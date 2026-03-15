@@ -88,7 +88,8 @@ private:
     }
 };
 
-ExecutionContext make_context(const fs::path& install_dir, std::string platform) {
+ExecutionContext make_context(const fs::path& install_dir, std::string platform,
+                             const fs::path& tools_dir = {}) {
     ExecutionContext ctx;
     ctx.pkg_name = "elfpatch-macos";
     ctx.version = "1.0.0";
@@ -98,7 +99,7 @@ ExecutionContext make_context(const fs::path& install_dir, std::string platform)
     ctx.install_dir = install_dir;
     ctx.run_dir = install_dir;
     ctx.xpkg_dir = install_dir;
-    ctx.bin_dir = install_dir / "bin";
+    ctx.bin_dir = tools_dir.empty() ? install_dir / "bin" : tools_dir;
     ctx.project_data_dir = install_dir / "data";
     return ctx;
 }
@@ -418,7 +419,7 @@ TEST(ExecutorTest, ApplyElfpatchAuto_LinuxUsesPatchelfForElf) {
     auto exec = create_executor(pkg_path);
     ASSERT_TRUE(exec.has_value()) << (exec ? "" : exec.error());
 
-    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "linux"));
+    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "linux", tools_dir));
     ASSERT_TRUE(hook_result.success) << hook_result.error;
 
     auto patch_result = exec->apply_elfpatch_auto();
@@ -485,7 +486,7 @@ TEST(ExecutorTest, ApplyElfpatchAuto_MacOsUsesInstallNameToolForMachO) {
     auto exec = create_executor(pkg_path);
     ASSERT_TRUE(exec.has_value()) << (exec ? "" : exec.error());
 
-    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "macosx"));
+    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "macosx", tools_dir));
     ASSERT_TRUE(hook_result.success) << hook_result.error;
 
     auto patch_result = exec->apply_elfpatch_auto();
@@ -551,7 +552,7 @@ TEST(ExecutorTest, ApplyElfpatchAuto_MacOsAddRpathFailureCountsAsFailed) {
     auto exec = create_executor(pkg_path);
     ASSERT_TRUE(exec.has_value()) << (exec ? "" : exec.error());
 
-    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "macosx"));
+    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "macosx", tools_dir));
     ASSERT_TRUE(hook_result.success) << hook_result.error;
 
     auto patch_result = exec->apply_elfpatch_auto();
@@ -599,7 +600,7 @@ TEST(ExecutorTest, ApplyElfpatchAuto_MacOsMissingToolSkipsGracefully) {
     auto exec = create_executor(pkg_path);
     ASSERT_TRUE(exec.has_value()) << (exec ? "" : exec.error());
 
-    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "macosx"));
+    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "macosx", empty_tools_dir));
     ASSERT_TRUE(hook_result.success) << hook_result.error;
 
     auto patch_result = exec->apply_elfpatch_auto();

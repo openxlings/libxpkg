@@ -923,52 +923,85 @@ local function _info(msg)
     else io.write("[xim:xpkg]: elfpatch: " .. msg .. "\n") end
 end
 
+local function _null_redirect()
+    if _RUNTIME and _RUNTIME.platform == "windows" then return " >NUL 2>&1" end
+    return " >/dev/null 2>&1"
+end
+
+local function _err_redirect()
+    if _RUNTIME and _RUNTIME.platform == "windows" then return " 2>NUL" end
+    return " 2>/dev/null"
+end
+
 local function _exec_ok(cmd)
-    local ret = os.execute(cmd .. " >/dev/null 2>&1")
-    return ret == 0 or ret == true
+    local ok, _, code = os.execute(cmd .. _null_redirect())
+    if ok == true or ok == 0 then return true end
+    _info("exec failed (code=" .. tostring(code) .. "): " .. cmd)
+    return false
 end
 
 local function _iorun(cmd)
-    local f = io.popen(cmd .. " 2>/dev/null")
+    local f = io.popen(cmd .. _err_redirect())
     if not f then return nil end
     local output = f:read("*a")
     f:close()
     return output
 end
 
-local function _tool_exists(name)
-    return _exec_ok("command -v " .. _shell_quote(name))
-end
+-- Find a tool by searching fixed paths then system PATH.
+-- Search order: subos/bin → _RUNTIME.bin_dir → system PATH (/usr/bin etc.)
+-- Returns { program = "/abs/path/to/tool" } or nil.
+local function _find_tool(toolname)
+    if _tool_cache[toolname] ~= nil then
+        if _tool_cache[toolname] == false then return nil end
+        return _tool_cache[toolname]
+    end
 
-local function _try_probe_tool(toolname)
-    for _, args in ipairs({"--version", "--help", "-h"}) do
-        if _exec_ok(_shell_quote(toolname) .. " " .. args) then
-            return { program = toolname }
+    local candidates = {}
+
+    -- 1. subos bin (patchelf, readelf live here)
+    local sysroot = _RUNTIME and _RUNTIME.subos_sysrootdir
+    if sysroot and sysroot ~= "" then
+        candidates[#candidates + 1] = path.join(sysroot, "bin", toolname)
+    end
+
+    -- 2. _RUNTIME.bin_dir (~/.xlings/bin)
+    local bin_dir = _RUNTIME and _RUNTIME.bin_dir
+    if bin_dir then
+        candidates[#candidates + 1] = path.join(bin_dir, toolname)
+    end
+
+    -- 3. macOS system tools
+    if is_host("macosx") then
+        candidates[#candidates + 1] = "/usr/bin/" .. toolname
+    end
+
+    -- 4. common system paths
+    candidates[#candidates + 1] = "/usr/bin/" .. toolname
+    candidates[#candidates + 1] = "/usr/local/bin/" .. toolname
+
+    for _, p in ipairs(candidates) do
+        if os.isfile(p) then
+            local tool = { program = p }
+            _info("using " .. toolname .. ": " .. p)
+            _tool_cache[toolname] = tool
+            return tool
         end
     end
+
+    -- 5. Last resort: search system PATH via shell
+    local which_cmd = is_host("windows") and "where" or "which"
+    local resolved = _trim(_iorun(which_cmd .. " " .. _shell_quote(toolname)))
+    if resolved and resolved ~= "" and os.isfile(resolved) then
+        local tool = { program = resolved }
+        _info("using " .. toolname .. ": " .. resolved .. " (PATH)")
+        _tool_cache[toolname] = tool
+        return tool
+    end
+
+    _warn(toolname .. " not found")
+    _tool_cache[toolname] = false
     return nil
-end
-
-local function _get_tool(cache_key, toolname)
-    if _tool_cache[cache_key] ~= nil then
-        if _tool_cache[cache_key] == false then return nil end
-        return _tool_cache[cache_key]
-    end
-
-    local tool = nil
-    if toolname == "install_name_tool" and os.isfile("/usr/bin/install_name_tool") then
-        tool = { program = "/usr/bin/install_name_tool" }
-    elseif _tool_exists(toolname) then
-        tool = { program = toolname }
-    else
-        tool = _try_probe_tool(toolname)
-    end
-
-    if not tool then
-        _warn(toolname .. " not found, related operations will be skipped")
-    end
-    _tool_cache[cache_key] = tool or false
-    return tool
 end
 
 local function _read_magic(filepath, size)
@@ -994,7 +1027,7 @@ local function _is_macho(filepath)
         return true
     end
 
-    local otool = _get_tool("otool", "otool")
+    local otool = _find_tool("otool")
     if not otool then
         return false
     end
@@ -1089,7 +1122,7 @@ local function _detect_system_loader()
         if os.isfile(p) then return p end
     end
 
-    local readelf = _get_tool("readelf", "readelf")
+    local readelf = _find_tool("readelf")
     if readelf and os.isfile("/bin/sh") then
         local output = _iorun(_shell_quote(readelf.program) .. " -l /bin/sh")
         if output then
@@ -1124,7 +1157,7 @@ local function _resolve_loader(loader_opt)
 end
 
 local function _fix_macho_dylib_refs(tool, filepath, opts)
-    local otool = _get_tool("otool", "otool")
+    local otool = _find_tool("otool")
     if not otool then
         return true
     end
@@ -1160,8 +1193,70 @@ local function _fix_macho_dylib_refs(tool, filepath, opts)
     return true
 end
 
+-- Shared shrink helper
+local function _apply_shrink(patch_tool, filepath, shrink, result)
+    if shrink == true then
+        if _exec_ok(_shell_quote(patch_tool.program) .. " --shrink-rpath " .. _shell_quote(filepath)) then
+            result.shrinked = result.shrinked + 1
+        else
+            result.shrink_failed = result.shrink_failed + 1
+        end
+    end
+end
+
+-- Patch directories as executables (interpreter + rpath)
+local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpath, shrink, result)
+    for _, dir in ipairs(dirs) do
+        local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
+        local targets = _collect_targets(full, { include_shared_libs = true })
+        for _, filepath in ipairs(targets) do
+            result.scanned = result.scanned + 1
+            local ok = true
+            if loader then
+                ok = _exec_ok(_shell_quote(patch_tool.program)
+                    .. " --set-interpreter " .. _shell_quote(loader)
+                    .. " " .. _shell_quote(filepath))
+            end
+            if ok and rpath and rpath ~= "" then
+                ok = _exec_ok(_shell_quote(patch_tool.program)
+                    .. " --set-rpath " .. _shell_quote(rpath)
+                    .. " " .. _shell_quote(filepath))
+            end
+            if ok then
+                result.patched = result.patched + 1
+                _apply_shrink(patch_tool, filepath, shrink, result)
+            else
+                result.failed = result.failed + 1
+            end
+        end
+    end
+end
+
+-- Patch directories as libraries (rpath only, no interpreter)
+local function _patch_elf_libraries(patch_tool, dirs, install_dir, rpath, shrink, result)
+    for _, dir in ipairs(dirs) do
+        local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
+        local targets = _collect_targets(full, { include_shared_libs = true })
+        for _, filepath in ipairs(targets) do
+            result.scanned = result.scanned + 1
+            local ok = true
+            if rpath and rpath ~= "" then
+                ok = _exec_ok(_shell_quote(patch_tool.program)
+                    .. " --set-rpath " .. _shell_quote(rpath)
+                    .. " " .. _shell_quote(filepath))
+            end
+            if ok then
+                result.patched = result.patched + 1
+                _apply_shrink(patch_tool, filepath, shrink, result)
+            else
+                result.failed = result.failed + 1
+            end
+        end
+    end
+end
+
 local function _patch_elf(target, opts, result)
-    local patch_tool = _get_tool("patchelf", "patchelf")
+    local patch_tool = _find_tool("patchelf")
     if not patch_tool then
         _warn("patchelf not found, skip patching")
         return result
@@ -1177,41 +1272,58 @@ local function _patch_elf(target, opts, result)
         _warn(msg)
     end
 
-    local targets = _collect_targets(target, opts)
-    for _, filepath in ipairs(targets) do
-        result.scanned = result.scanned + 1
-        local ok = true
+    local install_dir = _RUNTIME and _RUNTIME.install_dir or target
+    local bins = opts.bins or (_RUNTIME and _RUNTIME.elfpatch_bins)
+    local libs = opts.libs or (_RUNTIME and _RUNTIME.elfpatch_libs)
 
-        if loader then
-            ok = _exec_ok(_shell_quote(patch_tool.program)
-                .. " --set-interpreter "
-                .. _shell_quote(loader) .. " "
-                .. _shell_quote(filepath))
-        end
-        if ok and rpath and rpath ~= "" then
-            ok = _exec_ok(_shell_quote(patch_tool.program)
-                .. " --set-rpath "
-                .. _shell_quote(rpath) .. " "
-                .. _shell_quote(filepath))
-        end
+    -- Custom interpreter override (absolute path, skip _resolve_loader)
+    local custom_interp = opts.interpreter or (_RUNTIME and _RUNTIME.elfpatch_interpreter)
+    if custom_interp then
+        loader = custom_interp
+    end
+    -- Custom rpath override (absolute paths)
+    local custom_rpath = opts.custom_rpath or (_RUNTIME and _RUNTIME.elfpatch_rpath)
+    if custom_rpath then
+        rpath = _normalize_rpath(custom_rpath)
+    end
 
-        if ok then
-            result.patched = result.patched + 1
-            if opts.shrink == true then
-                local shrink_ok = _exec_ok(_shell_quote(patch_tool.program)
-                    .. " --shrink-rpath "
-                    .. _shell_quote(filepath))
-                if shrink_ok then
-                    result.shrinked = result.shrinked + 1
-                else
-                    result.shrink_failed = result.shrink_failed + 1
+    if bins or libs then
+        -- Declarative mode: package already classified bin/lib dirs
+        _info(string.format("declared: bins=%s libs=%s loader=%s",
+            bins and table.concat(bins, ",") or "nil",
+            libs and table.concat(libs, ",") or "nil",
+            tostring(loader)))
+        _patch_elf_executables(patch_tool, bins or {}, install_dir, loader, rpath, opts.shrink, result)
+        _patch_elf_libraries(patch_tool, libs or {}, install_dir, rpath, opts.shrink, result)
+    else
+        -- Fallback mode: full scan, interpreter and rpath independent (no cascade)
+        _info("fallback scan mode, loader=" .. tostring(loader))
+        local targets = _collect_targets(target, opts)
+        for _, filepath in ipairs(targets) do
+            result.scanned = result.scanned + 1
+            local any_ok = false
+
+            if loader then
+                if _exec_ok(_shell_quote(patch_tool.program)
+                    .. " --set-interpreter " .. _shell_quote(loader)
+                    .. " " .. _shell_quote(filepath)) then
+                    any_ok = true
                 end
             end
-        else
-            if opts.strict then
-                error("failed to patch ELF target: " .. filepath)
+            if rpath and rpath ~= "" then
+                if _exec_ok(_shell_quote(patch_tool.program)
+                    .. " --set-rpath " .. _shell_quote(rpath)
+                    .. " " .. _shell_quote(filepath)) then
+                    any_ok = true
+                end
             end
-            result.failed = result.failed + 1
+
+            if any_ok then
+                result.patched = result.patched + 1
+                _apply_shrink(patch_tool, filepath, opts.shrink, result)
+            else
+                result.failed = result.failed + 1
+            end
         end
     end
 
@@ -1219,7 +1331,7 @@ local function _patch_elf(target, opts, result)
 end
 
 local function _patch_macho(target, opts, result)
-    local tool = _get_tool("install_name_tool", "install_name_tool")
+    local tool = _find_tool("install_name_tool")
     if not tool then
         _warn("install_name_tool not found, skip patching (try: xcode-select --install)")
         return result
@@ -1328,6 +1440,67 @@ function M.patch_elf_loader_rpath(target, opts)
     return result
 end
 
+function M.set_interpreter(target, interpreter, opts)
+    opts = opts or {}
+    local result = { scanned = 0, patched = 0, failed = 0 }
+    if not is_host("linux") then return result end
+
+    local patch_tool = _find_tool("patchelf")
+    if not patch_tool then
+        _warn("patchelf not found")
+        return result
+    end
+
+    local targets = _collect_targets(target, opts)
+    for _, filepath in ipairs(targets) do
+        result.scanned = result.scanned + 1
+        _info("set-interpreter: " .. filepath .. " -> " .. interpreter)
+        if _exec_ok(_shell_quote(patch_tool.program)
+            .. " --set-interpreter " .. _shell_quote(interpreter)
+            .. " " .. _shell_quote(filepath)) then
+            result.patched = result.patched + 1
+        else
+            result.failed = result.failed + 1
+        end
+    end
+    return result
+end
+
+function M.set_rpath(target, rpath, opts)
+    opts = opts or {}
+    local shrink = opts.shrink
+    if shrink == nil then shrink = true end
+    local result = { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+
+    if is_host("linux") then
+        local patch_tool = _find_tool("patchelf")
+        if not patch_tool then
+            _warn("patchelf not found")
+            return result
+        end
+        local rpath_str = _normalize_rpath(rpath)
+        if not rpath_str or rpath_str == "" then return result end
+
+        local targets = _collect_targets(target, opts)
+        for _, filepath in ipairs(targets) do
+            result.scanned = result.scanned + 1
+            _info("set-rpath: " .. filepath)
+            if _exec_ok(_shell_quote(patch_tool.program)
+                .. " --set-rpath " .. _shell_quote(rpath_str)
+                .. " " .. _shell_quote(filepath)) then
+                result.patched = result.patched + 1
+                _apply_shrink(patch_tool, filepath, shrink, result)
+            else
+                result.failed = result.failed + 1
+            end
+        end
+    elseif is_host("macosx") then
+        return _patch_macho(target, { rpath = rpath }, result)
+    end
+
+    return result
+end
+
 function M.auto(enable_or_opts)
     _RUNTIME = _RUNTIME or {}
     if type(enable_or_opts) == "table" then
@@ -1336,6 +1509,20 @@ function M.auto(enable_or_opts)
         end
         if enable_or_opts.shrink ~= nil then
             _RUNTIME.elfpatch_shrink = (enable_or_opts.shrink == true)
+        end
+        -- Declarative bin/lib directories
+        if enable_or_opts.bins then
+            _RUNTIME.elfpatch_bins = enable_or_opts.bins
+        end
+        if enable_or_opts.libs then
+            _RUNTIME.elfpatch_libs = enable_or_opts.libs
+        end
+        -- Optional: custom interpreter and rpath (absolute paths)
+        if enable_or_opts.interpreter then
+            _RUNTIME.elfpatch_interpreter = enable_or_opts.interpreter
+        end
+        if enable_or_opts.rpath then
+            _RUNTIME.elfpatch_rpath = enable_or_opts.rpath
         end
     else
         _RUNTIME.elfpatch_auto = (enable_or_opts == true)

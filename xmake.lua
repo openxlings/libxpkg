@@ -40,12 +40,47 @@ target("mcpplibs-xpkg-lua-stdlib")
         f:write("import std;\n\n")
         f:write("export namespace mcpplibs::xpkg::detail {\n\n")
 
+        -- MSVC C2026: string literal max 16380 bytes; split large files
+        local MSVC_LIMIT = 15000
         local function embed(varname, rel_path)
             local content = io.readfile(path.join(proj, rel_path))
-            f:write("inline constexpr std::string_view " .. varname)
-            f:write(" = R\"__LUA__(\n")
-            f:write(content)
-            f:write("\n)__LUA__\";\n\n")
+            if #content <= MSVC_LIMIT then
+                f:write("inline constexpr std::string_view " .. varname)
+                f:write(" = R\"__LUA__(\n")
+                f:write(content)
+                f:write("\n)__LUA__\";\n\n")
+            else
+                -- Split into chunks joined via operator+
+                local chunks = {}
+                local pos = 1
+                local idx = 0
+                while pos <= #content do
+                    local chunk = content:sub(pos, pos + MSVC_LIMIT - 1)
+                    -- Avoid splitting in the middle of a line
+                    if pos + MSVC_LIMIT - 1 < #content then
+                        local nl = chunk:reverse():find("\n")
+                        if nl and nl < MSVC_LIMIT then
+                            chunk = content:sub(pos, pos + MSVC_LIMIT - nl - 1)
+                        end
+                    end
+                    local cname = varname .. "_" .. idx
+                    f:write("inline constexpr std::string_view " .. cname)
+                    f:write(" = R\"__LUA__(\n")
+                    f:write(chunk)
+                    f:write("\n)__LUA__\";\n\n")
+                    chunks[#chunks + 1] = cname
+                    pos = pos + #chunk
+                    idx = idx + 1
+                end
+                -- Concatenate via a function
+                f:write("inline const std::string " .. varname .. "_storage = []{ std::string s;\n")
+                for _, c in ipairs(chunks) do
+                    f:write("    s += " .. c .. ";\n")
+                end
+                f:write("    return s; }();\n")
+                f:write("inline const std::string_view " .. varname)
+                f:write(" = " .. varname .. "_storage;\n\n")
+            end
         end
 
         embed("prelude_lua",    "src/lua-stdlib/prelude.lua")

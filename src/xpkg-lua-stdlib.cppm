@@ -891,7 +891,7 @@ return M
 
 )__LUA__";
 
-inline constexpr std::string_view elfpatch_lua = R"__LUA__(
+inline constexpr std::string_view elfpatch_lua_0 = R"__LUA__(
 -- xim.libxpkg.elfpatch: ELF and Mach-O patch helpers
 local M = {}
 
@@ -1347,6 +1347,10 @@ local function _patch_macho(target, opts, result)
         result.scanned = result.scanned + 1
         local ok = true
 
+)__LUA__";
+
+inline constexpr std::string_view elfpatch_lua_1 = R"__LUA__(
+
         for _, rp in ipairs(rpath_paths) do
             local add_ok = _exec_ok(_shell_quote(tool.program)
                 .. " -add_rpath "
@@ -1566,6 +1570,12 @@ end
 return M
 
 )__LUA__";
+
+inline const std::string elfpatch_lua_storage = []{ std::string s;
+    s += elfpatch_lua_0;
+    s += elfpatch_lua_1;
+    return s; }();
+inline const std::string_view elfpatch_lua = elfpatch_lua_storage;
 
 inline constexpr std::string_view json_lua = R"__LUA__(
 -- xim.libxpkg.json: lightweight pure-Lua JSON encoder/decoder

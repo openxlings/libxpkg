@@ -23,8 +23,20 @@ struct PlatformMatrix {
     // platform -> version -> resource
     std::unordered_map<std::string,
         std::unordered_map<std::string, PlatformResource>> entries;
-    // platform -> list of dep names
+    // platform -> list of dep names. `deps` is the **effective union** of
+    // `runtime_deps` and `build_deps`, populated by the loader so legacy
+    // consumers reading `deps` keep working unchanged.
     std::unordered_map<std::string, std::vector<std::string>> deps;
+    // platform -> list of dep names that are needed at the consumer's
+    // run-time (activated in subos workspace, exposed via shim/PATH or
+    // linked at consumer-build).
+    std::unordered_map<std::string, std::vector<std::string>> runtime_deps;
+    // platform -> list of dep names that are needed only while THIS
+    // package is being installed/built. The installer downloads them
+    // to the xpkgs store but does NOT register them in the xvm DB or
+    // the active workspace, so the user's tool versions stay untouched.
+    // Install hooks access them via injected env vars / pkginfo API.
+    std::unordered_map<std::string, std::vector<std::string>> build_deps;
     // platform inheritance, e.g. "ubuntu" -> "linux"
     std::unordered_map<std::string, std::string> inherits;
     // Declared outside struct body → outlined symbol in module object.

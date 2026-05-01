@@ -183,17 +183,65 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
         if (!platform.empty() && lua::type(L, -1) == lua::TTABLE) {
             int plat_idx = lua::gettop(L);
 
-            // Parse deps array if present
+            // Parse deps. Two accepted shapes:
+            //
+            //   Legacy array form:
+            //     deps = { "node", "npm" }
+            //   → fan out to BOTH runtime_deps and build_deps for that
+            //     platform; preserves pre-split behaviour.
+            //
+            //   New table form:
+            //     deps = { runtime = {...}, build = {...} }
+            //   → strict separation: runtime entries activate in workspace,
+            //     build entries are install-time-only.
+            //
+            // `xpm.deps[platform]` is set to the union (runtime ∪ build)
+            // so legacy consumers reading `deps` keep working.
+            auto parse_string_array = [&](int idx) -> std::vector<std::string> {
+                std::vector<std::string> out;
+                if (lua::type(L, idx) != lua::TTABLE) return out;
+                int len = static_cast<int>(lua::rawlen(L, idx));
+                for (int i = 1; i <= len; ++i) {
+                    lua::rawgeti(L, idx, i);
+                    if (lua::type(L, -1) == lua::TSTRING)
+                        out.push_back(lua::tostring(L, -1));
+                    lua::pop(L, 1);
+                }
+                return out;
+            };
+
             lua::getfield(L, plat_idx, "deps");
             if (lua::type(L, -1) == lua::TTABLE) {
                 int deps_idx = lua::gettop(L);
+                // Detect shape: if rawlen > 0 OR the first numeric key
+                // exists, treat as array (legacy). Otherwise treat as
+                // a {runtime = ..., build = ...} table.
                 int len = static_cast<int>(lua::rawlen(L, deps_idx));
-                for (int i = 1; i <= len; ++i) {
-                    lua::rawgeti(L, deps_idx, i);
-                    if (lua::type(L, -1) == lua::TSTRING) {
-                        xpm.deps[platform].push_back(lua::tostring(L, -1));
-                    }
+                bool looks_like_array = len > 0;
+                if (looks_like_array) {
+                    auto v = parse_string_array(deps_idx);
+                    xpm.runtime_deps[platform] = v;
+                    xpm.build_deps[platform]   = v;
+                    xpm.deps[platform]         = v;
+                } else {
+                    lua::getfield(L, deps_idx, "runtime");
+                    auto rt = parse_string_array(lua::gettop(L));
                     lua::pop(L, 1);
+
+                    lua::getfield(L, deps_idx, "build");
+                    auto bd = parse_string_array(lua::gettop(L));
+                    lua::pop(L, 1);
+
+                    xpm.runtime_deps[platform] = rt;
+                    xpm.build_deps[platform]   = bd;
+
+                    // Build the union for legacy `deps` field
+                    std::vector<std::string> uni = rt;
+                    for (auto& d : bd) {
+                        if (std::find(uni.begin(), uni.end(), d) == uni.end())
+                            uni.push_back(d);
+                    }
+                    xpm.deps[platform] = std::move(uni);
                 }
             }
             lua::pop(L, 1);  // pop deps field

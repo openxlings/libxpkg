@@ -82,3 +82,48 @@ TEST(LoaderTest, BuildIndex_PkgindexBuild_TemplateAppended) {
     // Template adds xpm with linux/windows/macosx platforms
     EXPECT_FALSE(pkg->xpm.entries.empty()) << "template xpm should have been appended by pkgindex-build";
 }
+
+// Legacy array form: `deps = { "node", "npm" }` must populate
+// runtime_deps AND build_deps identically (loader fan-out) so
+// pre-split consumers keep getting the same dep set.
+TEST(LoaderTest, LoadPackage_DepsLegacy_FansOutToBoth) {
+    auto result = load_package(PKGINDEX / "pkgs/d/depslegacy.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+
+    auto& xpm = result->xpm;
+    auto rt = xpm.runtime_deps.find("linux");
+    auto bd = xpm.build_deps.find("linux");
+    auto un = xpm.deps.find("linux");
+    ASSERT_NE(rt, xpm.runtime_deps.end());
+    ASSERT_NE(bd, xpm.build_deps.end());
+    ASSERT_NE(un, xpm.deps.end());
+
+    std::vector<std::string> expected{"node", "npm"};
+    EXPECT_EQ(rt->second, expected);
+    EXPECT_EQ(bd->second, expected);
+    EXPECT_EQ(un->second, expected);
+}
+
+// Split form: deps = { runtime = {...}, build = {...} } must keep
+// the two lists separate, and the legacy `deps` field must hold
+// their union (preserving insertion order: runtime first, then build).
+TEST(LoaderTest, LoadPackage_DepsSplit_KeepsSeparation) {
+    auto result = load_package(PKGINDEX / "pkgs/d/depssplit.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+
+    auto& xpm = result->xpm;
+    auto rt = xpm.runtime_deps.find("linux");
+    auto bd = xpm.build_deps.find("linux");
+    auto un = xpm.deps.find("linux");
+    ASSERT_NE(rt, xpm.runtime_deps.end());
+    ASSERT_NE(bd, xpm.build_deps.end());
+    ASSERT_NE(un, xpm.deps.end());
+
+    std::vector<std::string> expectedRt{"node", "npm"};
+    std::vector<std::string> expectedBd{"gcc", "patchelf"};
+    EXPECT_EQ(rt->second, expectedRt);
+    EXPECT_EQ(bd->second, expectedBd);
+
+    std::vector<std::string> expectedUnion{"node", "npm", "gcc", "patchelf"};
+    EXPECT_EQ(un->second, expectedUnion);
+}

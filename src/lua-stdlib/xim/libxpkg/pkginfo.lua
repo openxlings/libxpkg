@@ -133,4 +133,89 @@ function M.install_dir(pkgname, pkgversion)
     return nil
 end
 
+-- ─────────────────────────────────────────────────────────────────────
+-- build_dep API
+-- ─────────────────────────────────────────────────────────────────────
+-- Returns metadata about a build-time dep available to the current
+-- install hook. Build deps are payloads xlings ensured are present in
+-- the xpkgs store but did NOT activate in subos workspace. Use this
+-- API instead of relying on PATH / shims when the consumer needs an
+-- ABSOLUTE PATH or wants explicit version selection independent of
+-- the user's active workspace.
+--
+--   local gcc = pkginfo.build_dep("gcc")
+--   -- gcc.path    : install_dir of the chosen build dep version
+--   -- gcc.bin     : <install_dir>/bin
+--   -- gcc.version : resolved version string
+--
+-- Resolution order:
+--   1. Env var XLINGS_BUILDDEP_<UPPER_NAME>_PATH (injected by the
+--      xlings installer when the consumer's `build` deps were resolved
+--      to a concrete version).
+--   2. Fallback: scan xpkgs the same way `dep_install_dir` does.
+--      Returns highest available version when version is omitted.
+--
+-- Returns nil if the build dep is not available.
+function M.build_dep(dep_name, dep_version)
+    local log = _get_log()
+    if not dep_name or dep_name == "" then return nil end
+
+    local function _upper(s) return (s:gsub("[^%w]", "_")):upper() end
+    local env_key  = "XLINGS_BUILDDEP_" .. _upper(dep_name) .. "_PATH"
+    local env_path = os.getenv(env_key)
+    local install_dir
+    if env_path and env_path ~= "" and os.isdir(env_path) then
+        install_dir = env_path
+        if log then log.debug("build_dep %s -> %s (via %s)",
+            dep_name, env_path, env_key) end
+    else
+        install_dir = M.dep_install_dir(dep_name, dep_version)
+        if log then log.debug("build_dep %s -> %s (via scan)",
+            dep_name, tostring(install_dir)) end
+    end
+
+    if not install_dir then return nil end
+
+    local resolved_ver = dep_version
+    if not resolved_ver or resolved_ver == "" then
+        -- The install_dir's leaf is the version (xpkgs/<store>/<ver>).
+        resolved_ver = path.filename(install_dir)
+    end
+
+    return {
+        path    = install_dir,
+        bin     = path.join(install_dir, "bin"),
+        include = path.join(install_dir, "include"),
+        lib     = path.join(install_dir, "lib"),
+        version = resolved_ver,
+    }
+end
+
+-- Convenience: prepend every build dep's `bin/` to PATH for the
+-- duration of the callback, then restore. Lets install hooks call
+-- bare `gcc` / `patchelf` etc and pick up the build-dep version
+-- without the hook needing to splice paths manually. The xlings
+-- installer also pre-injects PATH globally for the hook subprocess,
+-- so most hooks won't need this — useful only when an install hook
+-- spawns sub-processes that need a different PATH.
+function M.with_build_deps_on_path(build_dep_names, fn)
+    local log = _get_log()
+    local original_path = os.getenv("PATH") or ""
+    local extra = {}
+    for _, n in ipairs(build_dep_names or {}) do
+        local d = M.build_dep(n)
+        if d and d.bin and os.isdir(d.bin) then
+            table.insert(extra, d.bin)
+        elseif log then
+            log.warn("with_build_deps_on_path: %s not available", n)
+        end
+    end
+    if #extra == 0 then return fn() end
+    local new_path = table.concat(extra, path.envsep()) .. path.envsep() .. original_path
+    os.setenv("PATH", new_path)
+    local ok, err = pcall(fn)
+    os.setenv("PATH", original_path)
+    if not ok then error(err) end
+end
+
 return M

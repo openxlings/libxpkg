@@ -638,3 +638,152 @@ TEST(ExecutorTest, OsFuncs_Cp_PreservesSymlinks) {
     EXPECT_EQ(fs::read_symlink(dst / "link.txt").string(), "real.txt");
     fs::remove_all(temp);
 }
+
+// ─── auto-stamp behavior on HookType::Install ────────────────────────────
+//
+// Background: wrapper packages (linux-headers, etc.) leave install_dir
+// empty because their real payload lives elsewhere. Without anything in
+// install_dir, xlings's catalog probe (`is_directory && !is_empty`) flags
+// them as not-installed on every dependent install, looping forever.
+// run_hook(Install) auto-stamps `.xim-installed` when install_dir ends up
+// empty so the catalog probe can see "yes, installed".
+
+namespace {
+std::string read_file(const fs::path& p) {
+    std::ifstream in(p);
+    std::ostringstream ss; ss << in.rdbuf();
+    return ss.str();
+}
+} // namespace
+
+TEST(ExecutorTest, AutoStamp_WritesStampWhenInstallDirEmpty) {
+    const fs::path temp = make_temp_dir("libxpkg-stamp-empty-");
+    const fs::path install_dir = temp / "install";
+    fs::create_directories(install_dir);
+
+    auto pkg = temp / "wrapper.lua";
+    write_text(pkg, std::string(
+        "package = { spec = \"1\", name = \"wrapper\", "
+        "xpm = { linux = { [\"1.0.0\"] = { url = \"x\", sha256 = \"0\" } } } }\n"
+        "function install() return true end\n"));
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+
+    ExecutionContext ctx = make_context(install_dir, "linux");
+    ctx.pkg_name = "wrapper";
+    ctx.version  = "1.0.0";
+
+    auto r = exec->run_hook(HookType::Install, ctx);
+    ASSERT_TRUE(r.success) << r.error;
+
+    auto stamp = install_dir / ".xim-installed";
+    EXPECT_TRUE(fs::exists(stamp)) << "auto-stamp must write .xim-installed when install_dir empty";
+
+    auto content = read_file(stamp);
+    EXPECT_NE(content.find("schema = 1"),       std::string::npos);
+    EXPECT_NE(content.find("name = wrapper"),   std::string::npos);
+    EXPECT_NE(content.find("version = 1.0.0"),  std::string::npos);
+    EXPECT_NE(content.find("platform = linux"), std::string::npos);
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, AutoStamp_SkipsWhenInstallDirNonEmpty) {
+    // If the install hook (or anyone else) put content in install_dir
+    // before run_hook returns, we must NOT add the stamp file.
+    const fs::path temp = make_temp_dir("libxpkg-stamp-nonempty-");
+    const fs::path install_dir = temp / "install";
+    fs::create_directories(install_dir);
+
+    auto pkg = temp / "regular.lua";
+    write_text(pkg, std::string(
+        "package = { spec = \"1\", name = \"regular\", "
+        "xpm = { linux = { [\"1.0.0\"] = { url = \"x\", sha256 = \"0\" } } } }\n"
+        "function install()\n"
+        "  io.open(_RUNTIME.install_dir .. '/payload.txt', 'w'):write('content'):close()\n"
+        "  return true\n"
+        "end\n"));
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+
+    ExecutionContext ctx = make_context(install_dir, "linux");
+    ctx.pkg_name = "regular";
+    ctx.version  = "1.0.0";
+
+    auto r = exec->run_hook(HookType::Install, ctx);
+    ASSERT_TRUE(r.success) << r.error;
+
+    EXPECT_TRUE(fs::exists(install_dir / "payload.txt"));
+    EXPECT_FALSE(fs::exists(install_dir / ".xim-installed"))
+        << "auto-stamp must not write when install hook already populated install_dir";
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, AutoStamp_SkipsWhenInstallHookFailed) {
+    // Failed install hooks must not leave a stamp behind. If the hook
+    // returned false / errored, we don't yet know whether anything is
+    // actually installed; defaulting to "stamp present" would mask the
+    // failure on the next dependent install.
+    const fs::path temp = make_temp_dir("libxpkg-stamp-failed-");
+    const fs::path install_dir = temp / "install";
+    fs::create_directories(install_dir);
+
+    auto pkg = temp / "failing.lua";
+    write_text(pkg, std::string(
+        "package = { spec = \"1\", name = \"failing\", "
+        "xpm = { linux = { [\"1.0.0\"] = { url = \"x\", sha256 = \"0\" } } } }\n"
+        "function install() return false end\n"));
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+
+    ExecutionContext ctx = make_context(install_dir, "linux");
+    ctx.pkg_name = "failing";
+    ctx.version  = "1.0.0";
+
+    auto r = exec->run_hook(HookType::Install, ctx);
+    EXPECT_FALSE(r.success);
+    EXPECT_FALSE(fs::exists(install_dir / ".xim-installed"))
+        << "auto-stamp must not write when install hook returned false";
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, AutoStamp_NotWrittenForNonInstallHooks) {
+    // The auto-stamp is specific to HookType::Install. Other hooks
+    // (Config, Uninstall, Installed, Update) running on an empty
+    // install_dir must NOT trigger a stamp write.
+    const fs::path temp = make_temp_dir("libxpkg-stamp-otherhook-");
+    const fs::path install_dir = temp / "install";
+    fs::create_directories(install_dir);
+
+    auto pkg = temp / "noisy.lua";
+    write_text(pkg, std::string(
+        "package = { spec = \"1\", name = \"noisy\", "
+        "xpm = { linux = { [\"1.0.0\"] = { url = \"x\", sha256 = \"0\" } } } }\n"
+        "function install()   return true end\n"
+        "function config()    return true end\n"
+        "function uninstall() return true end\n"));
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+
+    ExecutionContext ctx = make_context(install_dir, "linux");
+    ctx.pkg_name = "noisy";
+    ctx.version  = "1.0.0";
+
+    // Config hook on empty install_dir → no stamp written.
+    auto r = exec->run_hook(HookType::Config, ctx);
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_FALSE(fs::exists(install_dir / ".xim-installed"));
+
+    // Uninstall hook on empty install_dir → no stamp written.
+    r = exec->run_hook(HookType::Uninstall, ctx);
+    ASSERT_TRUE(r.success) << r.error;
+    EXPECT_FALSE(fs::exists(install_dir / ".xim-installed"));
+
+    fs::remove_all(temp);
+}

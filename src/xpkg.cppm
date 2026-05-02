@@ -19,6 +19,32 @@ struct PlatformResource {
     std::unordered_map<std::string, std::string> mirrors;  // e.g. "GLOBAL"->url, "CN"->url
 };
 
+// What this package exposes to consumers/xlings at install/runtime.
+// All paths are RELATIVE to the package's install_dir; xlings joins them
+// with the actual on-disk install path on the target machine to get the
+// final absolute path. Per the design doc (2026-05-02-elfpatch-exports-design.md),
+// providers only declare fields they actually expose — `{lib64, lib}`
+// libdir convention covers 99% of packages and need not be re-declared.
+struct ExportsRuntime {
+    // Dynamic linker (PT_INTERP) path, relative to install_dir.
+    // Only libc-class providers (glibc, musl) declare this.
+    std::string loader;
+    // Library search dirs (RPATH closure). Empty == fall back to the
+    // {lib64, lib} convention. Only declare if the package's layout
+    // diverges from convention.
+    std::vector<std::string> libdirs;
+    // ABI tag, used to disambiguate when multiple deps provide loaders
+    // (e.g. "linux-x86_64-glibc" vs "linux-x86_64-musl"). The consumer
+    // can request a specific abi via `elfpatch.set({interp_from = ...})`.
+    std::string abi;
+};
+
+struct ExportsBlock {
+    ExportsRuntime runtime;
+    // Future extension points: data (ssl_certs / locale / ...),
+    // build (include / cmake / pkgconfig). Not in v1.
+};
+
 struct PlatformMatrix {
     // platform -> version -> resource
     std::unordered_map<std::string,
@@ -37,6 +63,11 @@ struct PlatformMatrix {
     // the active workspace, so the user's tool versions stay untouched.
     // Install hooks access them via injected env vars / pkginfo API.
     std::unordered_map<std::string, std::vector<std::string>> build_deps;
+    // platform -> what this package exposes (loader, libdirs, abi, ...)
+    // See ExportsBlock above. Empty for packages that don't declare anything;
+    // the predicate-driven elfpatch trigger uses these to decide whether
+    // a consumer needs INTERP/RPATH patching after install.
+    std::unordered_map<std::string, ExportsBlock> exports;
     // platform inheritance, e.g. "ubuntu" -> "linux"
     std::unordered_map<std::string, std::string> inherits;
     // Declared outside struct body → outlined symbol in module object.

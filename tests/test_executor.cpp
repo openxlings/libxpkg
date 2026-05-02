@@ -656,7 +656,9 @@ std::string read_file(const fs::path& p) {
 }
 } // namespace
 
-TEST(ExecutorTest, AutoStamp_WritesStampWhenInstallDirEmpty) {
+TEST(ExecutorTest, ApplyInstallStamp_WritesStampWhenInstallDirEmpty) {
+    // Wrapper packages (linux-headers, fromsource:* aliases) leave
+    // install_dir empty after install hook; stamp marks them as installed.
     const fs::path temp = make_temp_dir("libxpkg-stamp-empty-");
     const fs::path install_dir = temp / "install";
     fs::create_directories(install_dir);
@@ -676,6 +678,9 @@ TEST(ExecutorTest, AutoStamp_WritesStampWhenInstallDirEmpty) {
 
     auto r = exec->run_hook(HookType::Install, ctx);
     ASSERT_TRUE(r.success) << r.error;
+    // Consumer (e.g. xlings installer) calls stamp explicitly after all
+    // install paths (hook + extracted-payload fallback + script default).
+    exec->apply_install_stamp_if_empty(ctx);
 
     auto stamp = install_dir / ".xim-installed";
     EXPECT_TRUE(fs::exists(stamp)) << "auto-stamp must write .xim-installed when install_dir empty";
@@ -689,9 +694,9 @@ TEST(ExecutorTest, AutoStamp_WritesStampWhenInstallDirEmpty) {
     fs::remove_all(temp);
 }
 
-TEST(ExecutorTest, AutoStamp_SkipsWhenInstallDirNonEmpty) {
-    // If the install hook (or anyone else) put content in install_dir
-    // before run_hook returns, we must NOT add the stamp file.
+TEST(ExecutorTest, ApplyInstallStamp_SkipsWhenInstallDirNonEmpty) {
+    // If anything has populated install_dir (install hook content,
+    // staged extracted payload, default script install), don't add stamp.
     const fs::path temp = make_temp_dir("libxpkg-stamp-nonempty-");
     const fs::path install_dir = temp / "install";
     fs::create_directories(install_dir);
@@ -714,76 +719,76 @@ TEST(ExecutorTest, AutoStamp_SkipsWhenInstallDirNonEmpty) {
 
     auto r = exec->run_hook(HookType::Install, ctx);
     ASSERT_TRUE(r.success) << r.error;
+    exec->apply_install_stamp_if_empty(ctx);
 
     EXPECT_TRUE(fs::exists(install_dir / "payload.txt"));
     EXPECT_FALSE(fs::exists(install_dir / ".xim-installed"))
-        << "auto-stamp must not write when install hook already populated install_dir";
+        << "auto-stamp must not write when install_dir already has content";
 
     fs::remove_all(temp);
 }
 
-TEST(ExecutorTest, AutoStamp_SkipsWhenInstallHookFailed) {
-    // Failed install hooks must not leave a stamp behind. If the hook
-    // returned false / errored, we don't yet know whether anything is
-    // actually installed; defaulting to "stamp present" would mask the
-    // failure on the next dependent install.
-    const fs::path temp = make_temp_dir("libxpkg-stamp-failed-");
+TEST(ExecutorTest, RunHook_DoesNotImplicitlyStamp) {
+    // Regression: auto-stamp used to live inside run_hook, which wrote
+    // .xim-installed before xlings's stage_extracted_payload_ fallback
+    // could check "is install_dir empty?". This poisoned the fallback
+    // for packages whose install hook silently no-ops (e.g. patchelf,
+    // whose tarball has no top-level dir, so `os.mv(extracted_dir,
+    // install_dir)` is a no-op). Stamp must now be explicit.
+    const fs::path temp = make_temp_dir("libxpkg-stamp-noimplicit-");
     const fs::path install_dir = temp / "install";
     fs::create_directories(install_dir);
 
-    auto pkg = temp / "failing.lua";
+    auto pkg = temp / "silent.lua";
     write_text(pkg, std::string(
-        "package = { spec = \"1\", name = \"failing\", "
+        "package = { spec = \"1\", name = \"silent\", "
         "xpm = { linux = { [\"1.0.0\"] = { url = \"x\", sha256 = \"0\" } } } }\n"
-        "function install() return false end\n"));
+        "function install() return true end\n"));
 
     auto exec = create_executor(pkg);
     ASSERT_TRUE(exec.has_value()) << exec.error();
 
     ExecutionContext ctx = make_context(install_dir, "linux");
-    ctx.pkg_name = "failing";
+    ctx.pkg_name = "silent";
     ctx.version  = "1.0.0";
 
     auto r = exec->run_hook(HookType::Install, ctx);
-    EXPECT_FALSE(r.success);
+    ASSERT_TRUE(r.success) << r.error;
     EXPECT_FALSE(fs::exists(install_dir / ".xim-installed"))
-        << "auto-stamp must not write when install hook returned false";
+        << "run_hook must NOT write the stamp; consumers call apply_install_stamp_if_empty explicitly";
 
     fs::remove_all(temp);
 }
 
-TEST(ExecutorTest, AutoStamp_NotWrittenForNonInstallHooks) {
-    // The auto-stamp is specific to HookType::Install. Other hooks
-    // (Config, Uninstall, Installed, Update) running on an empty
-    // install_dir must NOT trigger a stamp write.
-    const fs::path temp = make_temp_dir("libxpkg-stamp-otherhook-");
+TEST(ExecutorTest, ApplyInstallStamp_IsIdempotent) {
+    // Calling apply_install_stamp_if_empty twice is safe — the second
+    // call sees a non-empty dir (the first call's stamp) and no-ops.
+    const fs::path temp = make_temp_dir("libxpkg-stamp-idempotent-");
     const fs::path install_dir = temp / "install";
     fs::create_directories(install_dir);
 
-    auto pkg = temp / "noisy.lua";
+    auto pkg = temp / "any.lua";
     write_text(pkg, std::string(
-        "package = { spec = \"1\", name = \"noisy\", "
+        "package = { spec = \"1\", name = \"any\", "
         "xpm = { linux = { [\"1.0.0\"] = { url = \"x\", sha256 = \"0\" } } } }\n"
-        "function install()   return true end\n"
-        "function config()    return true end\n"
-        "function uninstall() return true end\n"));
+        "function install() return true end\n"));
 
     auto exec = create_executor(pkg);
     ASSERT_TRUE(exec.has_value()) << exec.error();
 
     ExecutionContext ctx = make_context(install_dir, "linux");
-    ctx.pkg_name = "noisy";
+    ctx.pkg_name = "any";
     ctx.version  = "1.0.0";
 
-    // Config hook on empty install_dir → no stamp written.
-    auto r = exec->run_hook(HookType::Config, ctx);
-    ASSERT_TRUE(r.success) << r.error;
-    EXPECT_FALSE(fs::exists(install_dir / ".xim-installed"));
+    exec->apply_install_stamp_if_empty(ctx);
+    auto stamp = install_dir / ".xim-installed";
+    ASSERT_TRUE(fs::exists(stamp));
+    auto first_content = read_file(stamp);
 
-    // Uninstall hook on empty install_dir → no stamp written.
-    r = exec->run_hook(HookType::Uninstall, ctx);
-    ASSERT_TRUE(r.success) << r.error;
-    EXPECT_FALSE(fs::exists(install_dir / ".xim-installed"));
+    exec->apply_install_stamp_if_empty(ctx);
+    auto second_content = read_file(stamp);
+    EXPECT_EQ(first_content, second_content)
+        << "second call must not rewrite stamp";
 
     fs::remove_all(temp);
 }

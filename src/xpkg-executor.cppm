@@ -458,6 +458,42 @@ public:
             result.error   = lua::tostring(L_, -1);
             lua::pop(L_, 1);
         }
+
+        // Auto-stamp wrapper packages (linux-headers etc.) whose install hook
+        // returns success but leaves install_dir empty because the real
+        // payload lives elsewhere (subos sysroot via config(), or a
+        // sub-dependency). Without something in install_dir, xlings's catalog
+        // probe (`is_directory && !is_empty`) flags the package as not
+        // installed on every dependent install, re-running this hook + the
+        // expensive config hook every time. Drop a tiny `.xim-installed`
+        // stamp so install_dir is non-empty post-install. Authors no longer
+        // need to remember to write this themselves.
+        //
+        // Policy: only writes when (a) Install hook succeeded, (b) install_dir
+        // exists or can be created, (c) install_dir is empty. If the hook
+        // already laid down content, we don't touch it. Failed hooks or
+        // genuinely-missing install_dir return paths fall through unchanged.
+        if (hook == HookType::Install && result.success && !ctx.install_dir.empty()) {
+            std::error_code ec;
+            fs::create_directories(ctx.install_dir, ec);
+            ec.clear();
+            bool dir_exists = fs::exists(ctx.install_dir, ec)
+                           && fs::is_directory(ctx.install_dir, ec);
+            ec.clear();
+            if (dir_exists && fs::is_empty(ctx.install_dir, ec)) {
+                auto stamp_path = ctx.install_dir / ".xim-installed";
+                std::ofstream out(stamp_path);
+                if (out.is_open()) {
+                    // Key=value INI for human-readable + grep-friendly access.
+                    // schema=1 reserves room to evolve the format later.
+                    out << "schema = 1\n"
+                        << "name = "       << ctx.pkg_name << "\n"
+                        << "version = "    << ctx.version  << "\n"
+                        << "platform = "   << ctx.platform << "\n";
+                }
+            }
+        }
+
         return result;
     }
 

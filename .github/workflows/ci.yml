@@ -14,6 +14,13 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Pin xlings bootstrap to the version we develop libxpkg against. Bumping
+  # together with code changes that depend on the new release. Without a
+  # pin, quick_install.sh follows latest — fine in steady state, risky when
+  # an in-flight xlings release breaks something we use.
+  XLINGS_VERSION: v0.4.13
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
@@ -27,9 +34,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential
 
-      - name: Install Xlings
+      - name: Install Xlings (pinned ${{ env.XLINGS_VERSION }})
         env:
           XLINGS_NON_INTERACTIVE: 1
+          XLINGS_VERSION: ${{ env.XLINGS_VERSION }}
         run: |
           curl -fsSL https://raw.githubusercontent.com/d2learn/xlings/refs/heads/main/tools/other/quick_install.sh | bash
           echo "PATH=$HOME/.xlings/subos/current/bin:$PATH" >> "$GITHUB_ENV"

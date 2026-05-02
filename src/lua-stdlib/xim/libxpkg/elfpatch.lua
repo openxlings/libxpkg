@@ -710,9 +710,14 @@ end
 -- ─────────────────────────────────────────────────────────────────────
 -- DEPRECATED — half-year transition compat (drop after 2026-11)
 -- ─────────────────────────────────────────────────────────────────────
--- Old API: elfpatch.auto({enable, shrink, bins, libs, interpreter, rpath})
--- mapped to elfpatch.set({...}). Logs once at debug level so verbose
--- mode users see who's still on the old path; silent in normal mode.
+-- Old API: elfpatch.auto({enable, shrink, bins, libs, interpreter, rpath}).
+-- Sets `_RUNTIME.elfpatch_legacy_*` flags that `M.apply_auto` reads to
+-- preserve the original "loader='subos' default + bins/libs whitelists"
+-- behavior. Don't try to remap onto the new `M.set` semantics — they
+-- diverge in ways that broke prior consumers (e.g. legacy `auto({enable=true})`
+-- without explicit interpreter implicitly meant "use system loader",
+-- but `set({})` with no interpreter is a no-op under the new design).
+-- Logs once at debug level so verbose users see migration prompts.
 local _auto_warn_once = false
 function M.auto(enable_or_opts)
     if not _auto_warn_once then
@@ -725,23 +730,20 @@ function M.auto(enable_or_opts)
     end
     _RUNTIME = _RUNTIME or {}
     if type(enable_or_opts) == "table" then
-        if enable_or_opts.enable == false then return M.skip() end
-        local opts = {
-            shrink      = enable_or_opts.shrink,
-            interpreter = enable_or_opts.interpreter,
-            extra_rpath = enable_or_opts.rpath,
-        }
-        -- Old `bins`/`libs` were per-directory whitelists; map to new `scan`.
-        local scan_dirs = {}
-        for _, d in ipairs(enable_or_opts.bins or {}) do table.insert(scan_dirs, d) end
-        for _, d in ipairs(enable_or_opts.libs or {}) do table.insert(scan_dirs, d) end
-        if #scan_dirs > 0 then opts.scan = scan_dirs end
-        return M.set(opts)
-    elseif enable_or_opts == false then
-        return M.skip()
+        if enable_or_opts.enable ~= nil then
+            _RUNTIME.elfpatch_legacy_auto = (enable_or_opts.enable == true)
+        end
+        if enable_or_opts.shrink ~= nil then
+            _RUNTIME.elfpatch_legacy_shrink = (enable_or_opts.shrink == true)
+        end
+        if enable_or_opts.bins        then _RUNTIME.elfpatch_legacy_bins = enable_or_opts.bins end
+        if enable_or_opts.libs        then _RUNTIME.elfpatch_legacy_libs = enable_or_opts.libs end
+        if enable_or_opts.interpreter then _RUNTIME.elfpatch_legacy_interpreter = enable_or_opts.interpreter end
+        if enable_or_opts.rpath       then _RUNTIME.elfpatch_legacy_rpath = enable_or_opts.rpath end
+    else
+        _RUNTIME.elfpatch_legacy_auto = (enable_or_opts == true)
     end
-    -- enable_or_opts == true or nil → enable predicate-driven auto.
-    -- That's the default, so do nothing (don't touch user_override / skip).
+    return _RUNTIME.elfpatch_legacy_auto
 end
 
 -- Internal apply, called by xlings's apply_elfpatch_auto() after the
@@ -869,18 +871,77 @@ function M._apply()
     })
 end
 
--- Backward-compat shim for the old name. xlings's apply_elfpatch_auto
--- still calls `apply_auto`; pointing it at `_apply` keeps things working
--- without a libxpkg/xlings lockstep upgrade.
+-- Legacy apply path: behaves exactly like the pre-rewrite `apply_auto`
+-- (loader = "subos" by default, bins/libs whitelists, etc). Used when
+-- the install hook called the deprecated `M.auto({...})` API.
+local function _legacy_apply(opts)
+    opts = opts or {}
+    if not (_RUNTIME and _RUNTIME.elfpatch_legacy_auto) then
+        return { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+    end
+
+    local target = opts.target or (_RUNTIME and _RUNTIME.install_dir)
+    local rpath = opts.rpath
+        or (_RUNTIME and _RUNTIME.elfpatch_legacy_rpath)
+        or M.closure_lib_paths({
+            -- Old behavior: deps_list was the union; legacy callers
+            -- expect that closure. Don't switch to runtime_deps_list
+            -- here or it'll silently change behavior.
+            deps_list = _RUNTIME and _RUNTIME.deps_list,
+        })
+    local shrink = opts.shrink
+    if shrink == nil then
+        shrink = _RUNTIME and _RUNTIME.elfpatch_legacy_shrink == true
+    end
+    local loader = opts.loader
+        or (_RUNTIME and _RUNTIME.elfpatch_legacy_interpreter)
+        or "subos"
+
+    return M.patch_elf_loader_rpath(target, {
+        loader = loader,
+        rpath  = rpath,
+        shrink = shrink,
+        bins   = _RUNTIME and _RUNTIME.elfpatch_legacy_bins,
+        libs   = _RUNTIME and _RUNTIME.elfpatch_legacy_libs,
+        include_shared_libs = opts.include_shared_libs,
+        recurse = opts.recurse,
+        strict  = opts.strict,
+    })
+end
+
+-- xlings's apply_elfpatch_auto bridge. Routes between legacy and new
+-- behaviors:
+--   1. user_skip            → return (highest priority, both old/new)
+--   2. user_override (set)  → new predicate-aware override path
+--   3. legacy_auto (auto)   → legacy "loader=subos default" path
+--   4. neither              → new predicate-driven default
 function M.apply_auto(opts)
+    if _RUNTIME and _RUNTIME.elfpatch_user_skip then
+        return { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+    end
+    if _RUNTIME and _RUNTIME.elfpatch_user_override then
+        return M._apply()
+    end
+    if _RUNTIME and _RUNTIME.elfpatch_legacy_auto then
+        return _legacy_apply(opts)
+    end
+    -- Predicate-driven default: only kicks in if a runtime-dep declared
+    -- exports.runtime.loader. Otherwise no-op.
     return M._apply()
 end
 
--- Legacy queries used by some packages; map to the new state.
+-- Legacy queries used by some packages; map to the legacy state for
+-- packages still on M.auto, otherwise to the new override state.
 function M.is_auto()
+    if _RUNTIME and _RUNTIME.elfpatch_legacy_auto ~= nil then
+        return _RUNTIME.elfpatch_legacy_auto == true
+    end
     return not (_RUNTIME and _RUNTIME.elfpatch_user_skip)
 end
 function M.is_shrink()
+    if _RUNTIME and _RUNTIME.elfpatch_legacy_shrink ~= nil then
+        return _RUNTIME.elfpatch_legacy_shrink == true
+    end
     if _RUNTIME and _RUNTIME.elfpatch_user_opts then
         return _RUNTIME.elfpatch_user_opts.shrink == true
     end

@@ -164,11 +164,17 @@ local function _is_elf_for_host(filepath)
     return em == _host_e_machine()
 end
 
--- Read PT_INTERP existence: a static binary has no PT_INTERP segment;
--- patchelf is a no-op on it, but checking lets us skip the fork+exec.
--- Quick & approximate check: we run `patchelf --print-interpreter` and
--- look at exit status. If patchelf isn't around yet, skip the check
--- (patchelf will be a no-op anyway).
+-- Read PT_INTERP existence. Used by the fallback scan / declared-bins
+-- paths to discriminate executables from shared libraries WITHOUT relying
+-- on filename heuristics (`.so`):
+--   has INTERP → executable / PIE binary → set INTERP + RPATH
+--   no INTERP  → shared library / static binary → RPATH only (set INTERP
+--                would fail with patchelf exit code 1 and emit log noise)
+-- Probe is `patchelf --print-interpreter`: empty output means no INTERP
+-- segment, non-empty means present. If patchelf isn't found yet
+-- (early-bootstrap), assume INTERP present so we don't silently skip
+-- legitimate executables; the actual --set-interpreter call would fail
+-- harmlessly later anyway.
 local function _has_pt_interp(filepath, patch_tool)
     if not patch_tool then return true end
     local cmd = _shell_quote(patch_tool.program)
@@ -368,7 +374,9 @@ local function _apply_shrink(patch_tool, filepath, shrink, result)
     end
 end
 
--- Patch directories as executables (interpreter + rpath)
+-- Patch directories as executables (interpreter + rpath). Files without
+-- PT_INTERP (shared libs that happened to land in a bin dir, static
+-- binaries) get rpath-only treatment instead of failing the whole entry.
 local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpath, shrink, result)
     for _, dir in ipairs(dirs) do
         local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
@@ -376,7 +384,7 @@ local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpa
         for _, filepath in ipairs(targets) do
             result.scanned = result.scanned + 1
             local ok = true
-            if loader then
+            if loader and _has_pt_interp(filepath, patch_tool) then
                 ok = _exec_ok(_shell_quote(patch_tool.program)
                     .. " --set-interpreter " .. _shell_quote(loader)
                     .. " " .. _shell_quote(filepath))
@@ -460,19 +468,29 @@ local function _patch_elf(target, opts, result)
         _patch_elf_executables(patch_tool, bins or {}, install_dir, loader, rpath, opts.shrink, result)
         _patch_elf_libraries(patch_tool, libs or {}, install_dir, rpath, opts.shrink, result)
     else
-        -- Fallback mode: full scan, interpreter and rpath independent (no cascade)
+        -- Fallback mode: classify each file via PT_INTERP presence so we
+        -- don't attempt --set-interpreter on shared libraries (which
+        -- legitimately have no INTERP segment, causing patchelf to exit 1
+        -- and log noise). Files with INTERP get loader + rpath; files
+        -- without get rpath only.
         _info("fallback scan mode, loader=" .. tostring(loader))
         local targets = _collect_targets(target, opts)
         for _, filepath in ipairs(targets) do
             result.scanned = result.scanned + 1
             local any_ok = false
+            local has_interp = _has_pt_interp(filepath, patch_tool)
 
-            if loader then
+            if loader and has_interp then
                 if _exec_ok(_shell_quote(patch_tool.program)
                     .. " --set-interpreter " .. _shell_quote(loader)
                     .. " " .. _shell_quote(filepath)) then
                     any_ok = true
                 end
+            elseif loader and not has_interp then
+                -- Shared library / static binary: skip interp set silently;
+                -- still consider it for rpath. Don't penalize the patched
+                -- count if rpath also succeeds below.
+                any_ok = true
             end
             if rpath and rpath ~= "" then
                 if _exec_ok(_shell_quote(patch_tool.program)
@@ -599,6 +617,14 @@ function M.closure_lib_paths(opt)
     return values
 end
 
+-- Low-level dispatch: pick the right binary-format toolchain.
+--   linux   → ELF / patchelf:           --set-interpreter (PT_INTERP) + --set-rpath
+--   macosx  → Mach-O / install_name_tool: -add_rpath + dylib path rewrites; opts.loader ignored
+--   windows → PE has no INTERP/RPATH analog (DLL search is governed by the
+--             Windows loader: same dir → System32 → PATH). No-op + log.
+-- Higher-level entry points (M._apply, M.set / M.skip predicate path) bail
+-- out earlier on Windows; this dispatch is the last-line guard so direct
+-- callers (M.patch_elf_loader_rpath, legacy auto) stay safe too.
 function M.patch_elf_loader_rpath(target, opts)
     opts = opts or {}
     local result = { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
@@ -758,6 +784,23 @@ function M._apply()
     local empty = { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
     if not _RUNTIME then return empty end
 
+    -- Cross-platform support matrix:
+    --   linux   → ELF + patchelf:        full INTERP + RPATH (predicate path)
+    --   macosx  → Mach-O + install_name_tool: RPATH only; INTERP irrelevant
+    --             (dyld is the kernel's responsibility, no per-binary loader).
+    --             Predicate currently keys off `loader` so it's a no-op on
+    --             macosx unless a dep declares one — which is correct since
+    --             macOS deps shouldn't declare `loader`. Use elfpatch.set({
+    --             rpath = {...} }) explicitly if rpath-only patching needed.
+    --   windows → PE: no INTERP, no RPATH analog. DLL search is governed by
+    --             Windows loader (same-dir → System32 → PATH); patchelf has
+    --             no equivalent. Skip the whole predicate path early.
+    if is_host("windows") then
+        local log = _get_log()
+        if log then log.debug("elfpatch._apply: windows host has no INTERP/RPATH analog; skipping") end
+        return empty
+    end
+
     if _RUNTIME.elfpatch_user_skip then
         local log = _get_log()
         if log then log.debug("elfpatch._apply: user skip") end
@@ -781,19 +824,57 @@ function M._apply()
         return cands
     end
 
-    -- Compose final {loader, rpath, shrink, scan, skip} from either user
-    -- opts (override path) or predicate (default path).
+    -- Predicate resolution. Returns one of:
+    --   { loader=<path>, predicate_kind="self"        }  Rule 1: self-patch (opt-in)
+    --   { loader=<path>, predicate_kind="single", abi }  Rule 4: single dep with loader
+    --   { loader=nil,    predicate_kind="ambiguous"   }  Rule 5: multi-loader → fail-fast
+    --   { loader=nil,    predicate_kind="macos-rpath" }  macOS fallback: rpath-only
+    --   nil                                              no patch
+    --
+    -- ▸ Rule 1 (self-patch) is OPT-IN. A loader-provider declaring
+    --   exports.runtime.loader is publishing metadata for *consumers* —
+    --   it's not asking us to rewrite its own ELF. Auto-self-patch breaks
+    --   ld-linux / libc.so.6 program-header invariants (segfaults at
+    --   execve+1 with SEGV_MAPERR @ 0x8). The provider's install hook
+    --   should pre-relocate its own payload at install time (e.g.
+    --   glibc.lua's __relocate rewrites build-host paths). Opt in via
+    --   elfpatch.set({ self_patch = true }) only when the package author
+    --   has verified the provider is safe to self-patch.
+    --
+    -- ▸ macOS fallback: Mach-O has no INTERP analog (dyld is the kernel's
+    --   responsibility), so deps on macOS shouldn't declare `loader`. But
+    --   consumers still need RPATH closure to find dep dylibs. When no
+    --   loader candidate exists but at least one dep declared `libdirs`,
+    --   fire rpath-only on macOS. Linux deliberately doesn't have this
+    --   fallback — patching only RPATH leaves INTERP pointing at
+    --   build-host glibc, which segfaults at execve.
     local function _resolve_predicate()
-        local self_loader = _RUNTIME.self_exports and _RUNTIME.self_exports.loader
-        if self_loader and self_loader ~= "" then
-            return { loader = self_loader, predicate_kind = "self" }
+        local user_opts = _RUNTIME.elfpatch_user_opts or {}
+        if user_opts.self_patch == true then
+            local self_loader = _RUNTIME.self_exports and _RUNTIME.self_exports.loader
+            if self_loader and self_loader ~= "" then
+                return { loader = self_loader, predicate_kind = "self" }
+            end
         end
         local cands = _loader_candidates()
-        if #cands == 0 then return nil end
         if #cands == 1 then
             return { loader = cands[1].loader, predicate_kind = "single", abi = cands[1].abi }
         end
-        return { loader = nil, predicate_kind = "ambiguous", candidates = cands }
+        if #cands >= 2 then
+            return { loader = nil, predicate_kind = "ambiguous", candidates = cands }
+        end
+        -- 0 loader candidates. macOS-only fallback to rpath-only path.
+        if is_host("macosx") then
+            local rt = (_RUNTIME and _RUNTIME.runtime_deps_list) or {}
+            local exports = (_RUNTIME and _RUNTIME.deps_exports) or {}
+            for _, dep_spec in ipairs(rt) do
+                local e = exports[dep_spec]
+                if e and e.libdirs and #e.libdirs > 0 then
+                    return { loader = nil, predicate_kind = "macos-rpath" }
+                end
+            end
+        end
+        return nil
     end
 
     local effective_loader, effective_rpath, effective_shrink
@@ -843,10 +924,20 @@ function M._apply()
         effective_extra  = {}
     end
 
+    -- An empty loader is only safe to proceed in two cases:
+    --   1. macOS: Mach-O has no INTERP, so rpath-only is the natural patch.
+    --   2. user_set: caller explicitly chose set({ rpath=... }) without an
+    --      interpreter — honor their explicit intent.
+    -- On Linux predicate path, an empty loader means we'd leave INTERP
+    -- pointing at build-host glibc → segfault at execve. Bail safely.
     if not effective_loader or effective_loader == "" then
-        local log = _get_log()
-        if log then log.debug("elfpatch._apply: no loader resolved (source=" .. tostring(source) .. ")") end
-        return empty
+        local platform_allows_no_loader = is_host("macosx")
+        local user_explicitly_chose_rpath_only = (source == "user_set")
+        if not (platform_allows_no_loader or user_explicitly_chose_rpath_only) then
+            local log = _get_log()
+            if log then log.debug("elfpatch._apply: no loader resolved (source=" .. tostring(source) .. ")") end
+            return empty
+        end
     end
 
     -- Build rpath = closure(self libdirs + runtime-dep libdirs + sysroot)

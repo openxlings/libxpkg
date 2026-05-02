@@ -11,12 +11,35 @@ namespace fs  = std::filesystem;
 
 export namespace mcpplibs::xpkg {
 
+// Slim per-dep export info pre-resolved by xlings: paths are already
+// joined with the dep's install_dir, so the Lua side gets ready-to-use
+// absolute paths. Only the fields elfpatch.lua actually needs are
+// surfaced — additional `exports.*` capabilities (data, build) will be
+// injected via separate _RUNTIME tables when those land.
+struct DepExport {
+    std::string loader;                       // absolute path or empty
+    std::vector<std::string> libdirs;         // absolute paths (already joined)
+    std::string abi;                          // e.g. "linux-x86_64-glibc"
+};
+
 struct ExecutionContext {
     std::string pkg_name, version, platform, arch;
     fs::path install_file, install_dir;
     fs::path run_dir, xpkg_dir, bin_dir;
     fs::path project_data_dir;  // project-local data root (empty when no project config)
+    // `deps_list` retained as the legacy union (runtime ∪ build) for
+    // backward compat with old install hooks; new code should consult
+    // `runtime_deps_list` / `build_deps_list` to get the split.
     std::vector<std::string> deps_list, args;
+    std::vector<std::string> runtime_deps_list;
+    std::vector<std::string> build_deps_list;
+    // Pre-resolved exports of each runtime dep. Key is the dep spec as
+    // it appears in runtime_deps_list (e.g. "xim:glibc@2.39"). Only
+    // deps that actually declare exports show up; missing entries mean
+    // "this dep declared nothing — fall back to convention".
+    std::unordered_map<std::string, DepExport> deps_exports;
+    // The current package's own exports (rule 2 in the predicate trigger).
+    DepExport self_exports;
     std::string subos_sysrootdir;
 };
 
@@ -320,13 +343,37 @@ void inject_context(lua::State* L, const mcpplibs::xpkg::ExecutionContext& ctx) 
     set_string_field(L, "project_data_dir",  ctx.project_data_dir.string());
     set_string_field(L, "subos_sysrootdir",  ctx.subos_sysrootdir);
 
-    // deps_list as array table
+    auto push_string_array = [&](const std::vector<std::string>& v, const char* field) {
+        lua::newtable(L);
+        for (int i = 0; i < (int)v.size(); ++i) {
+            lua::pushstring(L, v[i].c_str());
+            lua::rawseti(L, -2, i + 1);
+        }
+        lua::setfield(L, -2, field);
+    };
+    push_string_array(ctx.deps_list,         "deps_list");
+    push_string_array(ctx.runtime_deps_list, "runtime_deps_list");
+    push_string_array(ctx.build_deps_list,   "build_deps_list");
+
+    // deps_exports: { [dep_spec] = { loader, libdirs, abi }, ... }
+    // Only deps that declared exports show up here.
     lua::newtable(L);
-    for (int i = 0; i < (int)ctx.deps_list.size(); ++i) {
-        lua::pushstring(L, ctx.deps_list[i].c_str());
-        lua::rawseti(L, -2, i + 1);
+    for (auto& [dep_spec, e] : ctx.deps_exports) {
+        lua::newtable(L);
+        set_string_field(L, "loader", e.loader);
+        set_string_field(L, "abi",    e.abi);
+        push_string_array(e.libdirs, "libdirs");
+        lua::setfield(L, -2, dep_spec.c_str());
     }
-    lua::setfield(L, -2, "deps_list");
+    lua::setfield(L, -2, "deps_exports");
+
+    // self_exports: same shape as a single deps_exports entry. Empty
+    // strings/arrays when the current package didn't declare exports.
+    lua::newtable(L);
+    set_string_field(L, "loader", ctx.self_exports.loader);
+    set_string_field(L, "abi",    ctx.self_exports.abi);
+    push_string_array(ctx.self_exports.libdirs, "libdirs");
+    lua::setfield(L, -2, "self_exports");
 
     // args as array table
     lua::newtable(L);

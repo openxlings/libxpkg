@@ -253,6 +253,45 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
             }
             lua::pop(L, 1);  // pop inherits field
 
+            // Parse exports block. Schema (all sub-fields optional):
+            //   exports = {
+            //       runtime = {
+            //           loader  = "lib64/ld-linux-x86-64.so.2",  -- libc only
+            //           libdirs = { "lib64", "lib" },            -- non-default only
+            //           abi     = "linux-x86_64-glibc",          -- multi-libc only
+            //       },
+            //   }
+            // Absence of `exports` (or any sub-field) means "use the default
+            // convention" — no export declared, predicate falls through.
+            lua::getfield(L, plat_idx, "exports");
+            if (lua::type(L, -1) == lua::TTABLE) {
+                int exports_idx = lua::gettop(L);
+                ExportsBlock block;
+
+                lua::getfield(L, exports_idx, "runtime");
+                if (lua::type(L, -1) == lua::TTABLE) {
+                    int rt_idx = lua::gettop(L);
+                    lua::getfield(L, rt_idx, "loader");
+                    if (lua::type(L, -1) == lua::TSTRING)
+                        block.runtime.loader = lua::tostring(L, -1);
+                    lua::pop(L, 1);
+
+                    lua::getfield(L, rt_idx, "libdirs");
+                    if (lua::type(L, -1) == lua::TTABLE)
+                        block.runtime.libdirs = parse_string_array(lua::gettop(L));
+                    lua::pop(L, 1);
+
+                    lua::getfield(L, rt_idx, "abi");
+                    if (lua::type(L, -1) == lua::TSTRING)
+                        block.runtime.abi = lua::tostring(L, -1);
+                    lua::pop(L, 1);
+                }
+                lua::pop(L, 1);  // pop runtime sub-table
+
+                xpm.exports[platform] = std::move(block);
+            }
+            lua::pop(L, 1);  // pop exports field
+
             // Iterate version entries
             lua::pushnil(L);
             while (lua::next(L, plat_idx)) {

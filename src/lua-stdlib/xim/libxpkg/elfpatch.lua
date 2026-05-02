@@ -122,6 +122,64 @@ local function _is_elf(filepath)
     return _read_magic(filepath, 4) == "\x7fELF"
 end
 
+-- Read ELF e_machine (offset 18, 2 bytes little-endian for ELFCLASS64
+-- on x86_64; ELF header layout is identical across the two classes for
+-- the e_machine field). Returns nil for non-ELF files.
+local _EM_X86_64  = 62      -- 0x3e
+local _EM_AARCH64 = 183     -- 0xb7
+local _EM_386     = 3
+local _EM_ARM     = 40
+
+local function _read_e_machine(filepath)
+    local f = io.open(filepath, "rb")
+    if not f then return nil end
+    local hdr = f:read(20)
+    f:close()
+    if not hdr or #hdr < 20 then return nil end
+    if hdr:sub(1, 4) ~= "\x7fELF" then return nil end
+    local lo = hdr:byte(19) or 0
+    local hi = hdr:byte(20) or 0
+    return lo + hi * 256
+end
+
+-- Best-effort host-arch detection. Default x86_64 because that's where
+-- xlings's binary distributions live; aarch64 is the second most common.
+-- Mismatch (e.g. an x86_64 host with an aarch64 ELF in install_dir) means
+-- the binary is for a different target and must NOT be patched — patchelf
+-- on it would corrupt or no-op spectacularly. _is_elf_for_host returns
+-- true only when the file is ELF AND its e_machine matches the host.
+local function _host_e_machine()
+    local arch = (os.arch and os.arch()) or "x86_64"
+    if arch:find("aarch64") or arch:find("arm64") then return _EM_AARCH64 end
+    if arch:find("x86_64")  or arch == "x64"      then return _EM_X86_64 end
+    if arch:find("i386")    or arch == "x86"      then return _EM_386 end
+    if arch:find("arm")                            then return _EM_ARM end
+    return _EM_X86_64
+end
+
+local function _is_elf_for_host(filepath)
+    if not _is_elf(filepath) then return false end
+    local em = _read_e_machine(filepath)
+    if not em then return false end
+    return em == _host_e_machine()
+end
+
+-- Read PT_INTERP existence: a static binary has no PT_INTERP segment;
+-- patchelf is a no-op on it, but checking lets us skip the fork+exec.
+-- Quick & approximate check: we run `patchelf --print-interpreter` and
+-- look at exit status. If patchelf isn't around yet, skip the check
+-- (patchelf will be a no-op anyway).
+local function _has_pt_interp(filepath, patch_tool)
+    if not patch_tool then return true end
+    local cmd = _shell_quote(patch_tool.program)
+        .. " --print-interpreter " .. _shell_quote(filepath) .. _err_redirect()
+    local h = io.popen(cmd, "r")
+    if not h then return true end
+    local out = h:read("*a") or ""
+    h:close()
+    return out:gsub("%s+", "") ~= ""
+end
+
 local function _is_macho(filepath)
     local magic = _read_magic(filepath, 4)
     if magic == "\xfe\xed\xfa\xce"
@@ -487,47 +545,56 @@ end
 function M.closure_lib_paths(opt)
     opt = opt or {}
     local values, seen = {}, {}
+    local function _push(p)
+        if p and not seen[p] then seen[p] = true; table.insert(values, p) end
+    end
 
-    local install_dir = _RUNTIME and _RUNTIME.install_dir
-    if install_dir then
-        for _, sub in ipairs({"lib64", "lib"}) do
-            local self_libdir = path.join(install_dir, sub)
-            if os.isdir(self_libdir) and not seen[self_libdir] then
-                seen[self_libdir] = true
-                table.insert(values, self_libdir)
-                break
+    -- Self libdirs: prefer self_exports.libdirs (already absolute, declared
+    -- by the package itself); fall back to {lib64, lib} convention.
+    local self_libdirs = _RUNTIME and _RUNTIME.self_exports and _RUNTIME.self_exports.libdirs
+    if self_libdirs and #self_libdirs > 0 then
+        for _, d in ipairs(self_libdirs) do _push(d) end
+    else
+        local install_dir = _RUNTIME and _RUNTIME.install_dir
+        if install_dir then
+            for _, sub in ipairs({"lib64", "lib"}) do
+                local self_libdir = path.join(install_dir, sub)
+                if os.isdir(self_libdir) then _push(self_libdir); break end
             end
         end
     end
 
-    local deps_list = opt.deps_list or (_RUNTIME and _RUNTIME.deps_list) or {}
+    -- Per-dep libdirs: prefer runtime_deps_list (post-#249 split, avoids
+    -- build_dep RPATH pollution). Old callers passing opt.deps_list keep
+    -- working. For each dep, prefer deps_exports[spec].libdirs (declared
+    -- via the provides side) when present; fall back to {lib64, lib}
+    -- convention via pkginfo.dep_install_dir lookup.
+    local deps_list = opt.deps_list
+        or (_RUNTIME and (_RUNTIME.runtime_deps_list or _RUNTIME.deps_list))
+        or {}
+    local deps_exports = _RUNTIME and _RUNTIME.deps_exports or {}
     for _, dep_spec in ipairs(deps_list) do
-        local dep_name = dep_spec:gsub("@.*", ""):gsub("^.+:", "")
-        local dep_version = dep_spec:find("@", 1, true) and dep_spec:match("@(.+)") or nil
-        local dep_dir = nil
-        if _LIBXPKG_MODULES and _LIBXPKG_MODULES.pkginfo then
-            dep_dir = _LIBXPKG_MODULES.pkginfo.dep_install_dir(dep_name, dep_version)
-        end
-        if dep_dir then
-            for _, sub in ipairs({"lib64", "lib"}) do
-                local libdir = path.join(dep_dir, sub)
-                if os.isdir(libdir) and not seen[libdir] then
-                    seen[libdir] = true
-                    table.insert(values, libdir)
-                    break
+        local declared = deps_exports[dep_spec]
+        if declared and declared.libdirs and #declared.libdirs > 0 then
+            for _, d in ipairs(declared.libdirs) do _push(d) end
+        else
+            local dep_name    = dep_spec:gsub("@.*", ""):gsub("^.+:", "")
+            local dep_version = dep_spec:find("@", 1, true) and dep_spec:match("@(.+)") or nil
+            local dep_dir
+            if _LIBXPKG_MODULES and _LIBXPKG_MODULES.pkginfo then
+                dep_dir = _LIBXPKG_MODULES.pkginfo.dep_install_dir(dep_name, dep_version)
+            end
+            if dep_dir then
+                for _, sub in ipairs({"lib64", "lib"}) do
+                    local libdir = path.join(dep_dir, sub)
+                    if os.isdir(libdir) then _push(libdir); break end
                 end
             end
         end
     end
 
     local sysroot = _RUNTIME and _RUNTIME.subos_sysrootdir
-    if sysroot and sysroot ~= "" then
-        local subos_lib = path.join(sysroot, "lib")
-        if not seen[subos_lib] then
-            seen[subos_lib] = true
-            table.insert(values, subos_lib)
-        end
-    end
+    if sysroot and sysroot ~= "" then _push(path.join(sysroot, "lib")) end
 
     return values
 end
@@ -607,66 +674,217 @@ function M.set_rpath(target, rpath, opts)
     return result
 end
 
+-- ─────────────────────────────────────────────────────────────────────
+-- Public API (v0.1.0+) — declarative ElfPatch
+-- ─────────────────────────────────────────────────────────────────────
+--
+-- Default (consumer install hook does nothing): xlings post-install
+-- predicate-driven trigger applies elfpatch automatically when the
+-- consumer's runtime deps include a package that declared
+-- `xpm.<plat>.exports.runtime.loader`.
+--
+-- Hook-level overrides (in order of precedence):
+--
+--   elfpatch.skip()              → don't auto-patch this package
+--   elfpatch.set({...})          → use these params (predicate stays off)
+--
+-- Override is "覆盖式" — once set is called, the predicate-driven auto
+-- path stops; xlings uses exactly the params provided. If you want
+-- partial customisation, prefer providing all required fields explicitly
+-- (loader / rpath) rather than mixing.
+--
+-- Lower-level escape hatches (rare, advanced):
+--   elfpatch.patch_elf_loader_rpath(target, opts)   manual call
+--   elfpatch.closure_lib_paths(opts)                compute rpath only
+function M.set(opts)
+    _RUNTIME = _RUNTIME or {}
+    _RUNTIME.elfpatch_user_override = true
+    _RUNTIME.elfpatch_user_opts = opts or {}
+end
+
+function M.skip()
+    _RUNTIME = _RUNTIME or {}
+    _RUNTIME.elfpatch_user_skip = true
+end
+
+-- ─────────────────────────────────────────────────────────────────────
+-- DEPRECATED — half-year transition compat (drop after 2026-11)
+-- ─────────────────────────────────────────────────────────────────────
+-- Old API: elfpatch.auto({enable, shrink, bins, libs, interpreter, rpath})
+-- mapped to elfpatch.set({...}). Logs once at debug level so verbose
+-- mode users see who's still on the old path; silent in normal mode.
+local _auto_warn_once = false
 function M.auto(enable_or_opts)
+    if not _auto_warn_once then
+        _auto_warn_once = true
+        local log = _get_log()
+        if log then
+            log.debug("elfpatch.auto() is deprecated; use elfpatch.set({...}) "
+                .. "or elfpatch.skip(). The old API will be removed after 2026-11.")
+        end
+    end
     _RUNTIME = _RUNTIME or {}
     if type(enable_or_opts) == "table" then
-        if enable_or_opts.enable ~= nil then
-            _RUNTIME.elfpatch_auto = (enable_or_opts.enable == true)
+        if enable_or_opts.enable == false then return M.skip() end
+        local opts = {
+            shrink      = enable_or_opts.shrink,
+            interpreter = enable_or_opts.interpreter,
+            extra_rpath = enable_or_opts.rpath,
+        }
+        -- Old `bins`/`libs` were per-directory whitelists; map to new `scan`.
+        local scan_dirs = {}
+        for _, d in ipairs(enable_or_opts.bins or {}) do table.insert(scan_dirs, d) end
+        for _, d in ipairs(enable_or_opts.libs or {}) do table.insert(scan_dirs, d) end
+        if #scan_dirs > 0 then opts.scan = scan_dirs end
+        return M.set(opts)
+    elseif enable_or_opts == false then
+        return M.skip()
+    end
+    -- enable_or_opts == true or nil → enable predicate-driven auto.
+    -- That's the default, so do nothing (don't touch user_override / skip).
+end
+
+-- Internal apply, called by xlings's apply_elfpatch_auto() after the
+-- install hook returns. Decision tree mirrors the design doc:
+--   1. user_skip  → return
+--   2. user_override → use hook-given opts
+--   3. self_exports.loader exists → use own loader (e.g. glibc itself)
+--   4. exactly one runtime-dep with exports.loader → use it
+--   5. ≥ 2 such deps → require interp_from in user_opts (fail-fast)
+--   6. otherwise → no patch
+function M._apply()
+    local empty = { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+    if not _RUNTIME then return empty end
+
+    if _RUNTIME.elfpatch_user_skip then
+        local log = _get_log()
+        if log then log.debug("elfpatch._apply: user skip") end
+        return empty
+    end
+
+    local target = (_RUNTIME and _RUNTIME.install_dir)
+    if not target then return empty end
+
+    -- Helper: scan runtime deps for loader providers.
+    local function _loader_candidates()
+        local cands = {}
+        local rt = (_RUNTIME and _RUNTIME.runtime_deps_list) or {}
+        local exports = (_RUNTIME and _RUNTIME.deps_exports) or {}
+        for _, dep_spec in ipairs(rt) do
+            local e = exports[dep_spec]
+            if e and e.loader and e.loader ~= "" then
+                table.insert(cands, { spec = dep_spec, loader = e.loader, abi = e.abi })
+            end
         end
-        if enable_or_opts.shrink ~= nil then
-            _RUNTIME.elfpatch_shrink = (enable_or_opts.shrink == true)
+        return cands
+    end
+
+    -- Compose final {loader, rpath, shrink, scan, skip} from either user
+    -- opts (override path) or predicate (default path).
+    local function _resolve_predicate()
+        local self_loader = _RUNTIME.self_exports and _RUNTIME.self_exports.loader
+        if self_loader and self_loader ~= "" then
+            return { loader = self_loader, predicate_kind = "self" }
         end
-        -- Declarative bin/lib directories
-        if enable_or_opts.bins then
-            _RUNTIME.elfpatch_bins = enable_or_opts.bins
+        local cands = _loader_candidates()
+        if #cands == 0 then return nil end
+        if #cands == 1 then
+            return { loader = cands[1].loader, predicate_kind = "single", abi = cands[1].abi }
         end
-        if enable_or_opts.libs then
-            _RUNTIME.elfpatch_libs = enable_or_opts.libs
+        return { loader = nil, predicate_kind = "ambiguous", candidates = cands }
+    end
+
+    local effective_loader, effective_rpath, effective_shrink
+    local effective_scan, effective_skip, effective_extra
+    local source
+
+    if _RUNTIME.elfpatch_user_override then
+        local u = _RUNTIME.elfpatch_user_opts or {}
+        if u.enable == false then return empty end
+        source = "user_set"
+        if u.interpreter and u.interpreter ~= "" then
+            effective_loader = u.interpreter
+        elseif u.interp_from and u.interp_from ~= "" then
+            for _, c in ipairs(_loader_candidates()) do
+                if c.abi == u.interp_from then effective_loader = c.loader; break end
+            end
+            if not effective_loader then
+                _warn("elfpatch.set: interp_from='" .. u.interp_from
+                    .. "' did not match any runtime-dep loader provider")
+                return empty
+            end
         end
-        -- Optional: custom interpreter and rpath (absolute paths)
-        if enable_or_opts.interpreter then
-            _RUNTIME.elfpatch_interpreter = enable_or_opts.interpreter
-        end
-        if enable_or_opts.rpath then
-            _RUNTIME.elfpatch_rpath = enable_or_opts.rpath
-        end
+        effective_shrink = (u.shrink ~= nil) and u.shrink or false
+        effective_scan   = u.scan
+        effective_skip   = u.skip
+        effective_extra  = u.extra_rpath or {}
     else
-        _RUNTIME.elfpatch_auto = (enable_or_opts == true)
+        local r = _resolve_predicate()
+        if not r then
+            local log = _get_log()
+            if log then log.debug("elfpatch._apply: no loader provider in deps; skipping") end
+            return empty
+        end
+        if r.predicate_kind == "ambiguous" then
+            local lines = {}
+            for _, c in ipairs(r.candidates) do
+                table.insert(lines, "  - " .. c.spec .. " (abi: " .. tostring(c.abi) .. ")")
+            end
+            _warn("elfpatch._apply: multiple loader providers in runtime deps:\n"
+                .. table.concat(lines, "\n")
+                .. "\nUse elfpatch.set({ interp_from = \"<abi>\" }) in install hook to disambiguate.")
+            return empty
+        end
+        source = ("predicate:" .. r.predicate_kind)
+        effective_loader = r.loader
+        effective_shrink = false
+        effective_extra  = {}
     end
-    return _RUNTIME.elfpatch_auto
-end
 
-function M.is_auto()
-    return _RUNTIME and _RUNTIME.elfpatch_auto == true
-end
-
-function M.is_shrink()
-    return _RUNTIME and _RUNTIME.elfpatch_shrink == true
-end
-
-function M.apply_auto(opts)
-    opts = opts or {}
-    if not M.is_auto() then
-        return { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+    if not effective_loader or effective_loader == "" then
+        local log = _get_log()
+        if log then log.debug("elfpatch._apply: no loader resolved (source=" .. tostring(source) .. ")") end
+        return empty
     end
 
-    local target = opts.target or (_RUNTIME and _RUNTIME.install_dir)
-    local rpath = opts.rpath or M.closure_lib_paths({
-        deps_list = _RUNTIME and _RUNTIME.deps_list
-    })
-    local shrink = opts.shrink
-    if shrink == nil then
-        shrink = M.is_shrink()
+    -- Build rpath = closure(self libdirs + runtime-dep libdirs + sysroot)
+    -- + any extra_rpath the user added via set({...}).
+    effective_rpath = M.closure_lib_paths({})
+    for _, p in ipairs(effective_extra or {}) do
+        table.insert(effective_rpath, p)
+    end
+
+    local log = _get_log()
+    if log then
+        log.debug("elfpatch._apply: source=" .. source
+            .. " loader=" .. tostring(effective_loader))
     end
 
     return M.patch_elf_loader_rpath(target, {
-        loader = opts.loader or "subos",
-        rpath = rpath,
-        shrink = shrink,
-        include_shared_libs = opts.include_shared_libs,
-        recurse = opts.recurse,
-        strict = opts.strict,
+        loader = effective_loader,
+        rpath  = effective_rpath,
+        shrink = effective_shrink,
+        scan   = effective_scan,
+        skip   = effective_skip,
     })
+end
+
+-- Backward-compat shim for the old name. xlings's apply_elfpatch_auto
+-- still calls `apply_auto`; pointing it at `_apply` keeps things working
+-- without a libxpkg/xlings lockstep upgrade.
+function M.apply_auto(opts)
+    return M._apply()
+end
+
+-- Legacy queries used by some packages; map to the new state.
+function M.is_auto()
+    return not (_RUNTIME and _RUNTIME.elfpatch_user_skip)
+end
+function M.is_shrink()
+    if _RUNTIME and _RUNTIME.elfpatch_user_opts then
+        return _RUNTIME.elfpatch_user_opts.shrink == true
+    end
+    return false
 end
 
 return M

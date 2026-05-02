@@ -127,3 +127,48 @@ TEST(LoaderTest, LoadPackage_DepsSplit_KeepsSeparation) {
     std::vector<std::string> expectedUnion{"node", "npm", "gcc", "patchelf"};
     EXPECT_EQ(un->second, expectedUnion);
 }
+
+// exports.runtime with all sub-fields populated must round-trip through the
+// parser. This is the "happy path" for declarative provider metadata.
+TEST(LoaderTest, LoadPackage_ExportsFull) {
+    auto result = load_package(PKGINDEX / "pkgs/e/exportsfull.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+
+    auto& xpm = result->xpm;
+    auto eit = xpm.exports.find("linux");
+    ASSERT_NE(eit, xpm.exports.end());
+    auto& rt = eit->second.runtime;
+
+    EXPECT_EQ(rt.loader, "lib64/ld-linux-x86-64.so.2");
+    EXPECT_EQ(rt.abi, "linux-x86_64-glibc");
+    std::vector<std::string> expectedLibdirs{"lib64", "lib", "usr/lib"};
+    EXPECT_EQ(rt.libdirs, expectedLibdirs);
+}
+
+// Partial declaration: only `loader` set, libdirs/abi omitted — must parse
+// without error and leave the omitted fields empty (consumers fall back to
+// the {lib64, lib} convention for libdirs).
+TEST(LoaderTest, LoadPackage_ExportsLoaderOnly) {
+    auto result = load_package(PKGINDEX / "pkgs/e/exportsloaderonly.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+
+    auto& xpm = result->xpm;
+    auto eit = xpm.exports.find("linux");
+    ASSERT_NE(eit, xpm.exports.end());
+    auto& rt = eit->second.runtime;
+
+    EXPECT_EQ(rt.loader, "lib/ld-musl-x86_64.so.1");
+    EXPECT_TRUE(rt.libdirs.empty());
+    EXPECT_TRUE(rt.abi.empty());
+}
+
+// Packages without an `exports` block must remain valid; the platform's
+// exports map entry simply doesn't exist (consumers see "no provider
+// declared" and the predicate trigger falls through to no-op).
+TEST(LoaderTest, LoadPackage_NoExports) {
+    auto result = load_package(PKGINDEX / "pkgs/h/hello.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+
+    auto& xpm = result->xpm;
+    EXPECT_EQ(xpm.exports.find("linux"), xpm.exports.end());
+}

@@ -435,6 +435,88 @@ TEST(ExecutorTest, ApplyElfpatchAuto_LinuxUsesPatchelfForElf) {
     fs::remove_all(temp_dir);
 }
 
+// Regression: patchelf 0.18.0 corrupts compact ELFs (e.g. ninja 1.12.1
+// at 273 KB) when --set-interpreter runs before --set-rpath. The interp
+// op extends PT_LOAD and shifts the dynamic section; the subsequent
+// rpath op operates on stale offsets and writes through DT_NEEDED,
+// segfaulting the binary at execve+1. Workaround: rpath must run first,
+// interp second. See docs/plans/2026-05-03-patchelf-order-bug-analysis.md.
+TEST(ExecutorTest, ApplyElfpatchAuto_LinuxRpathBeforeInterpreter) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Linux tool emulation test is POSIX-specific";
+#endif
+
+    const fs::path temp_dir = make_temp_dir("libxpkg-elfpatch-order-");
+    const fs::path tools_dir = temp_dir / "tools";
+    const fs::path install_dir = temp_dir / "install";
+    const fs::path lib_dir = install_dir / "lib";
+    const fs::path log_path = temp_dir / "tool.log";
+    const fs::path pkg_path = temp_dir / "elfpatch-order.lua";
+    const fs::path binary_path = install_dir / "demo-bin";
+
+    fs::create_directories(tools_dir);
+    fs::create_directories(lib_dir);
+
+    // Fake patchelf logs every invocation; --print-interpreter returns
+    // a non-empty string so _has_pt_interp treats the file as having
+    // PT_INTERP (we want to exercise both ops on the same file).
+    write_executable_script(tools_dir / "patchelf",
+                            "#!/bin/sh\n"
+                            "if [ \"$1\" = \"--print-interpreter\" ]; then\n"
+                            "  echo /lib64/ld-linux-x86-64.so.2\n"
+                            "  exit 0\n"
+                            "fi\n"
+                            "printf 'patchelf %s\\n' \"$*\" >> \"$ELFPATCH_LOG\"\n");
+
+    {
+        std::ofstream binary(binary_path, std::ios::binary);
+        ASSERT_TRUE(binary.good());
+        const unsigned char magic[] = {0x7f, 'E', 'L', 'F', 0, 0, 0, 0};
+        binary.write(reinterpret_cast<const char*>(magic), sizeof(magic));
+    }
+    fs::permissions(binary_path,
+                    fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec,
+                    fs::perm_options::replace);
+
+    write_text(pkg_path,
+               "package = { spec = \"1\", name = \"elfpatch-order\", xpm = { linux = { [\"latest\"] = { ref = \"1.0.0\" }, [\"1.0.0\"] = { url = \"https://example.com/demo.tar.gz\", sha256 = \"0\" } } } }\n"
+               "local elfpatch = import(\"xim.libxpkg.elfpatch\")\n"
+               "function install()\n"
+               // explicit interpreter so we bypass _resolve_loader's "subos"
+               // default (the system probe fails in this hermetic test env);
+               // we just need both --set-rpath and --set-interpreter to fire.
+               "    elfpatch.auto({ enable = true, interpreter = \"/lib64/ld-linux-x86-64.so.2\" })\n"
+               "    return true\n"
+               "end\n");
+
+    const std::string original_path = std::getenv("PATH") ? std::getenv("PATH") : "";
+    ScopedEnvVar path_env("PATH", tools_dir.string() + ":" + original_path);
+    ScopedEnvVar log_env("ELFPATCH_LOG", log_path.string());
+
+    auto exec = create_executor(pkg_path);
+    ASSERT_TRUE(exec.has_value()) << (exec ? "" : exec.error());
+
+    auto hook_result = exec->run_hook(HookType::Install, make_context(install_dir, "linux", tools_dir));
+    ASSERT_TRUE(hook_result.success) << hook_result.error;
+    auto patch_result = exec->apply_elfpatch_auto();
+    ASSERT_TRUE(patch_result.success) << patch_result.error;
+
+    std::ifstream log_file(log_path);
+    std::ostringstream log_buffer;
+    log_buffer << log_file.rdbuf();
+    const std::string log = log_buffer.str();
+
+    auto rpath_pos  = log.find("--set-rpath");
+    auto interp_pos = log.find("--set-interpreter");
+    ASSERT_NE(rpath_pos,  std::string::npos) << "expected --set-rpath in log; got:\n" << log;
+    ASSERT_NE(interp_pos, std::string::npos) << "expected --set-interpreter in log; got:\n" << log;
+    EXPECT_LT(rpath_pos, interp_pos)
+        << "--set-rpath must be invoked BEFORE --set-interpreter to avoid "
+           "patchelf 0.18.0's compact-ELF corruption bug. Log:\n" << log;
+
+    fs::remove_all(temp_dir);
+}
+
 TEST(ExecutorTest, ApplyElfpatchAuto_MacOsUsesInstallNameToolForMachO) {
 #ifdef _WIN32
     GTEST_SKIP() << "macOS tool emulation test is POSIX-specific";

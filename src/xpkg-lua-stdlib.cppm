@@ -1356,6 +1356,18 @@ end
 -- Patch directories as executables (interpreter + rpath). Files without
 -- PT_INTERP (shared libs that happened to land in a bin dir, static
 -- binaries) get rpath-only treatment instead of failing the whole entry.
+--
+-- Op order: --set-rpath FIRST, then --set-interpreter. patchelf 0.18.0
+-- has an order-sensitive corruption bug on compact ELFs (≤ ~280 KB,
+-- e.g. ninja 1.12.1 at 273 KB): when --set-interpreter runs first, it
+-- extends PT_LOAD and shifts the dynamic section; the subsequent
+-- --set-rpath operates on stale offsets and writes through DT_NEEDED,
+-- corrupting the binary irreversibly (loader segfaults at execve+1).
+-- Note this is patchelf's INTERNAL processing order — passing both
+-- flags in a single command also fails because patchelf processes
+-- interp before rpath internally regardless of CLI order. The
+-- workaround is two separate invocations in reverse order.
+-- See docs/plans/2026-05-03-patchelf-order-bug-analysis.md.
 local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpath, shrink, result)
     for _, dir in ipairs(dirs) do
         local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
@@ -1363,14 +1375,14 @@ local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpa
         for _, filepath in ipairs(targets) do
             result.scanned = result.scanned + 1
             local ok = true
-            if loader and _has_pt_interp(filepath, patch_tool) then
-                ok = _exec_ok(_shell_quote(patch_tool.program)
-                    .. " --set-interpreter " .. _shell_quote(loader)
-                    .. " " .. _shell_quote(filepath))
-            end
-            if ok and rpath and rpath ~= "" then
+            if rpath and rpath ~= "" then
                 ok = _exec_ok(_shell_quote(patch_tool.program)
                     .. " --set-rpath " .. _shell_quote(rpath)
+                    .. " " .. _shell_quote(filepath))
+            end
+            if ok and loader and _has_pt_interp(filepath, patch_tool) then
+                ok = _exec_ok(_shell_quote(patch_tool.program)
+                    .. " --set-interpreter " .. _shell_quote(loader)
                     .. " " .. _shell_quote(filepath))
             end
             if ok then
@@ -1393,6 +1405,10 @@ local function _patch_elf_libraries(patch_tool, dirs, install_dir, rpath, shrink
             local ok = true
             if rpath and rpath ~= "" then
                 ok = _exec_ok(_shell_quote(patch_tool.program)
+)__LUA__";
+
+inline constexpr std::string_view elfpatch_lua_1 = R"__LUA__(
+
                     .. " --set-rpath " .. _shell_quote(rpath)
                     .. " " .. _shell_quote(filepath))
             end
@@ -1416,10 +1432,6 @@ local function _patch_elf(target, opts, result)
     local loader = _resolve_loader(opts.loader)
     local rpath = _normalize_rpath(opts.rpath)
     if opts.loader and not loader then
-)__LUA__";
-
-inline constexpr std::string_view elfpatch_lua_1 = R"__LUA__(
-
         local msg = "cannot resolve loader: " .. tostring(opts.loader)
         if opts.strict then
             error(msg)
@@ -1456,6 +1468,11 @@ inline constexpr std::string_view elfpatch_lua_1 = R"__LUA__(
         -- legitimately have no INTERP segment, causing patchelf to exit 1
         -- and log noise). Files with INTERP get loader + rpath; files
         -- without get rpath only.
+        --
+        -- Op order: --set-rpath FIRST, then --set-interpreter. See
+        -- _patch_elf_executables comment for why (patchelf 0.18.0 small-
+        -- ELF corruption bug) and docs/plans/2026-05-03-patchelf-order-
+        -- bug-analysis.md for full analysis.
         _info("fallback scan mode, loader=" .. tostring(loader))
         local targets = _collect_targets(target, opts)
         for _, filepath in ipairs(targets) do
@@ -1463,6 +1480,13 @@ inline constexpr std::string_view elfpatch_lua_1 = R"__LUA__(
             local any_ok = false
             local has_interp = _has_pt_interp(filepath, patch_tool)
 
+            if rpath and rpath ~= "" then
+                if _exec_ok(_shell_quote(patch_tool.program)
+                    .. " --set-rpath " .. _shell_quote(rpath)
+                    .. " " .. _shell_quote(filepath)) then
+                    any_ok = true
+                end
+            end
             if loader and has_interp then
                 if _exec_ok(_shell_quote(patch_tool.program)
                     .. " --set-interpreter " .. _shell_quote(loader)
@@ -1472,15 +1496,8 @@ inline constexpr std::string_view elfpatch_lua_1 = R"__LUA__(
             elseif loader and not has_interp then
                 -- Shared library / static binary: skip interp set silently;
                 -- still consider it for rpath. Don't penalize the patched
-                -- count if rpath also succeeds below.
+                -- count if rpath alone succeeded above.
                 any_ok = true
-            end
-            if rpath and rpath ~= "" then
-                if _exec_ok(_shell_quote(patch_tool.program)
-                    .. " --set-rpath " .. _shell_quote(rpath)
-                    .. " " .. _shell_quote(filepath)) then
-                    any_ok = true
-                end
             end
 
             if any_ok then
@@ -1752,6 +1769,10 @@ function M.auto(enable_or_opts)
     else
         _RUNTIME.elfpatch_legacy_auto = (enable_or_opts == true)
     end
+)__LUA__";
+
+inline constexpr std::string_view elfpatch_lua_2 = R"__LUA__(
+
     return _RUNTIME.elfpatch_legacy_auto
 end
 
@@ -1772,10 +1793,6 @@ function M._apply()
     --   macosx  → Mach-O + install_name_tool: RPATH only; INTERP irrelevant
     --             (dyld is the kernel's responsibility, no per-binary loader).
     --             Predicate currently keys off `loader` so it's a no-op on
-)__LUA__";
-
-inline constexpr std::string_view elfpatch_lua_2 = R"__LUA__(
-
     --             macosx unless a dep declares one — which is correct since
     --             macOS deps shouldn't declare `loader`. Use elfpatch.set({
     --             rpath = {...} }) explicitly if rpath-only patching needed.

@@ -108,15 +108,37 @@ os.cp = function(src, dst, opts)
     outf:write(content); outf:close()
     return true
 end
+-- POSIX: shell-escape a glob pattern, keeping glob meta-chars raw so the
+-- shell still expands them. Quoting the whole pattern (e.g. "/tmp/x/v*")
+-- suppresses globbing — `ls -d "/tmp/x/v*"` would only match a file
+-- literally named `v*`. Instead we backslash-escape characters that need
+-- shell quoting (whitespace, $, `, ', ", redirects, etc.) and leave glob
+-- meta (* ? [ ] ~) untouched.
+local _SHELL_META_NO_GLOB = " \t\r\n$`'\"<>|&;()!\\"
+local function _shell_glob_escape(s)
+    local out = {}
+    for i = 1, #s do
+        local c = s:sub(i, i)
+        if _SHELL_META_NO_GLOB:find(c, 1, true) then
+            out[#out+1] = "\\"
+        end
+        out[#out+1] = c
+    end
+    return table.concat(out)
+end
+
 os.dirs = function(pattern)
     local result = {}
-    -- Quote pattern to handle spaces; use platform-appropriate command
     local sep = _PATH_SEP
     local cmd
     if sep == "\\" then
+        -- cmd.exe `dir` does its own wildcard expansion on the pattern
+        -- argument, so quoting is safe and required for paths with spaces.
         cmd = 'dir /B /AD "' .. pattern .. '" 2>nul'
     else
-        cmd = 'ls -d "' .. pattern .. '" 2>/dev/null'
+        -- POSIX `ls` does NOT expand globs itself; the shell does. Escape
+        -- shell metachars but leave glob meta raw so expansion still works.
+        cmd = 'ls -d ' .. _shell_glob_escape(pattern) .. ' 2>/dev/null'
     end
     local f = io.popen(cmd)
     if f then

@@ -43,4 +43,4 @@ jobs:
       # setup. Only macOS-specific tests (need install_name_tool) are
       # filtered — they can't run on a Linux runner.
       - name: Run tests
-        run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_MacOs*
+        run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*

@@ -26,8 +26,23 @@ jobs:
       - name: Install workspace tools (.xlings.json → mcpp 0.0.3)
         run: xlings install -y
 
+      # Cache mcpp's self-bootstrapped sandbox (musl-gcc + binutils +
+      # glibc + ninja + patchelf, ~800 MB). Toolchain set is pinned by
+      # mcpp 0.0.3, so a fixed key suffices.
+      - name: Cache mcpp sandbox
+        uses: actions/cache@v4
+        with:
+          path: ~/.xlings/data/xpkgs/xim-x-mcpp/0.0.3/registry
+          key: mcpp-sandbox-${{ runner.os }}-mcpp0.0.3
+
+      # Linux elfpatch tests shell out to a `patchelf` binary; install
+      # the apt copy here so we can run them. `install_name_tool` is
+      # macOS-only — those `*MacOs*` tests stay filtered.
+      - name: Install patchelf (Linux elfpatch tests)
+        run: sudo apt-get update -qq && sudo apt-get install -y patchelf
+
       - name: Build with mcpp
         run: mcpp build
 
-      - name: Run tests (skip ExecutorTest.ApplyElfpatchAuto_* — needs patchelf/install_name_tool which the runner doesn't ship)
-        run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*
+      - name: Run tests (filter macOS-only tests)
+        run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_MacOs*

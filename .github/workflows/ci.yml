@@ -23,11 +23,24 @@ jobs:
           "/tmp/xlings-${XLINGS_VERSION}-linux-x86_64/subos/default/bin/xlings" self install
           echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
 
-      - name: Install workspace tools (.xlings.json → mcpp 0.0.3)
+      - name: Install workspace tools (.xlings.json → mcpp 0.0.4)
         run: xlings install -y
+
+      # Cache mcpp's self-bootstrapped sandbox (musl-gcc + binutils +
+      # glibc + ninja + patchelf, ~800 MB). Toolchain set is pinned by
+      # mcpp 0.0.4, so a fixed key suffices.
+      - name: Cache mcpp sandbox
+        uses: actions/cache@v4
+        with:
+          path: ~/.xlings/data/xpkgs/xim-x-mcpp/0.0.4/registry
+          key: mcpp-sandbox-${{ runner.os }}-mcpp0.0.4
 
       - name: Build with mcpp
         run: mcpp build
 
-      - name: Run tests (skip ExecutorTest.ApplyElfpatchAuto_* — needs patchelf/install_name_tool which the runner doesn't ship)
-        run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*
+      # mcpp 0.0.4 auto-prepends sandbox PATH (patchelf, ninja) for
+      # test binaries, so Linux elfpatch tests run without manual PATH
+      # setup. Only macOS-specific tests (need install_name_tool) are
+      # filtered — they can't run on a Linux runner.
+      - name: Run tests
+        run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_MacOs*

@@ -15,6 +15,34 @@ function import(mod_path)
         _G[name] = _LIBXPKG_MODULES[name]
         return _LIBXPKG_MODULES[name]
     end
+    -- pkgindex custom modules: import("xim.pkgindex.<name>")
+    -- Loads <pkgindex_dir>/libs/<name>.lua from the package index repository.
+    -- Modules are cached in _LIBXPKG_MODULES after first load.
+    local pkgindex_mod = mod_path:match("xim%.pkgindex%.(.+)")
+    if pkgindex_mod then
+        -- Check cache first
+        if _LIBXPKG_MODULES[pkgindex_mod] then
+            _G[pkgindex_mod] = _LIBXPKG_MODULES[pkgindex_mod]
+            return _LIBXPKG_MODULES[pkgindex_mod]
+        end
+        -- _PKGINDEX_DIR is set early (before L_dofile) so top-level imports work;
+        -- _RUNTIME.pkgindex_dir is set later by inject_context for hook calls.
+        local pkgindex_dir = _PKGINDEX_DIR
+            or (_RUNTIME and _RUNTIME.pkgindex_dir)
+        if pkgindex_dir and pkgindex_dir ~= "" then
+            local mod_file = pkgindex_dir .. "/libs/" .. pkgindex_mod .. ".lua"
+            local loader = loadfile(mod_file)
+            if loader then
+                local ok, mod = pcall(loader)
+                if ok and mod then
+                    _LIBXPKG_MODULES[pkgindex_mod] = mod
+                    _G[pkgindex_mod] = mod
+                    return mod
+                end
+            end
+        end
+    end
+
     -- Stub for unknown imports (platform, base.runtime, etc.)
     local log = _LIBXPKG_MODULES and _LIBXPKG_MODULES["log"]
     if log then log.debug("unknown module '%s', returning stub", mod_path) end

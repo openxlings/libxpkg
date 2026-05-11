@@ -41,6 +41,7 @@ struct ExecutionContext {
     // The current package's own exports (rule 2 in the predicate trigger).
     DepExport self_exports;
     std::string subos_sysrootdir;
+    std::string pkgindex_dir;    // package index repo root (for custom module loading)
 };
 
 struct HookResult {
@@ -266,6 +267,229 @@ void register_os_funcs(lua::State* L) {
     lua::pop(L, 1); // pop os table
 }
 
+// Register C++-backed fs module into _LIBXPKG_MODULES["fs"].
+// Provides filesystem primitives that are missing from the os.* layer:
+// symlink creation/reading, file/dir enumeration, single-file copy, etc.
+// All functions use std::filesystem — no shell commands.
+void register_fs_module(lua::State* L) {
+    lua::newtable(L);  // the fs module table
+
+    // fs.symlink(src, dst) -> bool
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* src = lua::tostring(L, 1);
+        const char* dst = lua::tostring(L, 2);
+        if (!src || !dst) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        fs::path sp(src);
+        if (fs::is_directory(sp, ec))
+            fs::create_directory_symlink(sp, fs::path(dst), ec);
+        else
+            fs::create_symlink(sp, fs::path(dst), ec);
+        lua::pushboolean(L, ec ? 0 : 1);
+        return 1;
+    });
+    lua::setfield(L, -2, "symlink");
+
+    // fs.readlink(path) -> string | nil
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushnil(L); return 1; }
+        std::error_code ec;
+        auto target = fs::read_symlink(fs::path(p), ec);
+        if (ec) { lua::pushnil(L); return 1; }
+        lua::pushstring(L, target.string().c_str());
+        return 1;
+    });
+    lua::setfield(L, -2, "readlink");
+
+    // fs.is_symlink(path) -> bool
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        lua::pushboolean(L, fs::is_symlink(fs::path(p), ec) ? 1 : 0);
+        return 1;
+    });
+    lua::setfield(L, -2, "is_symlink");
+
+    // fs.exists(path) -> bool  (follows symlinks)
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        lua::pushboolean(L, fs::exists(fs::path(p), ec) ? 1 : 0);
+        return 1;
+    });
+    lua::setfield(L, -2, "exists");
+
+    // fs.is_directory(path) -> bool
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        lua::pushboolean(L, fs::is_directory(fs::path(p), ec) ? 1 : 0);
+        return 1;
+    });
+    lua::setfield(L, -2, "is_directory");
+
+    // fs.is_file(path) -> bool
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        lua::pushboolean(L, fs::is_regular_file(fs::path(p), ec) ? 1 : 0);
+        return 1;
+    });
+    lua::setfield(L, -2, "is_file");
+
+    // fs.mkdir_p(path) -> bool
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        fs::create_directories(fs::path(p), ec);
+        lua::pushboolean(L, ec ? 0 : 1);
+        return 1;
+    });
+    lua::setfield(L, -2, "mkdir_p");
+
+    // fs.remove(path) -> bool  (single file or empty dir)
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        lua::pushboolean(L, fs::remove(fs::path(p), ec) ? 1 : 0);
+        return 1;
+    });
+    lua::setfield(L, -2, "remove");
+
+    // fs.remove_all(path) -> bool
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        fs::remove_all(fs::path(p), ec);
+        lua::pushboolean(L, 1);
+        return 1;
+    });
+    lua::setfield(L, -2, "remove_all");
+
+    // fs.copy_file(src, dst) -> bool  (single file, overwrite)
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* src = lua::tostring(L, 1);
+        const char* dst = lua::tostring(L, 2);
+        if (!src || !dst) { lua::pushboolean(L, 0); return 1; }
+        std::error_code ec;
+        fs::copy_file(fs::path(src), fs::path(dst),
+                      fs::copy_options::overwrite_existing, ec);
+        lua::pushboolean(L, ec ? 0 : 1);
+        return 1;
+    });
+    lua::setfield(L, -2, "copy_file");
+
+    // fs.entries(dir) -> table of {path, name, type}
+    // type: "file", "directory", "symlink", "other"
+    // Non-recursive. Returns full paths.
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* dir = lua::tostring(L, 1);
+        lua::newtable(L);
+        if (!dir) return 1;
+        std::error_code ec;
+        fs::path dp(dir);
+        if (!fs::is_directory(dp, ec)) return 1;
+        int idx = 1;
+        for (auto& entry : fs::directory_iterator(dp, ec)) {
+            lua::newtable(L);
+            lua::pushstring(L, entry.path().string().c_str());
+            lua::setfield(L, -2, "path");
+            lua::pushstring(L, entry.path().filename().string().c_str());
+            lua::setfield(L, -2, "name");
+            const char* etype = "other";
+            if (entry.is_symlink(ec))          etype = "symlink";
+            else if (entry.is_regular_file(ec)) etype = "file";
+            else if (entry.is_directory(ec))    etype = "directory";
+            lua::pushstring(L, etype);
+            lua::setfield(L, -2, "type");
+            lua::rawseti(L, -2, idx++);
+        }
+        return 1;
+    });
+    lua::setfield(L, -2, "entries");
+
+    // fs.files(dir, recursive?) -> table of file paths
+    // recursive: optional bool, default false
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* dir = lua::tostring(L, 1);
+        bool recursive = lua::toboolean(L, 2);
+        lua::newtable(L);
+        if (!dir) return 1;
+        std::error_code ec;
+        fs::path dp(dir);
+        if (!fs::is_directory(dp, ec)) return 1;
+        int idx = 1;
+        if (recursive) {
+            for (auto& entry : fs::recursive_directory_iterator(dp, ec)) {
+                if (entry.is_regular_file(ec)) {
+                    lua::pushstring(L, entry.path().string().c_str());
+                    lua::rawseti(L, -2, idx++);
+                }
+            }
+        } else {
+            for (auto& entry : fs::directory_iterator(dp, ec)) {
+                if (entry.is_regular_file(ec)) {
+                    lua::pushstring(L, entry.path().string().c_str());
+                    lua::rawseti(L, -2, idx++);
+                }
+            }
+        }
+        return 1;
+    });
+    lua::setfield(L, -2, "files");
+
+    // fs.dirs(dir) -> table of subdirectory paths (non-recursive)
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* dir = lua::tostring(L, 1);
+        lua::newtable(L);
+        if (!dir) return 1;
+        std::error_code ec;
+        fs::path dp(dir);
+        if (!fs::is_directory(dp, ec)) return 1;
+        int idx = 1;
+        for (auto& entry : fs::directory_iterator(dp, ec)) {
+            if (entry.is_directory(ec)) {
+                lua::pushstring(L, entry.path().string().c_str());
+                lua::rawseti(L, -2, idx++);
+            }
+        }
+        return 1;
+    });
+    lua::setfield(L, -2, "dirs");
+
+    // fs.basename(path) -> string
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushstring(L, ""); return 1; }
+        lua::pushstring(L, fs::path(p).filename().string().c_str());
+        return 1;
+    });
+    lua::setfield(L, -2, "basename");
+
+    // fs.dirname(path) -> string
+    lua::pushcfunction(L, [](lua::State* L) -> int {
+        const char* p = lua::tostring(L, 1);
+        if (!p) { lua::pushstring(L, ""); return 1; }
+        lua::pushstring(L, fs::path(p).parent_path().string().c_str());
+        return 1;
+    });
+    lua::setfield(L, -2, "dirname");
+
+    // Store into _LIBXPKG_MODULES["fs"]
+    lua::getglobal(L, "_LIBXPKG_MODULES");
+    lua::insert(L, -2);       // stack: [modules, fs_table]
+    lua::setfield(L, -2, "fs");  // modules["fs"] = fs_table
+    lua::pop(L, 1);           // pop modules
+}
+
 // Load all xim.libxpkg.* modules into _LIBXPKG_MODULES table, then run prelude
 bool load_stdlib(lua::State* L, std::string& err_out) {
     // Create empty _LIBXPKG_MODULES table
@@ -324,6 +548,9 @@ bool load_stdlib(lua::State* L, std::string& err_out) {
     // Override shell-based os.* with C++ std::filesystem implementations
     register_os_funcs(L);
 
+    // Register C++-backed fs module (symlink, entries, etc.)
+    register_fs_module(L);
+
     return true;
 }
 
@@ -342,6 +569,7 @@ void inject_context(lua::State* L, const mcpplibs::xpkg::ExecutionContext& ctx) 
     set_string_field(L, "bin_dir",           ctx.bin_dir.string());
     set_string_field(L, "project_data_dir",  ctx.project_data_dir.string());
     set_string_field(L, "subos_sysrootdir",  ctx.subos_sysrootdir);
+    set_string_field(L, "pkgindex_dir",      ctx.pkgindex_dir);
 
     auto push_string_array = [&](const std::vector<std::string>& v, const char* field) {
         lua::newtable(L);
@@ -677,6 +905,17 @@ create_executor(const fs::path& pkg_path) {
     if (!detail::load_stdlib(L, err)) {
         lua::close(L);
         return std::unexpected(err);
+    }
+
+    // Derive pkgindex root from pkg_path for top-level import("xim.pkgindex.*").
+    // Package files live at <pkgindex>/pkgs/<letter>/<name>.lua — 3 levels up.
+    {
+        auto pkgindex = pkg_path.parent_path().parent_path().parent_path();
+        std::error_code ec;
+        if (fs::is_directory(pkgindex / "libs", ec)) {
+            lua::pushstring(L, pkgindex.string().c_str());
+            lua::setglobal(L, "_PKGINDEX_DIR");
+        }
     }
 
     if (lua::L_dofile(L, pkg_path.string().c_str()) != lua::OK) {

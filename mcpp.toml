@@ -1,27 +1,16 @@
 [package]
-name        = "mcpplibs.xpkg"
+namespace   = "mcpplibs"
+name        = "xpkg"
 version     = "0.0.39"
-description = "C++23 reference implementation of the xpkg V1 spec — `import mcpplibs.xpkg;`"
+description = "C++23 reference implementation of the xpkg V1 spec"
 license     = "Apache-2.0"
 repo        = "https://github.com/openxlings/libxpkg"
 
 [targets.xpkg]
 kind = "lib"
 
-# Library-root convention picks `src/xpkg.cppm` automatically.
-# The package ships five separate modules under the `mcpplibs.xpkg.*`
-# namespace (loader, index, executor, lua_stdlib) — they sit alongside
-# the primary `mcpplibs.xpkg` and all roll into the single libxpkg.a.
-#
-# `src/xpkg-lua-stdlib.cppm` is generated from `src/lua-stdlib/**/*.lua`
-# at xmake build time (see `before_build` in xmake.lua); the current
-# generated copy is committed so mcpp builds work without invoking the
-# xmake codegen path. Regenerate via `xmake build mcpplibs-xpkg-lua-stdlib`
-# whenever the .lua sources change.
-
 [dependencies]
 "mcpplibs.capi.lua" = "0.0.3"
 
-# `mcpp test` discovers tests/**/*.cpp + tests/**/*.cppm automatically.
 [dev-dependencies]
 gtest = "1.15.2"

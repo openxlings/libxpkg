@@ -842,6 +842,237 @@ TEST(ExecutorTest, RunHook_DoesNotImplicitlyStamp) {
     fs::remove_all(temp);
 }
 
+// ---- fs module tests ----
+
+TEST(ExecutorTest, FsModule_SymlinkAndReadlink) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Symlink tests are POSIX-specific";
+#endif
+    const fs::path temp = make_temp_dir("libxpkg-fs-symlink-");
+    write_text(temp / "target.txt", "hello");
+
+    auto pkg = temp / "fs_symlink.lua";
+    write_text(pkg, std::string(
+        "package = { name = \"fs_symlink\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "import('xim.libxpkg.fs')\n"
+        "function xpkg_main(dir)\n"
+        "    local src = dir .. '/target.txt'\n"
+        "    local dst = dir .. '/link.txt'\n"
+        "    if not fs.symlink(src, dst) then error('symlink failed') end\n"
+        "    if not fs.is_symlink(dst) then error('is_symlink failed') end\n"
+        "    local target = fs.readlink(dst)\n"
+        "    if target ~= src then error('readlink mismatch: ' .. tostring(target)) end\n"
+        "end\n"));
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.args = {temp.string()};
+    auto r = exec->run_script(ctx);
+    EXPECT_TRUE(r.success) << r.error;
+    EXPECT_TRUE(fs::is_symlink(temp / "link.txt"));
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, FsModule_Entries) {
+    const fs::path temp = make_temp_dir("libxpkg-fs-entries-");
+    write_text(temp / "a.txt", "a");
+    write_text(temp / "b.txt", "b");
+    fs::create_directories(temp / "subdir");
+
+    auto pkg = temp / "fs_entries.lua";
+    write_text(pkg, std::string(
+        "package = { name = \"fs_entries\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "import('xim.libxpkg.fs')\n"
+        "function xpkg_main(dir)\n"
+        "    local entries = fs.entries(dir)\n"
+        "    if #entries < 3 then error('expected >= 3 entries, got ' .. #entries) end\n"
+        "    local has_file, has_dir = false, false\n"
+        "    for _, e in ipairs(entries) do\n"
+        "        if e.name == 'a.txt' and e.type == 'file' then has_file = true end\n"
+        "        if e.name == 'subdir' and e.type == 'directory' then has_dir = true end\n"
+        "    end\n"
+        "    if not has_file then error('missing file entry') end\n"
+        "    if not has_dir then error('missing dir entry') end\n"
+        "end\n"));
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.args = {temp.string()};
+    auto r = exec->run_script(ctx);
+    EXPECT_TRUE(r.success) << r.error;
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, FsModule_FilesRecursive) {
+    const fs::path temp = make_temp_dir("libxpkg-fs-files-");
+    // Use a subdirectory to avoid counting the test pkg .lua file
+    const fs::path data = temp / "data";
+    fs::create_directories(data / "a" / "b");
+    write_text(data / "top.txt", "t");
+    write_text(data / "a" / "mid.txt", "m");
+    write_text(data / "a" / "b" / "deep.txt", "d");
+
+    auto pkg = temp / "fs_files.lua";
+    write_text(pkg, std::string(
+        "package = { name = \"fs_files\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "import('xim.libxpkg.fs')\n"
+        "function xpkg_main(dir)\n"
+        "    local flat = fs.files(dir)\n"
+        "    local deep = fs.files(dir, true)\n"
+        "    if #flat ~= 1 then error('flat expected 1, got ' .. #flat) end\n"
+        "    if #deep ~= 3 then error('deep expected 3, got ' .. #deep) end\n"
+        "end\n"));
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.args = {data.string()};
+    auto r = exec->run_script(ctx);
+    EXPECT_TRUE(r.success) << r.error;
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, FsModule_CopyFile) {
+    const fs::path temp = make_temp_dir("libxpkg-fs-copyfile-");
+    write_text(temp / "src.txt", "content");
+
+    auto pkg = temp / "fs_cp.lua";
+    write_text(pkg, std::string(
+        "package = { name = \"fs_cp\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "import('xim.libxpkg.fs')\n"
+        "function xpkg_main(dir)\n"
+        "    if not fs.copy_file(dir..'/src.txt', dir..'/dst.txt') then error('copy_file failed') end\n"
+        "    if not fs.is_file(dir..'/dst.txt') then error('dst missing') end\n"
+        "end\n"));
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.args = {temp.string()};
+    auto r = exec->run_script(ctx);
+    EXPECT_TRUE(r.success) << r.error;
+    EXPECT_TRUE(fs::exists(temp / "dst.txt"));
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, FsModule_MkdirP_Remove) {
+    const fs::path temp = make_temp_dir("libxpkg-fs-mkdir-");
+
+    auto pkg = temp / "fs_mkdir.lua";
+    write_text(pkg, std::string(
+        "package = { name = \"fs_mkdir\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "import('xim.libxpkg.fs')\n"
+        "function xpkg_main(dir)\n"
+        "    local nested = dir .. '/a/b/c'\n"
+        "    if not fs.mkdir_p(nested) then error('mkdir_p failed') end\n"
+        "    if not fs.is_directory(nested) then error('not a dir') end\n"
+        "    if not fs.exists(nested) then error('not exists') end\n"
+        "    fs.remove_all(dir .. '/a')\n"
+        "    if fs.exists(dir .. '/a') then error('remove_all failed') end\n"
+        "end\n"));
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.args = {temp.string()};
+    auto r = exec->run_script(ctx);
+    EXPECT_TRUE(r.success) << r.error;
+    fs::remove_all(temp);
+}
+
+// ---- pkgindex custom module loading tests ----
+
+TEST(ExecutorTest, PkgindexCustomModule_LoadsFromLibsDir) {
+    const fs::path temp = make_temp_dir("libxpkg-pkgindex-mod-");
+    // Create pkgindex structure: <root>/libs/mymod.lua, <root>/pkgs/t/test.lua
+    fs::create_directories(temp / "pkgindex" / "libs");
+    fs::create_directories(temp / "pkgindex" / "pkgs" / "t");
+
+    // Write custom module
+    write_text(temp / "pkgindex" / "libs" / "mymod.lua",
+        "local M = {}\n"
+        "function M.greet() return 'hello from mymod' end\n"
+        "return M\n");
+
+    // Write package that uses it (import inside xpkg_main so _RUNTIME is set)
+    auto pkg = temp / "pkgindex" / "pkgs" / "t" / "test.lua";
+    write_text(pkg, std::string(
+        "package = { name = \"test\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "function xpkg_main()\n"
+        "    import('xim.pkgindex.mymod')\n"
+        "    local msg = mymod.greet()\n"
+        "    if msg ~= 'hello from mymod' then error('wrong: ' .. tostring(msg)) end\n"
+        "end\n"));
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.pkgindex_dir = (temp / "pkgindex").string();
+    auto r = exec->run_script(ctx);
+    EXPECT_TRUE(r.success) << r.error;
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, PkgindexCustomModule_CachesAcrossCalls) {
+    const fs::path temp = make_temp_dir("libxpkg-pkgindex-cache-");
+    fs::create_directories(temp / "pkgindex" / "libs");
+    fs::create_directories(temp / "pkgindex" / "pkgs" / "t");
+
+    // Module with a counter to verify it's only loaded once
+    write_text(temp / "pkgindex" / "libs" / "counter.lua",
+        "local M = { count = 0 }\n"
+        "M.count = M.count + 1\n"
+        "return M\n");
+
+    auto pkg = temp / "pkgindex" / "pkgs" / "t" / "test.lua";
+    write_text(pkg, std::string(
+        "package = { name = \"test\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "function xpkg_main()\n"
+        "    import('xim.pkgindex.counter')\n"
+        "    local c1 = counter.count\n"
+        "    import('xim.pkgindex.counter')  -- second import should hit cache\n"
+        "    local c2 = counter.count\n"
+        "    if c1 ~= 1 then error('first load count should be 1, got ' .. tostring(c1)) end\n"
+        "    if c1 ~= c2 then error('module reloaded: ' .. tostring(c1) .. ' vs ' .. tostring(c2)) end\n"
+        "end\n"));
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.pkgindex_dir = (temp / "pkgindex").string();
+    auto r = exec->run_script(ctx);
+    EXPECT_TRUE(r.success) << r.error;
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, PkgindexCustomModule_UnknownReturnsStub) {
+    const fs::path temp = make_temp_dir("libxpkg-pkgindex-unknown-");
+    fs::create_directories(temp / "pkgindex" / "libs");
+    fs::create_directories(temp / "pkgindex" / "pkgs" / "t");
+
+    auto pkg = temp / "pkgindex" / "pkgs" / "t" / "test.lua";
+    write_text(pkg, std::string(
+        "package = { name = \"test\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "function xpkg_main()\n"
+        "    import('xim.pkgindex.nonexistent')\n"
+        "    -- Should get a stub proxy, not crash\n"
+        "    local x = tostring(nonexistent.something)\n"
+        "end\n"));
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.pkgindex_dir = (temp / "pkgindex").string();
+    auto r = exec->run_script(ctx);
+    EXPECT_TRUE(r.success) << r.error;
+    fs::remove_all(temp);
+}
+
 TEST(ExecutorTest, ApplyInstallStamp_IsIdempotent) {
     // Calling apply_install_stamp_if_empty twice is safe — the second
     // call sees a non-empty dir (the first call's stamp) and no-ops.

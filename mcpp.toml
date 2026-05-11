@@ -2,15 +2,15 @@
 namespace   = "mcpplibs"
 name        = "xpkg"
 version     = "0.0.39"
-description = "C++23 reference implementation of the xpkg V1 spec — import mcpplibs.xpkg;"
+description = "C++23 reference implementation of the xpkg V1 spec"
 license     = "Apache-2.0"
 repo        = "https://github.com/openxlings/libxpkg"
 
 [targets.xpkg]
 kind = "lib"
 
-[dependencies.mcpplibs.capi]
-lua = "0.0.3"
+[dependencies]
+"mcpplibs.capi.lua" = "0.0.3"
 
-[dev-dependencies.compat]
+[dev-dependencies]
 gtest = "1.15.2"

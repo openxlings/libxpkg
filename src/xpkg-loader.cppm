@@ -153,6 +153,7 @@ PackageType parse_type(const std::string& s) {
     if (s == "script")   return PackageType::Script;
     if (s == "template") return PackageType::Template;
     if (s == "config")   return PackageType::Config;
+    if (s == "subos")    return PackageType::Subos;
     return PackageType::Package;
 }
 

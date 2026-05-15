@@ -9,7 +9,7 @@ export module mcpplibs.xpkg;
 
 export namespace mcpplibs::xpkg {
 
-enum class PackageType   { Package, Script, Template, Config };
+enum class PackageType   { Package, Script, Template, Config, Subos };
 enum class PackageStatus { Dev, Stable, Deprecated };
 
 struct PlatformResource {

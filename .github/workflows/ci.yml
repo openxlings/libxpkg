@@ -45,15 +45,16 @@ jobs:
 
       - name: Build xpkg with xmake
         run: |
-          GCC_ROOT="$HOME/.xlings/data/xpkgs/xim-x-gcc/16.1.0"
+          XLINGS_BIN="$HOME/.xlings/subos/current/bin"
           export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
-          export LD_LIBRARY_PATH="$GCC_ROOT/lib64:$GCC_ROOT/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export AS=/usr/bin/as
           xmake f -c -m release \
             --toolchain=gcc \
-            --sdk="$GCC_ROOT" \
-            --cc="$GCC_ROOT/bin/gcc" \
-            --cxx="$GCC_ROOT/bin/g++" \
+            --cc="$XLINGS_BIN/gcc" \
+            --cxx="$XLINGS_BIN/g++" \
+            --ld="$XLINGS_BIN/g++" \
+            --sh="$XLINGS_BIN/g++" \
+            --ar=/usr/bin/ar \
+            --as=/usr/bin/as \
             --policies=build.c++.modules.std \
             -y
           xmake build -y -j"$(nproc)" xpkg

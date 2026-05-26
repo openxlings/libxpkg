@@ -1,5 +1,5 @@
 {
   "workspace": {
-    "mcpp": { "linux": "0.0.7" }
+    "xim:mcpp": { "linux": "0.0.30" }
   }
 }

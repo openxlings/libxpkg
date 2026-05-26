@@ -9,8 +9,8 @@ repo        = "https://github.com/openxlings/libxpkg"
 [targets.xpkg]
 kind = "lib"
 
-[dependencies]
-"mcpplibs.capi.lua" = "0.0.3"
+[dependencies."mcpplibs.capi"]
+lua = "0.0.3"
 
 [dev-dependencies]
 gtest = "1.15.2"

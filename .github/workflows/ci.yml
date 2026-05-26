@@ -14,7 +14,7 @@ jobs:
 
       - name: Install xlings
         env:
-          XLINGS_VERSION: 0.4.25
+          XLINGS_VERSION: 0.4.41
         run: |
           tarball="xlings-${XLINGS_VERSION}-linux-x86_64.tar.gz"
           curl -fsSL -o "/tmp/${tarball}" \
@@ -23,24 +23,94 @@ jobs:
           "/tmp/xlings-${XLINGS_VERSION}-linux-x86_64/subos/default/bin/xlings" self install
           echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
 
-      - name: Install workspace tools (.xlings.json → mcpp 0.0.7)
+      - name: Update xlings package index
+        run: |
+          xlings config --mirror GLOBAL
+          xlings update
+
+      - name: Install workspace tools (.xlings.json -> xim:mcpp 0.0.30)
         run: xlings install -y
+
+      - name: Verify mcpp 0.0.30 installation
+        run: |
+          if ! mcpp --version; then
+            install_dir="$HOME/.xlings/data/xpkgs/xim-x-mcpp/0.0.30"
+            payload_dir="$HOME/.xlings/data/runtimedir/mcpp-0.0.30-linux-x86_64"
+            if [ -x "$payload_dir/bin/mcpp" ]; then
+              mkdir -p "$install_dir"
+              cp -a "$payload_dir"/. "$install_dir"/
+            fi
+          fi
+          mcpp --version
 
       # Cache mcpp's self-bootstrapped sandbox (musl-gcc + binutils +
       # glibc + ninja + patchelf, ~800 MB). Toolchain set is pinned by
-      # mcpp 0.0.7, so a fixed key suffices.
+      # mcpp 0.0.30, so a fixed key suffices.
       - name: Cache mcpp sandbox
         uses: actions/cache@v4
         with:
-          path: ~/.xlings/data/xpkgs/xim-x-mcpp/0.0.7/registry
-          key: mcpp-sandbox-${{ runner.os }}-mcpp0.0.7
+          path: |
+            ~/.mcpp/registry
+            ~/.mcpp/bmi
+          key: mcpp-sandbox-${{ runner.os }}-mcpp0.0.30
+
+      - name: Prepare mcpp dependency artifacts
+        run: |
+          set +e
+          fp_output="$(mcpp build --print-fingerprint 2>&1)"
+          set -e
+          printf '%s\n' "$fp_output"
+          fingerprint="$(printf '%s\n' "$fp_output" | awk '/^Fingerprint:/{print $2; exit}')"
+          triple="$(printf '%s\n' "$fp_output" | awk '/^Toolchain:/{gsub(/[()]/, "", $NF); print $NF; exit}')"
+          test -n "$fingerprint"
+          test -n "$triple"
+
+          dep_manifest="$(find "$HOME/.mcpp/registry/data/xpkgs/mcpplibs.capi-x-mcpplibs.capi.lua/0.0.3" \
+            -path '*/mcpp.toml' -print -quit)"
+          test -n "$dep_manifest"
+          dep_root="$(dirname "$dep_manifest")"
+          (cd "$dep_root" && mcpp build)
+
+          dep_bmi="$(find "$dep_root/target/$triple" \( \
+            -path '*/gcm.cache/mcpplibs.capi.lua.gcm' -o \
+            -path '*/pcm.cache/mcpplibs.capi.lua.pcm' \
+            \) -print -quit)"
+          dep_archive="$(find "$dep_root/target/$triple" -path '*/bin/libcapi-lua.a' -print -quit)"
+          test -n "$dep_bmi"
+          test -n "$dep_archive"
+
+          target_dir="target/$triple/$fingerprint"
+          dep_bmi_dir="$(basename "$(dirname "$dep_bmi")")"
+          mkdir -p "$target_dir/$dep_bmi_dir"
+          cp -f "$dep_bmi" "$target_dir/$dep_bmi_dir/$(basename "$dep_bmi")"
+
+          {
+            echo "MCPP_TARGET_DIR=$target_dir"
+            echo "MCPP_DEP_ARCHIVE=$dep_archive"
+          } >> "$GITHUB_ENV"
 
       - name: Build with mcpp
         run: mcpp build
 
-      # mcpp 0.0.7 auto-prepends sandbox PATH (patchelf, ninja) for
+      # mcpp 0.0.30 auto-prepends sandbox PATH (patchelf, ninja) for
       # test binaries, so Linux elfpatch tests run without manual PATH
       # setup. Only macOS-specific tests (need install_name_tool) are
       # filtered — they can't run on a Linux runner.
       - name: Run tests
-        run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*
+        run: |
+          if mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*; then
+            exit 0
+          fi
+
+          perl -0pi -e 's#(build bin/test_[^\n]+ : cxx_link [^\n]+)#${1} '"$MCPP_DEP_ARCHIVE"'#g' \
+            "$MCPP_TARGET_DIR/build.ninja"
+
+          ninja_bin="$(find "$HOME/.mcpp/registry/data/xpkgs" -path '*/bin/ninja' -type f -print -quit)"
+          if [ -z "$ninja_bin" ]; then
+            ninja_bin="ninja"
+          fi
+          "$ninja_bin" -C "$MCPP_TARGET_DIR"
+
+          for test_bin in "$MCPP_TARGET_DIR"/bin/test_*; do
+            "$test_bin" --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*
+          done

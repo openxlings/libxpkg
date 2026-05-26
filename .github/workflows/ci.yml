@@ -7,14 +7,14 @@ on:
 
 jobs:
   build:
-    name: build + test (linux x86_64, mcpp)
+    name: build + test (linux x86_64)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Install xlings
         env:
-          XLINGS_VERSION: 0.4.25
+          XLINGS_VERSION: 0.4.41
         run: |
           tarball="xlings-${XLINGS_VERSION}-linux-x86_64.tar.gz"
           curl -fsSL -o "/tmp/${tarball}" \
@@ -23,24 +23,38 @@ jobs:
           "/tmp/xlings-${XLINGS_VERSION}-linux-x86_64/subos/default/bin/xlings" self install
           echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
 
-      - name: Install workspace tools (.xlings.json → mcpp 0.0.7)
-        run: xlings install -y
+      - name: Install workspace tools (.xlings.json)
+        run: |
+          xlings config --mirror GLOBAL
+          xlings update
+          xlings install -y
 
-      # Cache mcpp's self-bootstrapped sandbox (musl-gcc + binutils +
-      # glibc + ninja + patchelf, ~800 MB). Toolchain set is pinned by
-      # mcpp 0.0.7, so a fixed key suffices.
-      - name: Cache mcpp sandbox
-        uses: actions/cache@v4
-        with:
-          path: ~/.xlings/data/xpkgs/xim-x-mcpp/0.0.7/registry
-          key: mcpp-sandbox-${{ runner.os }}-mcpp0.0.7
+      - name: Verify workspace tools
+        run: |
+          mcpp --version
+          xmake --version
+          "$HOME/.xlings/data/xpkgs/xim-x-gcc/16.1.0/bin/g++" --version
 
       - name: Build with mcpp
         run: mcpp build
 
-      # mcpp 0.0.7 auto-prepends sandbox PATH (patchelf, ninja) for
-      # test binaries, so Linux elfpatch tests run without manual PATH
-      # setup. Only macOS-specific tests (need install_name_tool) are
-      # filtered — they can't run on a Linux runner.
+      # Only macOS-specific tests (need install_name_tool) are filtered —
+      # they cannot run on a Linux runner.
       - name: Run tests
         run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*
+
+      - name: Build xpkg with xmake
+        run: |
+          XLINGS_BIN="$HOME/.xlings/subos/current/bin"
+          export PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
+          xmake f -c -m release \
+            --toolchain=gcc \
+            --cc="$XLINGS_BIN/gcc" \
+            --cxx="$XLINGS_BIN/g++" \
+            --ld="$XLINGS_BIN/g++" \
+            --sh="$XLINGS_BIN/g++" \
+            --ar=/usr/bin/ar \
+            --as=/usr/bin/as \
+            --policies=build.c++.modules.std \
+            -y
+          xmake build -y -j"$(nproc)" xpkg

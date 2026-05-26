@@ -9,6 +9,19 @@ description: Use when working on libxpkg — adding modules, writing tests, modi
 
 libxpkg 是 xpkg 规范的 C++23 参考实现，分为四个子模块。以下是开发过程中积累的关键模式和陷阱。
 
+## xpkg V1 包脚本边界
+
+xpkg 包作者的默认边界是：
+
+- libxpkg 提供的 `xim.libxpkg.*` 模块。
+- 标准 Lua 语法与标准库。
+- xpkg V1 规范中的 `package` 元数据、`xpm` 平台矩阵和 lifecycle hooks。
+- xpkg 运行时内置 API，例如 `import()`、`path.*`、扩展的 `os.*`/`io.*`/`string.*`、`is_host()`、`try { ... }`。
+
+新增或审查包脚本时，优先判断它是否只依赖上述四类能力。不要把包脚本 API 描述成某个外部构建工具的 API；在规范、注释和 review 结论中使用“xpkg 内置 API”或“xpkg runtime API”。
+
+规范入口：`docs/V1/xpackage-spec.md`。
+
 ## 模块架构
 
 ```
@@ -121,24 +134,29 @@ end)
 
 ## 5. Lua 钩子文件规范
 
-xpkg 包 `.lua` 文件必须正确捕获 `import()` 的返回值：
+xpkg 包 `.lua` 文件应使用 `libxpkg + 标准 Lua + xpkg 规范 + xpkg 内置 API`。`import()` 可加载 `xim.libxpkg.*` 模块；推荐捕获返回值为局部变量，避免隐式全局造成测试和复用困难：
 
 ```lua
--- ❌ 错误：import() 不注入全局，pkginfo/xvm 为 nil
+-- 不推荐：依赖隐式全局
 import("xim.libxpkg.pkginfo")
 import("xim.libxpkg.xvm")
 
--- ✅ 正确：捕获为局部变量
+-- 推荐：捕获为局部变量
 local pkginfo = import("xim.libxpkg.pkginfo")
 local xvm     = import("xim.libxpkg.xvm")
 ```
+
+包脚本允许使用：
+- 标准 Lua：`string/table/math/io/os.getenv/pcall/error` 等。
+- xpkg 内置 API：`path.join`、`os.isfile`、`os.isdir`、`os.tryrm`、`os.mv`、`io.readfile`、`io.writefile`、`is_host`、`try { ... }` 等。
+- libxpkg 模块：`pkginfo/xvm/system/log/json/pkgmanager/utils/elfpatch/base64`。
 
 **钩子函数模板：**
 ```lua
 -- installed() — 检查是否已安装，返回版本字符串或 nil
 function installed()
     local dir = pkginfo.install_dir()
-    if dir and io.exists(dir .. "/.installed") then
+    if dir and os.isfile(dir .. "/.installed") then
         return pkginfo.version()
     end
     return nil
@@ -147,9 +165,16 @@ end
 -- install() — 安装逻辑
 function install()
     local dir = pkginfo.install_dir()
-    os.execute('mkdir -p "' .. dir .. '"')
+    os.mkdir(dir)
     io.writefile(dir .. "/.installed", pkginfo.version())
-    if xvm then xvm.add(pkginfo.name(), pkginfo.version(), dir) end
+    return true
+end
+
+-- config() — 注册命令/库/header 或写配置
+function config()
+    local dir = pkginfo.install_dir()
+    if xvm then xvm.add(pkginfo.name(), { bindir = dir }) end
+    return true
 end
 
 -- uninstall() — 卸载逻辑
@@ -159,6 +184,7 @@ function uninstall()
     if xvm and xvm.has(pkginfo.name()) then
         xvm.remove(pkginfo.name())
     end
+    return true
 end
 ```
 

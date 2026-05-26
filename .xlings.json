@@ -1,5 +1,7 @@
 {
   "workspace": {
-    "xim:mcpp": { "linux": "0.0.30" }
+    "xim:mcpp": { "linux": "0.0.30" },
+    "xim:xmake": { "linux": "3.0.7" },
+    "xim:gcc": { "linux": "16.1.0" }
   }
 }

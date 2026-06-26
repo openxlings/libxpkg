@@ -1,8 +1,8 @@
 [package]
 namespace   = "mcpplibs"
 name        = "xpkg"
-version     = "0.0.39"
-description = "C++23 reference implementation of the xpkg V1 spec"
+version     = "0.0.42"
+description = "C++23 reference implementation of the xpkg V2 spec (multi-arch)"
 license     = "Apache-2.0"
 repo        = "https://github.com/openxlings/libxpkg"
 

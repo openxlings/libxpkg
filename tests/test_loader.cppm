@@ -172,3 +172,84 @@ TEST(LoaderTest, LoadPackage_NoExports) {
     auto& xpm = result->xpm;
     EXPECT_EQ(xpm.exports.find("linux"), xpm.exports.end());
 }
+
+// ---------------------------------------------------------------------------
+// Arch normalization
+// ---------------------------------------------------------------------------
+
+TEST(ArchTest, NormalizesAliases) {
+    EXPECT_EQ(normalize_arch("amd64"),   "x86_64");
+    EXPECT_EQ(normalize_arch("x64"),     "x86_64");
+    EXPECT_EQ(normalize_arch("x86-64"),  "x86_64");
+    EXPECT_EQ(normalize_arch("x86_64"),  "x86_64");   // canonical passthrough
+    EXPECT_EQ(normalize_arch("arm64"),   "aarch64");
+    EXPECT_EQ(normalize_arch("armv8"),   "aarch64");
+    EXPECT_EQ(normalize_arch("aarch64"), "aarch64");
+    EXPECT_EQ(normalize_arch("AArch64"), "aarch64");  // case-insensitive
+}
+
+TEST(ArchTest, ArchMatchesAcrossSpellings) {
+    EXPECT_TRUE(arch_matches("arm64", "aarch64"));
+    EXPECT_TRUE(arch_matches("amd64", "x86_64"));
+    EXPECT_FALSE(arch_matches("x86_64", "aarch64"));
+}
+
+// ---------------------------------------------------------------------------
+// V2 multi-arch xpm shapes
+// ---------------------------------------------------------------------------
+
+// Scheme B: per-arch resource map. Each arch carries its own url + sha256;
+// the single-arch url/sha256 stay empty. Arch keys normalize to canonical.
+TEST(LoaderTest, V2_PerArchMap_ParsesBothArches) {
+    auto result = load_package(PKGINDEX / "pkgs/v/v2map.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    auto& r = result->xpm.entries.at("linux").at("1.0.0");
+    EXPECT_TRUE(r.url.empty());
+    EXPECT_TRUE(r.sha256.empty());
+    ASSERT_EQ(r.archs.size(), 2u);
+    EXPECT_EQ(r.archs.at("x86_64").url,    "https://ex/v2map-1.0.0-linux-x86_64.tar.gz");
+    EXPECT_EQ(r.archs.at("x86_64").sha256, "aaaa");
+    EXPECT_EQ(r.archs.at("aarch64").url,   "https://ex/v2map-1.0.0-linux-aarch64.tar.gz");
+    EXPECT_EQ(r.archs.at("aarch64").sha256, "bbbb");
+}
+
+// Scheme C: a URL template plus a per-arch sha256 table and an arch_alias
+// map. The template string is kept verbatim (expanded only at install time).
+TEST(LoaderTest, V2_Template_ParsesShaMapAndAlias) {
+    auto result = load_package(PKGINDEX / "pkgs/v/v2tmpl.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    auto& r = result->xpm.entries.at("linux").at("1.0.0");
+    EXPECT_EQ(r.url, "https://ex/${name}-${version}-${os}-${arch_alias}.${ext}");
+    EXPECT_TRUE(r.sha256.empty());  // sha256 was a table, not a string
+    ASSERT_EQ(r.sha256_by_arch.size(), 2u);
+    EXPECT_EQ(r.sha256_by_arch.at("x86_64"),  "aaaa");
+    EXPECT_EQ(r.sha256_by_arch.at("aarch64"), "bbbb");
+    EXPECT_EQ(r.arch_alias.at("x86_64"),  "amd64");
+    EXPECT_EQ(r.arch_alias.at("aarch64"), "arm64");
+    EXPECT_FALSE(r.is_res);
+}
+
+// res shape: XLINGS_RES auto-URL plus per-arch checksums (closes the
+// XLINGS_RES "no sha256" gap). is_res flags install-time URL synthesis.
+TEST(LoaderTest, V2_Res_ParsesFlagAndShaMap) {
+    auto result = load_package(PKGINDEX / "pkgs/v/v2res.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    auto& r = result->xpm.entries.at("linux").at("1.0.0");
+    EXPECT_TRUE(r.is_res);
+    ASSERT_EQ(r.sha256_by_arch.size(), 2u);
+    EXPECT_EQ(r.sha256_by_arch.at("x86_64"),  "aaaa");
+    EXPECT_EQ(r.sha256_by_arch.at("aarch64"), "bbbb");
+    EXPECT_TRUE(r.archs.empty());  // res shape is not a per-arch map
+}
+
+// Legacy single-arch entries must be entirely unaffected by V2 parsing.
+TEST(LoaderTest, V2_LegacySingleArch_Unchanged) {
+    auto result = load_package(PKGINDEX / "pkgs/h/hello.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    auto& r = result->xpm.entries.at("linux").at("1.0.0");
+    EXPECT_EQ(r.url, "https://example.com/hello-1.0.0-linux.tar.gz");
+    EXPECT_FALSE(r.sha256.empty());
+    EXPECT_TRUE(r.archs.empty());
+    EXPECT_TRUE(r.sha256_by_arch.empty());
+    EXPECT_FALSE(r.is_res);
+}

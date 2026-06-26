@@ -301,8 +301,11 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                 if (lua::type(L, -2) == lua::TSTRING)
                     version = lua::tostring(L, -2);
 
-                // Skip non-version keys (deps, inherits, etc.)
-                if (!version.empty() && version != "deps" && version != "inherits") {
+                // Skip non-version keys. `exports` is a platform-level table
+                // (parsed above) that would otherwise leak in as a bogus
+                // version entry; `deps`/`inherits` likewise.
+                if (!version.empty() && version != "deps"
+                        && version != "inherits" && version != "exports") {
                     PlatformResource res;
                     if (lua::type(L, -1) == lua::TTABLE) {
                         int res_idx = lua::gettop(L);
@@ -316,6 +319,56 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                         }
                         res.sha256 = get_str(L, res_idx, "sha256");
                         res.ref    = get_str(L, res_idx, "ref");
+
+                        // ---- V2 multi-arch shapes ----
+                        // Scheme C / res: `sha256` is a per-arch TABLE rather
+                        // than a string (get_str returned "" for a table).
+                        res.sha256_by_arch = get_str_map(L, res_idx, "sha256");
+                        // Re-key the per-arch sha256 map to canonical arch names.
+                        if (!res.sha256_by_arch.empty()) {
+                            std::unordered_map<std::string, std::string> canon;
+                            for (auto& [k, v] : res.sha256_by_arch)
+                                canon[normalize_arch(k)] = v;
+                            res.sha256_by_arch = std::move(canon);
+                        }
+                        // Optional ${arch_alias} mapping (canonical -> upstream token).
+                        {
+                            auto alias = get_str_map(L, res_idx, "arch_alias");
+                            for (auto& [k, v] : alias)
+                                res.arch_alias[normalize_arch(k)] = v;
+                        }
+                        res.is_res = get_bool(L, res_idx, "res");
+
+                        // Scheme B: per-arch resource map. Detected when the
+                        // entry carries no single-arch url/ref/sha256 and no
+                        // template/res markers, but has arch-named subtables.
+                        if (res.url.empty() && res.ref.empty() && res.sha256.empty()
+                                && res.sha256_by_arch.empty() && !res.is_res) {
+                            lua::pushnil(L);
+                            while (lua::next(L, res_idx)) {
+                                if (lua::type(L, -2) == lua::TSTRING
+                                        && lua::type(L, -1) == lua::TTABLE) {
+                                    std::string canon = normalize_arch(lua::tostring(L, -2));
+                                    if (canon == "x86_64" || canon == "aarch64"
+                                            || canon == "x86") {
+                                        int arch_idx = lua::gettop(L);
+                                        ArchResource ar;
+                                        ar.url = get_str(L, arch_idx, "url");
+                                        if (ar.url.empty()) {
+                                            ar.mirrors = get_str_map(L, arch_idx, "url");
+                                            if (auto it = ar.mirrors.find("GLOBAL");
+                                                    it != ar.mirrors.end())
+                                                ar.url = it->second;
+                                            else if (!ar.mirrors.empty())
+                                                ar.url = ar.mirrors.begin()->second;
+                                        }
+                                        ar.sha256 = get_str(L, arch_idx, "sha256");
+                                        res.archs[canon] = std::move(ar);
+                                    }
+                                }
+                                lua::pop(L, 1);  // pop value, keep key for next()
+                            }
+                        }
                     } else if (lua::type(L, -1) == lua::TSTRING) {
                         // e.g. "XLINGS_RES" — treat as url placeholder
                         res.url = lua::tostring(L, -1);

@@ -1,5 +1,6 @@
 module;
 #include <string>
+#include <string_view>
 #include <vector>
 #include <filesystem>
 #include <unordered_map>
@@ -12,11 +13,40 @@ export namespace mcpplibs::xpkg {
 enum class PackageType   { Package, Script, Template, Config, Subos };
 enum class PackageStatus { Dev, Stable, Deprecated };
 
-struct PlatformResource {
+// Canonicalize a CPU-arch token to xlings' internal spelling.
+// Accepts common aliases so recipes can use upstream names verbatim:
+//   amd64 / x64 / x86-64 / x86_64  -> "x86_64"
+//   arm64 / armv8  / aarch64       -> "aarch64"
+//   x86   / i386   / i686          -> "x86"
+// Unknown tokens are returned lower-cased unchanged. Case-insensitive.
+std::string normalize_arch(std::string_view raw);
+
+// True when two arch tokens denote the same canonical arch (e.g. "arm64"
+// and "aarch64"). Used by the install-time resolver and `package.archs`
+// validation so authors and hosts can disagree on spelling.
+bool arch_matches(std::string_view a, std::string_view b);
+
+// A single arch's download resource. Lighter than PlatformResource (no
+// `ref`, no nested archs) so PlatformResource::archs stays a map of a
+// COMPLETE type — std::unordered_map does not support incomplete value
+// types, which a recursive PlatformResource-in-PlatformResource would be.
+struct ArchResource {
     std::string url;
     std::string sha256;
-    std::string ref;  // version alias, e.g. "latest" -> "1.0.0"
+    std::unordered_map<std::string, std::string> mirrors;  // region: GLOBAL/CN
+};
+
+struct PlatformResource {
+    std::string url;     // single url | URL template ("...${arch}...") | "XLINGS_RES" | "" when `archs` used
+    std::string sha256;  // single-arch sha256 | "" when sha256_by_arch used
+    std::string ref;     // version alias, e.g. "latest" -> "1.0.0"
     std::unordered_map<std::string, std::string> mirrors;  // e.g. "GLOBAL"->url, "CN"->url
+    // ---- V2 multi-arch additions. All empty/false => legacy V1 resource,
+    // parsed and resolved exactly as before. ----
+    std::unordered_map<std::string, ArchResource> archs;        // canonical-arch -> resource (Scheme B: per-arch map)
+    std::unordered_map<std::string, std::string> sha256_by_arch; // canonical-arch -> sha256 (Scheme C: template / res)
+    std::unordered_map<std::string, std::string> arch_alias;     // canonical-arch -> upstream token for ${arch_alias}
+    bool is_res = false;                                         // res=true: XLINGS_RES with per-arch checksums
 };
 
 // What this package exposes to consumers/xlings at install/runtime.
@@ -131,4 +161,19 @@ PlatformMatrix::~PlatformMatrix() = default;
 Package::~Package()       = default;
 PackageIndex::~PackageIndex() = default;
 IndexRepos::~IndexRepos() = default;
+
+std::string normalize_arch(std::string_view raw) {
+    std::string s;
+    s.reserve(raw.size());
+    for (char c : raw)
+        s += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+    if (s == "amd64" || s == "x64" || s == "x86-64" || s == "x86_64") return "x86_64";
+    if (s == "arm64" || s == "armv8" || s == "aarch64")               return "aarch64";
+    if (s == "x86"   || s == "i386" || s == "i686")                   return "x86";
+    return s;
+}
+
+bool arch_matches(std::string_view a, std::string_view b) {
+    return normalize_arch(a) == normalize_arch(b);
+}
 }

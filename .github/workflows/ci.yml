@@ -23,7 +23,7 @@ jobs:
           "/tmp/xlings-${XLINGS_VERSION}-linux-x86_64/subos/default/bin/xlings" self install
           echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
 
-      - name: Install workspace tools (.xlings.json → mcpp 2026.8.4.1)
+      - name: Install workspace tools (.xlings.json → mcpp 2026.9.26.2)
         run: xlings install -y
 
       # Cache mcpp's self-bootstrapped sandbox (musl-gcc + binutils +
@@ -32,8 +32,8 @@ jobs:
       - name: Cache mcpp sandbox
         uses: actions/cache@v4
         with:
-          path: ~/.xlings/data/xpkgs/xim-x-mcpp/2026.8.4.1/registry
-          key: mcpp-sandbox-${{ runner.os }}-mcpp2026.8.4.1
+          path: ~/.xlings/data/xpkgs/xim-x-mcpp/2026.9.26.2/registry
+          key: mcpp-sandbox-${{ runner.os }}-mcpp2026.9.26.2
 
       # build.mcpp regenerates the embedded Lua stdlib from src/lua-stdlib/
       # into MCPP_OUT_DIR. There is no committed copy to fall out of sync with.

@@ -27,6 +27,9 @@ struct ResolvedResource {
     std::string url;
     std::string sha256;
     std::unordered_map<std::string, std::string> mirrors;
+    // The packaging revision of the entry that supplies the payload: for a
+    // `ref` alias, the revision of the entry the alias resolves to.
+    int revision = 0;
 };
 
 std::expected<ResolvedResource, std::string> resolve_resource(
@@ -114,6 +117,7 @@ std::expected<ResolvedResource, std::string> resolve_resource(
 
     ResolvedResource result;
     result.version = resolved_version;
+    result.revision = resource->revision;
     if (arch_resource != nullptr) {
         result.url = arch_resource->url;
         result.sha256 = arch_resource->sha256;

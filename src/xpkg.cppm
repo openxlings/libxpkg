@@ -47,6 +47,11 @@ struct PlatformResource {
     std::unordered_map<std::string, std::string> sha256_by_arch; // canonical-arch -> sha256 (Scheme C: template / res)
     std::unordered_map<std::string, std::string> arch_alias;     // canonical-arch -> upstream token for ${arch_alias}
     bool is_res = false;                                         // res=true: XLINGS_RES with per-arch checksums
+    // Packaging revision of this version's payload: a change to what the
+    // recipe installs that keeps the upstream version. 0 when the entry
+    // states none. A client records the revision it installed and treats a
+    // different recipe revision as not installed (xpkg V2 spec, "revision").
+    int revision = 0;
 };
 
 // What this package exposes to consumers/xlings at install/runtime.

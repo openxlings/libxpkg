@@ -155,6 +155,20 @@ bool get_bool(lua::State* L, int idx, const char* key) {
     return r;
 }
 
+// A non-negative integer field, or 0. Lenient like the readers above: a
+// malformed value reads as absent. The index's own CI rejects it.
+int get_nonneg_int(lua::State* L, int idx, const char* key) {
+    lua::getfield(L, idx, key);
+    int r = 0;
+    if (lua::isinteger(L, -1)) {
+        auto v = lua::tointeger(L, -1);
+        if (v >= 0 && v <= std::numeric_limits<int>::max())
+            r = static_cast<int>(v);
+    }
+    lua::pop(L, 1);
+    return r;
+}
+
 std::vector<std::string> get_str_array(lua::State* L, int idx, const char* key) {
     std::vector<std::string> result;
     lua::getfield(L, idx, key);
@@ -401,6 +415,7 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                         }
                         res.sha256 = get_str(L, res_idx, "sha256");
                         res.ref    = get_str(L, res_idx, "ref");
+                        res.revision = get_nonneg_int(L, res_idx, "revision");
 
                         // ---- V2 multi-arch shapes ----
                         // Scheme C / res: `sha256` is a per-arch TABLE rather

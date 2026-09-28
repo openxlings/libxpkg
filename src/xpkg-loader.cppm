@@ -8,6 +8,21 @@ import std;
 namespace lua = mcpplibs::capi::lua;
 namespace fs  = std::filesystem;
 
+export namespace mcpplibs::xpkg {
+
+// Where a package index's build script writes its console output, when the
+// caller wants it rather than the process's stdout.
+//
+// pkgindex-build.lua reports progress as a self-refreshing terminal line
+// ("\r[i/n] ns::file\033[K"). Written to fd 1 it reaches a file or a pipe as
+// carriage returns and escape sequences, and only the caller knows where its
+// output goes. With a BuildOutput set, the script's `io.write` and `print` hand
+// their text here, unchanged and in order; the caller decides what a line is
+// and how to show it. Without one, nothing changes.
+using BuildOutput = std::function<void(std::string_view)>;
+
+} // export namespace mcpplibs::xpkg
+
 namespace mcpplibs::xpkg::loader_detail {
 
 // Register loader sandbox: no-op import() + defensive stubs for non-standard
@@ -620,7 +635,39 @@ void register_build_sandbox(lua::State* L, const fs::path& script_dir) {
 
 // Run pkgindex-build.lua's install() function to generate complete package files.
 // Returns true if a build script was found and executed successfully.
-bool run_pkgindex_build(const fs::path& repo_dir) {
+// io.write / print that forward to a BuildOutput held as the closure's upvalue.
+// The BuildOutput outlives the Lua state (run_pkgindex_build owns both).
+int build_output_write_(lua::State* L) {
+    auto* out = static_cast<const BuildOutput*>(
+        lua::touserdata(L, lua::upvalueindex(1)));
+    const int n = lua::gettop(L);
+    for (int i = 1; i <= n; ++i) {
+        unsigned long long len = 0;
+        const char* text = lua::L_tolstring(L, i, &len);
+        if (out && text) (*out)(std::string_view(text, static_cast<std::size_t>(len)));
+        lua::pop(L, 1);
+    }
+    return 0;
+}
+
+int build_output_print_(lua::State* L) {
+    auto* out = static_cast<const BuildOutput*>(
+        lua::touserdata(L, lua::upvalueindex(1)));
+    const int n = lua::gettop(L);
+    std::string line;
+    for (int i = 1; i <= n; ++i) {
+        unsigned long long len = 0;
+        const char* text = lua::L_tolstring(L, i, &len);
+        if (i > 1) line += '\t';
+        if (text) line.append(text, static_cast<std::size_t>(len));
+        lua::pop(L, 1);
+    }
+    line += '\n';
+    if (out) (*out)(line);
+    return 0;
+}
+
+bool run_pkgindex_build(const fs::path& repo_dir, const BuildOutput& output) {
     auto build_script = repo_dir / "pkgindex-build.lua";
     if (!fs::exists(build_script)) return false;
 
@@ -641,6 +688,18 @@ bool run_pkgindex_build(const fs::path& repo_dir) {
 
     // Register build sandbox with real filesystem operations
     register_build_sandbox(L, repo_dir);
+
+    if (output) {
+        auto* sink = const_cast<BuildOutput*>(&output);
+        lua::getglobal(L, "io");
+        lua::pushlightuserdata(L, sink);
+        lua::pushcclosure(L, build_output_write_, 1);
+        lua::setfield(L, -2, "write");
+        lua::pop(L, 1);
+        lua::pushlightuserdata(L, sink);
+        lua::pushcclosure(L, build_output_print_, 1);
+        lua::setglobal(L, "print");
+    }
 
     // Execute the build script
     if (lua::L_dofile(L, build_script.string().c_str()) != lua::OK) {
@@ -729,14 +788,15 @@ load_package(const fs::path& pkg_path) {
 }
 
 std::expected<PackageIndex, std::string>
-build_index(const fs::path& repo_dir, const std::string& defaultNamespace = "") {
+build_index(const fs::path& repo_dir, const std::string& defaultNamespace,
+            const BuildOutput& buildOutput) {
     PackageIndex index;
     auto pkgs_dir = repo_dir / "pkgs";
     if (!fs::is_directory(pkgs_dir))
         return std::unexpected("pkgs/ directory not found in: " + repo_dir.string());
 
     // Run pkgindex-build.lua if present (generates complete package files)
-    loader_detail::run_pkgindex_build(repo_dir);
+    loader_detail::run_pkgindex_build(repo_dir, buildOutput);
 
     std::vector<fs::path> packagePaths;
     for (auto& letter_dir : fs::directory_iterator(pkgs_dir)) {
@@ -796,6 +856,11 @@ build_index(const fs::path& repo_dir, const std::string& defaultNamespace = "") 
     }
 
     return index;
+}
+
+std::expected<PackageIndex, std::string>
+build_index(const fs::path& repo_dir, const std::string& defaultNamespace = "") {
+    return build_index(repo_dir, defaultNamespace, BuildOutput{});
 }
 
 std::expected<IndexRepos, std::string>

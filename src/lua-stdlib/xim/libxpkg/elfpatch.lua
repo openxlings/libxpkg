@@ -181,46 +181,183 @@ local function _is_elf(filepath)
     return _read_magic(filepath, 4) == "\x7fELF"
 end
 
--- Read ELF e_machine (offset 18, 2 bytes little-endian for ELFCLASS64
--- on x86_64; ELF header layout is identical across the two classes for
--- the e_machine field). Returns nil for non-ELF files.
+-- e_machine values the ABI filter names by architecture (see _target_abi).
 local _EM_X86_64  = 62      -- 0x3e
 local _EM_AARCH64 = 183     -- 0xb7
 local _EM_386     = 3
 local _EM_ARM     = 40
 
-local function _read_e_machine(filepath)
+-- What an ELF file asks of a loader, read from its own headers.
+--
+-- Returns nil whenever the headers cannot be read in full: too short, not ELF,
+-- an unknown class or byte order, a table that runs past the end of the file.
+-- nil means UNKNOWN, and an unknown file is patched exactly as it always was --
+-- every skip below needs positive evidence. That is also what keeps a caller's
+-- stand-in file (an ELF magic and nothing else) on the path it was written for.
+--
+-- Read here rather than asked of patchelf: one open per file instead of a
+-- process per question, and the same answer on a host whose patchelf is not
+-- installed yet.
+local _PT_DYNAMIC = 2
+local _PT_INTERP  = 3
+local _DT_NEEDED  = 1
+local _MAX_DYNAMIC_BYTES = 1024 * 1024
+
+local function _elf_facts(filepath)
     local f = io.open(filepath, "rb")
     if not f then return nil end
-    local hdr = f:read(20)
+    local hdr = f:read(64)
+    if not hdr or #hdr < 52 or hdr:sub(1, 4) ~= "\x7fELF" then f:close(); return nil end
+    local class, order = hdr:byte(5), hdr:byte(6)
+    if (class ~= 1 and class ~= 2) or (order ~= 1 and order ~= 2) then f:close(); return nil end
+    local is64 = class == 2
+    if is64 and #hdr < 64 then f:close(); return nil end
+    local e = order == 1 and "<" or ">"
+
+    local machine = string.unpack(e .. "I2", hdr, 19)
+    local phoff, phentsize, phnum
+    if is64 then
+        phoff = string.unpack(e .. "I8", hdr, 33)
+        phentsize, phnum = string.unpack(e .. "I2I2", hdr, 55)
+    else
+        phoff = string.unpack(e .. "I4", hdr, 29)
+        phentsize, phnum = string.unpack(e .. "I2I2", hdr, 43)
+    end
+    -- 0xffff is PN_XNUM: the real count lives in a section header. Rare enough
+    -- to leave unknown rather than follow.
+    if phentsize ~= (is64 and 56 or 32) or phnum == 0xffff then f:close(); return nil end
+
+    local facts = { class = class, machine = machine, interp = false, needed = 0 }
+    if phnum == 0 then f:close(); return facts end
+
+    f:seek("set", phoff)
+    local phdrs = f:read(phentsize * phnum)
+    if not phdrs or #phdrs < phentsize * phnum then f:close(); return nil end
+
+    local dyn_off, dyn_size
+    for i = 0, phnum - 1 do
+        local at = i * phentsize + 1
+        local p_type = string.unpack(e .. "I4", phdrs, at)
+        if p_type == _PT_INTERP then
+            facts.interp = true
+        elseif p_type == _PT_DYNAMIC then
+            if is64 then
+                dyn_off = string.unpack(e .. "I8", phdrs, at + 8)
+                dyn_size = string.unpack(e .. "I8", phdrs, at + 32)
+            else
+                dyn_off = string.unpack(e .. "I4", phdrs, at + 4)
+                dyn_size = string.unpack(e .. "I4", phdrs, at + 16)
+            end
+        end
+    end
+
+    if dyn_off and dyn_size > 0 then
+        if dyn_size > _MAX_DYNAMIC_BYTES then f:close(); return nil end
+        f:seek("set", dyn_off)
+        local dyn = f:read(dyn_size)
+        if not dyn or #dyn < dyn_size then f:close(); return nil end
+        local entry = is64 and 16 or 8
+        local fmt = e .. (is64 and "i8" or "i4")
+        for at = 1, #dyn - entry + 1, entry do
+            local tag = string.unpack(fmt, dyn, at)
+            if tag == 0 then break end
+            if tag == _DT_NEEDED then facts.needed = facts.needed + 1 end
+        end
+    end
     f:close()
-    if not hdr or #hdr < 20 then return nil end
-    if hdr:sub(1, 4) ~= "\x7fELF" then return nil end
-    local lo = hdr:byte(19) or 0
-    local hi = hdr:byte(20) or 0
-    return lo + hi * 256
+    return facts
 end
 
--- Best-effort host-arch detection. Default x86_64 because that's where
--- xlings's binary distributions live; aarch64 is the second most common.
--- Mismatch (e.g. an x86_64 host with an aarch64 ELF in install_dir) means
--- the binary is for a different target and must NOT be patched — patchelf
--- on it would corrupt or no-op spectacularly. _is_elf_for_host returns
--- true only when the file is ELF AND its e_machine matches the host.
-local function _host_e_machine()
-    local arch = (os.arch and os.arch()) or "x86_64"
-    if arch:find("aarch64") or arch:find("arm64") then return _EM_AARCH64 end
-    if arch:find("x86_64")  or arch == "x64"      then return _EM_X86_64 end
-    if arch:find("i386")    or arch == "x86"      then return _EM_386 end
-    if arch:find("arm")                            then return _EM_ARM end
-    return _EM_X86_64
+-- The ABI a patched file must belong to: the loader's own, when there is one
+-- to read; otherwise this host's, but only for an architecture recognised by
+-- name. An unrecognised host yields nil -- no filtering -- because guessing
+-- x86_64 there would call every native file foreign and patch nothing.
+local function _target_abi(loader)
+    if loader and loader ~= "" then
+        local facts = _elf_facts(loader)
+        if facts then return { class = facts.class, machine = facts.machine } end
+    end
+    local arch = (os.arch and os.arch()) or ""
+    if arch:find("aarch64") or arch:find("arm64") then return { class = 2, machine = _EM_AARCH64 } end
+    if arch:find("x86_64") or arch == "x64" then return { class = 2, machine = _EM_X86_64 } end
+    if arch:find("i386") or arch == "x86" then return { class = 1, machine = _EM_386 } end
+    if arch:find("arm") then return { class = 1, machine = _EM_ARM } end
+    return nil
 end
 
-local function _is_elf_for_host(filepath)
-    if not _is_elf(filepath) then return false end
-    local em = _read_e_machine(filepath)
-    if not em then return false end
-    return em == _host_e_machine()
+-- nil, or why this file must be left exactly as it is.
+--
+-- Two shapes, both measured (libxpkg#43):
+--   * built for another machine -- an npm package's prebuilds carry aarch64 and
+--     armv7 binaries next to the x86_64 ones; an x86_64 loader written into
+--     them is wrong by construction.
+--   * nothing to resolve -- no PT_INTERP and no DT_NEEDED. A static or
+--     static-pie program (a Rust musl build, ripgrep) is one; so is a loader
+--     itself. `patchelf --set-rpath` on such a file rewrites a layout nothing
+--     reads, and the result segfaults before main (exit 139).
+local function _skip_reason(filepath, abi)
+    local facts = _elf_facts(filepath)
+    if not facts then return nil end
+    if abi and (facts.machine ~= abi.machine or facts.class ~= abi.class) then
+        return string.format("built for another machine (e_machine %d, class %d)",
+            facts.machine, facts.class)
+    end
+    if not facts.interp and facts.needed == 0 then
+        return "nothing to resolve (no PT_INTERP, no DT_NEEDED)"
+    end
+    return nil
+end
+
+-- `set{ skip = ... }` / `set{ scan = ... }` entries: paths relative to the
+-- install dir, '/'-separated, no wildcards. Normalised once, so "./bin/",
+-- "bin/" and "bin" are one entry.
+local function _rel_list(v)
+    if v == nil then return nil end
+    if type(v) == "string" then v = { v } end
+    if type(v) ~= "table" then return nil end
+    local out = {}
+    for _, p in ipairs(v) do
+        if type(p) == "string" then
+            p = p:gsub("\\", "/"):gsub("^%./", ""):gsub("/+$", "")
+            if p ~= "" and p ~= "." then table.insert(out, p) end
+        end
+    end
+    return out
+end
+
+local function _relative_to(root, filepath)
+    root = tostring(root or ""):gsub("\\", "/"):gsub("/+$", "")
+    local p = tostring(filepath):gsub("\\", "/")
+    if root ~= "" and p:sub(1, #root + 1) == root .. "/" then
+        return p:sub(#root + 2)
+    end
+    return p
+end
+
+-- A skip entry names a file or a directory; a directory covers everything
+-- beneath it. Prefix on a path boundary, so "bin/rg" does not cover "bin/rgx".
+local function _is_listed(rel, list)
+    if not list then return false end
+    for _, s in ipairs(list) do
+        if rel == s or rel:sub(1, #s + 1) == s .. "/" then return true end
+    end
+    return false
+end
+
+-- The one gate every patching loop asks before touching a file.
+local function _should_skip(filepath, install_dir, abi, skip, result)
+    if skip and _is_listed(_relative_to(install_dir, filepath), skip) then
+        result.skipped = result.skipped + 1
+        _info("skip " .. filepath .. ": listed in skip")
+        return true
+    end
+    local why = _skip_reason(filepath, abi)
+    if why then
+        result.skipped = result.skipped + 1
+        _info("skip " .. filepath .. ": " .. why)
+        return true
+    end
+    return false
 end
 
 -- Read PT_INTERP existence. Used by the fallback scan / declared-bins
@@ -482,12 +619,13 @@ end
 -- interp before rpath internally regardless of CLI order. The
 -- workaround is two separate invocations in reverse order.
 -- See docs/plans/2026-05-03-patchelf-order-bug-analysis.md.
-local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpath, shrink, result)
+local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpath, shrink, result, gate)
     for _, dir in ipairs(dirs) do
         local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
         local targets = _collect_targets(full, { include_shared_libs = true })
         for _, filepath in ipairs(targets) do
             result.scanned = result.scanned + 1
+            if gate(filepath) then goto next_exe end
             local ok = true
             -- Computed BEFORE the rpath, because it now decides the tag as
             -- well as the interpreter. It was already being computed for the
@@ -511,17 +649,19 @@ local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpa
             else
                 result.failed = result.failed + 1
             end
+            ::next_exe::
         end
     end
 end
 
 -- Patch directories as libraries (rpath only, no interpreter)
-local function _patch_elf_libraries(patch_tool, dirs, install_dir, rpath, shrink, result)
+local function _patch_elf_libraries(patch_tool, dirs, install_dir, rpath, shrink, result, gate)
     for _, dir in ipairs(dirs) do
         local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
         local targets = _collect_targets(full, { include_shared_libs = true })
         for _, filepath in ipairs(targets) do
             result.scanned = result.scanned + 1
+            if gate(filepath) then goto next_lib end
             local ok = true
             if rpath and rpath ~= "" then
                 ok = _exec_ok(_shell_quote(patch_tool.program)
@@ -534,6 +674,7 @@ local function _patch_elf_libraries(patch_tool, dirs, install_dir, rpath, shrink
             else
                 result.failed = result.failed + 1
             end
+            ::next_lib::
         end
     end
 end
@@ -570,14 +711,22 @@ local function _patch_elf(target, opts, result)
         rpath = _normalize_rpath(custom_rpath)
     end
 
+    -- Asked once per file, in every mode below. The ABI comes from the loader
+    -- that is about to be written, so "foreign" means "not for this loader".
+    local abi = _target_abi(loader)
+    local skip = _rel_list(opts.skip)
+    local gate = function(filepath)
+        return _should_skip(filepath, install_dir, abi, skip, result)
+    end
+
     if bins or libs then
         -- Declarative mode: package already classified bin/lib dirs
         _info(string.format("declared: bins=%s libs=%s loader=%s",
             bins and table.concat(bins, ",") or "nil",
             libs and table.concat(libs, ",") or "nil",
             tostring(loader)))
-        _patch_elf_executables(patch_tool, bins or {}, install_dir, loader, rpath, opts.shrink, result)
-        _patch_elf_libraries(patch_tool, libs or {}, install_dir, rpath, opts.shrink, result)
+        _patch_elf_executables(patch_tool, bins or {}, install_dir, loader, rpath, opts.shrink, result, gate)
+        _patch_elf_libraries(patch_tool, libs or {}, install_dir, rpath, opts.shrink, result, gate)
     else
         -- Fallback mode: classify each file via PT_INTERP presence so we
         -- don't attempt --set-interpreter on shared libraries (which
@@ -590,9 +739,27 @@ local function _patch_elf(target, opts, result)
         -- ELF corruption bug) and docs/plans/2026-05-03-patchelf-order-
         -- bug-analysis.md for full analysis.
         _info("fallback scan mode, loader=" .. tostring(loader))
-        local targets = _collect_targets(target, opts)
+        -- `scan` narrows the walk to the listed paths under the install dir;
+        -- without it the whole tree is walked, as before.
+        local targets
+        local scan = _rel_list(opts.scan)
+        if scan then
+            targets = {}
+            local seen = {}
+            for _, rel in ipairs(scan) do
+                for _, filepath in ipairs(_collect_targets(path.join(install_dir, rel), opts)) do
+                    if not seen[filepath] then
+                        seen[filepath] = true
+                        table.insert(targets, filepath)
+                    end
+                end
+            end
+        else
+            targets = _collect_targets(target, opts)
+        end
         for _, filepath in ipairs(targets) do
             result.scanned = result.scanned + 1
+            if gate(filepath) then goto next_file end
             local any_ok = false
             local has_interp = _has_pt_interp(filepath, patch_tool)
 
@@ -623,9 +790,13 @@ local function _patch_elf(target, opts, result)
             else
                 result.failed = result.failed + 1
             end
+            ::next_file::
         end
     end
 
+    if result.skipped > 0 then
+        _info(string.format("left %d file(s) untouched", result.skipped))
+    end
     return result
 end
 
@@ -764,7 +935,7 @@ end
 -- callers (M.patch_elf_loader_rpath, legacy auto) stay safe too.
 function M.patch_elf_loader_rpath(target, opts)
     opts = opts or {}
-    local result = { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+    local result = { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
 
     if is_host("linux") then
         return _patch_elf(target, opts, result)
@@ -806,7 +977,7 @@ function M.set_rpath(target, rpath, opts)
     opts = opts or {}
     local shrink = opts.shrink
     if shrink == nil then shrink = true end
-    local result = { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+    local result = { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
 
     if is_host("linux") then
         local patch_tool = _find_tool("patchelf")
@@ -855,6 +1026,19 @@ end
 -- path stops; xlings uses exactly the params provided. If you want
 -- partial customisation, prefer providing all required fields explicitly
 -- (loader / rpath) rather than mixing.
+--
+-- Narrowing what is patched, without taking the patch over:
+--   scan = { "bin", "lib" }        walk only these paths under the install
+--                                  dir instead of the whole tree
+--   skip = { "resources/rg" }      leave these alone; a directory covers
+--                                  everything beneath it
+-- Both are paths relative to the install dir, '/'-separated, no wildcards.
+--
+-- Whatever the params, two kinds of file are never touched, because a
+-- patch can only break them: a file built for another machine than the
+-- loader being written, and a file with neither PT_INTERP nor DT_NEEDED
+-- (static and static-pie programs, a loader itself). Both are reported in
+-- the result's `skipped` count.
 --
 -- Lower-level escape hatches (rare, advanced):
 --   elfpatch.patch_elf_loader_rpath(target, opts)   manual call
@@ -918,7 +1102,7 @@ end
 --   5. ≥ 2 such deps → require interp_from in user_opts (fail-fast)
 --   6. otherwise → no patch
 function M._apply()
-    local empty = { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+    local empty = { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
     if not _RUNTIME then return empty end
 
     -- Cross-platform support matrix:
@@ -1105,7 +1289,7 @@ end
 local function _legacy_apply(opts)
     opts = opts or {}
     if not (_RUNTIME and _RUNTIME.elfpatch_legacy_auto) then
-        return { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+        return { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
     end
 
     local target = opts.target or (_RUNTIME and _RUNTIME.install_dir)
@@ -1145,7 +1329,7 @@ end
 --   4. neither              → new predicate-driven default
 function M.apply_auto(opts)
     if _RUNTIME and _RUNTIME.elfpatch_user_skip then
-        return { scanned = 0, patched = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+        return { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
     end
     if _RUNTIME and _RUNTIME.elfpatch_user_override then
         return M._apply()

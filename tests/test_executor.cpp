@@ -736,6 +736,211 @@ TEST(ExecutorTest, ApplyElfpatchAuto_ForcesRpathOnExecutablesOnly) {
     fs::remove_all(temp_dir);
 }
 
+// A minimal but well-formed little-endian ELF64: header, program headers, an
+// optional PT_INTERP string and a PT_DYNAMIC table holding `needed` DT_NEEDED
+// entries. Enough for a reader of the headers to reach a verdict; a stand-in
+// that is only the ELF magic reads as UNKNOWN and is patched as before.
+static void write_min_elf64(const fs::path& p, std::uint16_t machine, bool interp,
+                     int needed) {
+    std::string bytes(64, '\0');
+    auto put = [&](std::size_t at, std::uint64_t v, int width) {
+        if (bytes.size() < at + width) bytes.resize(at + width, '\0');
+        for (int i = 0; i < width; ++i)
+            bytes[at + i] = static_cast<char>((v >> (8 * i)) & 0xff);
+    };
+    const std::string interp_path = "/lib64/ld-linux-x86-64.so.2";
+    const int phnum = interp ? 2 : 1;
+    const std::size_t phoff = 64;
+    const std::size_t interp_off = phoff + 56 * phnum;
+    const std::size_t dyn_off = interp_off + (interp ? interp_path.size() + 1 : 0);
+    const std::size_t dyn_size = 16 * (needed + 1);
+
+    bytes[0] = 0x7f; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
+    bytes[4] = 2;    // ELFCLASS64
+    bytes[5] = 1;    // little endian
+    bytes[6] = 1;    // EV_CURRENT
+    put(16, 3, 2);             // e_type = ET_DYN
+    put(18, machine, 2);       // e_machine
+    put(20, 1, 4);             // e_version
+    put(32, phoff, 8);         // e_phoff
+    put(52, 64, 2);            // e_ehsize
+    put(54, 56, 2);            // e_phentsize
+    put(56, phnum, 2);         // e_phnum
+
+    std::size_t ph = phoff;
+    if (interp) {
+        put(ph + 0, 3, 4);                          // PT_INTERP
+        put(ph + 8, interp_off, 8);                 // p_offset
+        put(ph + 32, interp_path.size() + 1, 8);    // p_filesz
+        ph += 56;
+    }
+    put(ph + 0, 2, 4);                              // PT_DYNAMIC
+    put(ph + 8, dyn_off, 8);
+    put(ph + 32, dyn_size, 8);
+
+    if (interp) {
+        bytes.resize(interp_off);
+        bytes += interp_path;
+        bytes.push_back('\0');
+    }
+    bytes.resize(dyn_off + dyn_size, '\0');
+    for (int i = 0; i < needed; ++i) put(dyn_off + 16 * i, 1, 8);  // DT_NEEDED
+
+    fs::create_directories(p.parent_path());
+    std::ofstream f(p, std::ios::binary);
+    f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+    f.close();
+    fs::permissions(p,
+                    fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec,
+                    fs::perm_options::replace);
+}
+
+// libxpkg#43. Three kinds of file are never handed to patchelf, whatever the
+// scan finds: one with neither PT_INTERP nor DT_NEEDED (static-pie; writing an
+// RPATH into one made it exit 139 before main), one built for another machine
+// than the loader being written, and one the recipe named in `skip`. What IS
+// patched is unchanged: the executable and the library next to them.
+//
+// The ABI comes from the loader file, so the verdict does not depend on the
+// machine the test runs on (the context below even claims arm64).
+TEST(ExecutorTest, ElfpatchGate_LeavesStaticForeignAndSkippedFilesAlone) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "the ELF patch path runs on linux hosts only";
+#endif
+    constexpr std::uint16_t kX86_64 = 62;
+    constexpr std::uint16_t kAarch64 = 183;
+
+    const fs::path temp_dir = make_temp_dir("libxpkg-elfpatch-gate-");
+    const fs::path tools_dir = temp_dir / "tools";
+    const fs::path install_dir = temp_dir / "install";
+    const fs::path loader = temp_dir / "loader" / "ld-linux-x86-64.so.2";
+    const fs::path log_path = temp_dir / "tool.log";
+    const fs::path pkg_path = temp_dir / "elfpatch-gate.lua";
+
+    fs::create_directories(tools_dir);
+    write_executable_script(tools_dir / "patchelf",
+                            "#!/bin/sh\n"
+                            "printf 'patchelf %s\\n' \"$*\" >> \"$ELFPATCH_LOG\"\n"
+                            "if [ \"$1\" = \"--print-interpreter\" ]; then\n"
+                            "  case \"$2\" in *app*|*skipme*) echo /lib64/ld-linux-x86-64.so.2 ;; esac\n"
+                            "fi\n"
+                            "exit 0\n");
+
+    write_min_elf64(loader, kX86_64, /*interp=*/false, /*needed=*/0);
+    write_min_elf64(install_dir / "bin" / "app", kX86_64, true, 1);
+    write_min_elf64(install_dir / "lib" / "libfoo.so", kX86_64, false, 1);
+    write_min_elf64(install_dir / "resources" / "static-helper", kX86_64, false, 0);
+    write_min_elf64(install_dir / "prebuilds" / "linux-arm64" / "addon.node",
+                    kAarch64, false, 1);
+    write_min_elf64(install_dir / "bin" / "skipme", kX86_64, true, 1);
+
+    write_text(pkg_path,
+               "package = { spec = \"1\", name = \"elfpatch-gate\", xpm = { linux = { [\"latest\"] = { ref = \"1.0.0\" }, [\"1.0.0\"] = { url = \"https://example.com/demo.tar.gz\", sha256 = \"0\" } } } }\n"
+               "local elfpatch = import(\"xim.libxpkg.elfpatch\")\n"
+               "function install()\n"
+               "    elfpatch.set({ interpreter = \"" + loader.generic_string() + "\",\n"
+               "                   skip = { \"./bin/skipme\" } })\n"
+               "    return true\n"
+               "end\n");
+
+    const std::string original_path = std::getenv("PATH") ? std::getenv("PATH") : "";
+    ScopedEnvVar path_env("PATH", tools_dir.string() + ":" + original_path);
+    ScopedEnvVar log_env("ELFPATCH_LOG", log_path.string());
+
+    auto exec = create_executor(pkg_path);
+    ASSERT_TRUE(exec.has_value()) << (exec ? "" : exec.error());
+
+    auto hook_result = exec->run_hook(HookType::Install,
+                                      make_context(install_dir, "linux", tools_dir));
+    ASSERT_TRUE(hook_result.success) << hook_result.error;
+
+    auto patch_result = exec->apply_elfpatch_auto();
+    ASSERT_TRUE(patch_result.success) << patch_result.error;
+    // scanned patched failed: all five are seen, two are patched.
+    EXPECT_EQ(patch_result.output, "5 2 0");
+
+    std::ifstream log_file(log_path);
+    std::ostringstream log_buffer;
+    log_buffer << log_file.rdbuf();
+    const std::string log = log_buffer.str();
+
+    auto touched = [&](const std::string& name) {
+        std::istringstream in(log);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.find("--set-") != std::string::npos
+                && line.find(name) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    };
+    EXPECT_TRUE(touched("bin/app")) << log;
+    EXPECT_TRUE(touched("lib/libfoo.so")) << log;
+    EXPECT_FALSE(touched("static-helper")) << log;
+    EXPECT_FALSE(touched("addon.node")) << log;
+    EXPECT_FALSE(touched("skipme")) << log;
+
+    fs::remove_all(temp_dir);
+}
+
+// `scan` narrows the walk: a file outside the listed paths is not even seen.
+TEST(ExecutorTest, ElfpatchGate_ScanLimitsTheWalk) {
+#if !defined(__linux__)
+    GTEST_SKIP() << "the ELF patch path runs on linux hosts only";
+#endif
+    constexpr std::uint16_t kX86_64 = 62;
+
+    const fs::path temp_dir = make_temp_dir("libxpkg-elfpatch-scan-");
+    const fs::path tools_dir = temp_dir / "tools";
+    const fs::path install_dir = temp_dir / "install";
+    const fs::path loader = temp_dir / "loader" / "ld-linux-x86-64.so.2";
+    const fs::path log_path = temp_dir / "tool.log";
+    const fs::path pkg_path = temp_dir / "elfpatch-scan.lua";
+
+    fs::create_directories(tools_dir);
+    write_executable_script(tools_dir / "patchelf",
+                            "#!/bin/sh\n"
+                            "printf 'patchelf %s\\n' \"$*\" >> \"$ELFPATCH_LOG\"\n"
+                            "exit 0\n");
+
+    write_min_elf64(loader, kX86_64, false, 0);
+    write_min_elf64(install_dir / "lib" / "libin.so", kX86_64, false, 1);
+    write_min_elf64(install_dir / "extras" / "libout.so", kX86_64, false, 1);
+
+    write_text(pkg_path,
+               "package = { spec = \"1\", name = \"elfpatch-scan\", xpm = { linux = { [\"latest\"] = { ref = \"1.0.0\" }, [\"1.0.0\"] = { url = \"https://example.com/demo.tar.gz\", sha256 = \"0\" } } } }\n"
+               "local elfpatch = import(\"xim.libxpkg.elfpatch\")\n"
+               "function install()\n"
+               "    elfpatch.set({ interpreter = \"" + loader.generic_string() + "\",\n"
+               "                   scan = { \"lib/\" } })\n"
+               "    return true\n"
+               "end\n");
+
+    const std::string original_path = std::getenv("PATH") ? std::getenv("PATH") : "";
+    ScopedEnvVar path_env("PATH", tools_dir.string() + ":" + original_path);
+    ScopedEnvVar log_env("ELFPATCH_LOG", log_path.string());
+
+    auto exec = create_executor(pkg_path);
+    ASSERT_TRUE(exec.has_value()) << (exec ? "" : exec.error());
+    auto hook_result = exec->run_hook(HookType::Install,
+                                      make_context(install_dir, "linux", tools_dir));
+    ASSERT_TRUE(hook_result.success) << hook_result.error;
+
+    auto patch_result = exec->apply_elfpatch_auto();
+    ASSERT_TRUE(patch_result.success) << patch_result.error;
+    EXPECT_EQ(patch_result.output, "1 1 0");
+
+    std::ifstream log_file(log_path);
+    std::ostringstream log_buffer;
+    log_buffer << log_file.rdbuf();
+    const std::string log = log_buffer.str();
+    EXPECT_NE(log.find("libin.so"), std::string::npos) << log;
+    EXPECT_EQ(log.find("libout.so"), std::string::npos) << log;
+
+    fs::remove_all(temp_dir);
+}
+
 // A driver vendor library is the host's file: a symlink into /usr/lib, coupled
 // to the host's kernel module, and not ours to put an RPATH on. The historical
 // answer was to put OUR libraries on LD_LIBRARY_PATH so the vendor could find

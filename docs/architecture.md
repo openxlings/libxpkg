@@ -73,6 +73,7 @@ graph TD
 - `load_package(path)` — 解析单个 xpkg `.lua` 文件 → `Package`
 - `load_index_repos(path)` — 解析 `xim-indexrepos.lua` → `IndexRepos`
 - `build_index(repo_dir)` — 扫描 `pkgs/` 目录构建 `PackageIndex`
+- `build_index(repo_dir, ns, BuildOutput)` — 同上；索引自带的 `pkgindex-build.lua` 用 `io.write` / `print` 写出的内容原样、按顺序交给 `BuildOutput`，不再写到进程的 stdout。构建脚本用 `\r[i/n] …\033[K` 画进度，只有调用方知道自己的输出去向（终端、文件还是管道），所以由它决定怎么显示（0.0.59）
 - `load_index_db(path)` / `save_index_db(index, path)` — JSON 格式索引持久化
 
 ### mcpplibs.xpkg.index — 索引层
@@ -94,6 +95,20 @@ graph TD
 - `PackageExecutor::run_hook(hook, ctx)` — 执行指定钩子
 - `PackageExecutor::check_installed(ctx)` — 检查安装状态
 - 支持钩子：`installed` / `build` / `install` / `config` / `uninstall`
+
+#### elfpatch 的自动 patch 不碰哪些文件（0.0.59）
+
+不管是自动路径还是 `elfpatch.set{...}`，下面三类文件都计入结果的 `skipped`，不交给 patchelf：
+
+| 文件 | 判定依据 | 原因 |
+|------|----------|------|
+| 没有 `PT_INTERP` 也没有 `DT_NEEDED` | 读文件自己的 program header 和 dynamic 段 | static / static-pie 程序、loader 本身：写 RPATH 只会改坏它，实测 exit 139（libxpkg#43） |
+| 为另一种机器构建 | `EI_CLASS` + `e_machine` 与即将写入的 loader 的头部比较；没有 loader 时与宿主比较（宿主架构认不出就不过滤） | npm prebuilds 常带多架构二进制 |
+| 配方在 `skip` 里点名 | 相对安装目录的路径前缀，目录覆盖其下全部 | 配方只需声明例外，不必接管整个 patch |
+
+头部读不完整（太短、表越界、未知 class）一律视为"未知"，按原来的方式 patch——跳过必须有正面证据。
+
+`elfpatch.set{ scan = {...} }` 把扫描范围收窄到列出的路径（同样是相对安装目录的路径，不支持通配符）。
 
 #### Lua 运行时兼容层
 

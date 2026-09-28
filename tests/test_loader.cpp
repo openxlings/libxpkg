@@ -139,6 +139,39 @@ TEST(LoaderTest, BuildIndex_PkgindexBuild_TemplateAppended) {
     EXPECT_FALSE(pkg->xpm.entries.empty()) << "template xpm should have been appended by pkgindex-build";
 }
 
+// A build script's progress goes where the caller says, not to fd 1.
+//
+// The real index build scripts draw a self-refreshing line
+// ("\r[i/n] ns::file\033[K") with io.write, and print() on failure. Both
+// reach the BuildOutput unchanged and in order; nothing reaches stdout.
+TEST(LoaderTest, BuildIndex_PkgindexBuild_OutputGoesToTheSink) {
+    auto fixture = copy_pkgindex_build_fixture("output-sink");
+    {
+        std::ofstream script(fixture / "pkgindex-build.lua", std::ios::trunc);
+        script << "package = { name = \"pkgindex-update\", xpm = { linux = { [\"latest\"] = {} } } }\n"
+                  "function install()\n"
+                  "    io.write(\"\\r[1/2] t::a.lua\\027[K\")\n"
+                  "    io.write(\"\\r[2/2] t::b.lua\\027[K\")\n"
+                  "    print(\"\")\n"
+                  "    print(\"done\", 2)\n"
+                  "    return true\n"
+                  "end\n";
+    }
+
+    std::string captured;
+    testing::internal::CaptureStdout();
+    auto result = build_index(fixture, "", [&](std::string_view text) {
+        captured.append(text);
+    });
+    const std::string stdoutText = testing::internal::GetCapturedStdout();
+    fs::remove_all(fixture);
+
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(captured,
+              "\r[1/2] t::a.lua\033[K\r[2/2] t::b.lua\033[K\ndone\t2\n");
+    EXPECT_EQ(stdoutText, "");
+}
+
 // Legacy array form: `deps = { "node", "npm" }` must populate
 // runtime_deps AND build_deps identically (loader fan-out) so
 // pre-split consumers keep getting the same dep set.

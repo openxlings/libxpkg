@@ -1,12 +1,25 @@
 -- xim.libxpkg.system: system operations API
 local M = {}
 
+-- Run a command the way os.execute does. When the host asked for a hook log
+-- (ExecutionContext.hook_log) os.execute sends the child's stdout/stderr to
+-- that file; `tty` opts one command out, for the few that must reach the
+-- terminal (a prompt, a password, output the user has to read). The executor
+-- keeps the original os.execute under an internal name; where that name is
+-- absent nothing redirects os.execute either, so falling back is the same call.
+local function _execute(cmd, tty)
+    if tty and _LIBXPKG_EXEC_INHERIT then return _LIBXPKG_EXEC_INHERIT(cmd) end
+    return os.execute(cmd)
+end
+
+-- opt.retry : extra attempts after the first failure
+-- opt.tty   : true = the command's output is not redirected into the hook log
 function M.exec(cmd, opt)
     opt = opt or {}
     local retries = opt.retry or 0
     local attempts = retries + 1
     for i = 1, attempts do
-        local ret = os.execute(cmd)
+        local ret = _execute(cmd, opt.tty)
         if ret == 0 or ret == true then return end
         if i == attempts then
             error("exec failed after " .. attempts .. " attempt(s): " .. tostring(cmd))
@@ -20,6 +33,8 @@ function M.bindir()           return _RUNTIME and _RUNTIME.bin_dir or nil end
 function M.xpkg_args()        return (_RUNTIME and _RUNTIME.args) or {} end
 function M.subos_sysrootdir() return _RUNTIME and _RUNTIME.subos_sysrootdir or nil end
 
+-- admin = true runs the script under sudo, which prompts on the terminal, so
+-- it is never redirected into the hook log.
 function M.run_in_script(content, admin)
     local tmpfile = os.tmpname()
     -- write content to temp file
@@ -29,7 +44,7 @@ function M.run_in_script(content, admin)
     local ok, err = pcall(function()
         os.execute("chmod +x " .. tmpfile)
         local prefix = (admin == true) and "sudo " or ""
-        local ret = os.execute(prefix .. tmpfile)
+        local ret = _execute(prefix .. tmpfile, admin == true)
         if ret ~= 0 and ret ~= true then
             error("script failed with code: " .. tostring(ret))
         end

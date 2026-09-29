@@ -110,6 +110,36 @@ graph TD
 
 `elfpatch.set{ scan = {...} }` 把扫描范围收窄到列出的路径（同样是相对安装目录的路径，不支持通配符）。
 
+#### hook 子进程的输出：`ExecutionContext::hook_log`（0.0.60）
+
+hook 里的 `print` / `io.write` / `io.stderr:write` 一直被 `run_hook` 捕获进 `HookResult::output`（末尾 16 KB）。但 hook 用 `os.execute`（`system.exec`、`os.exec`、`system.run_in_script` 最终都走它）启动的**子进程**继承本进程的 fd 1/2，输出会直接写到调用方的终端，或者调用方放在 stdout 上的协议流里。`hook_log` 让调用方决定这些输出去哪。
+
+| `hook_log` | 行为 |
+|------------|------|
+| 空（默认） | 与 0.0.59 完全一致：子进程继承 fd 1/2，`print` 等只进环形缓冲区。其他使用 libxpkg 的程序不受影响 |
+| 非空 | `run_hook` 开始时清空并创建这个文件（目录不存在则创建），写第一行 `# <hook> hook of <pkg_name>@<version>`；hook 运行期间，`print` / `io.write` / `io.stderr:write` 与 `os.execute` 的子进程输出**按发生顺序**写进同一个文件；结束时 `HookResult::output` = 文件末尾 16 KB（沿用 UTF-8 清洗与截断标记） |
+
+实现约束：
+
+- **只在 `run_hook` 里接管 `os.execute`**，返回时恢复。`run_script`、`apply_elfpatch_auto` 不受影响；`io.popen` / `os.iorun` 本来就捕获输出，也不改。
+- **命令字符串原样交给 shell，不拼接重定向。** 在末尾拼 `>> log 2>&1` 对 `a && b` 只重定向最后一条；在 Windows 上，在命令前加任何字符都会改变 cmd `/c` 的去引号规则，而 `pkgs/m/msvc.lua` 依赖这条规则。所以重定向做在进程层面：POSIX 用 `posix_spawn("/bin/sh", "-c", cmd)` + `adddup2`，Windows 用 `CreateProcessA(COMSPEC, "<COMSPEC> /c <cmd>")` + `STARTF_USESTDHANDLES`（命令行与 UCRT `system()` 构造的一致，同样用窄字符 API）。stdin 保持继承。
+- **返回值与 Lua 5.4 的 `os.execute` 一致**：退出码 0 → `true, "exit", 0`；退出码 n → `nil, "exit", n`；被信号杀死 → `nil, "signal", s`；`os.execute()` 无参仍问“有没有 shell”。`ret == 0 or ret == true` 之类的现有判断不受影响。
+- **日志打不开不让 hook 失败**：子进程的输出去 `/dev/null`（Windows 是 `NUL`），经 `log` 模块警告一次（因此出现在 `HookResult::output` 里），`HookResult::output` 退回环形缓冲区。
+- 与 `system()` 的一个已知差异：等待子进程期间不像 `system()` 那样忽略 SIGINT/SIGQUIT。
+
+需要终端的命令（提示、密码、要给用户看的输出）显式退出重定向：
+
+```lua
+system.exec("make menuconfig", { tty = true })   -- 输出直通终端，不进日志
+system.run_in_script(script, true)               -- admin（sudo）同理
+```
+
+旧版本的 `system.exec` 忽略 `tty`，而它本来就是直通终端，所以 recipe 可以无条件采用。直通用的原始 `os.execute` 只以内部名 `_LIBXPKG_EXEC_INHERIT` 暴露，不是公开的 `os.*` 函数。
+
+#### `pkginfo.build_dep` 的名字规范化（0.0.60）
+
+xlings 导出 `XLINGS_BUILDDEP_<NAME>_PATH` 时先去掉 `@版本`，再去掉命名空间前缀，再把字母数字转大写、其余转 `_`。`build_dep` 现在按同一规则拼变量名，`build_dep("xim:7zip")`、`build_dep("7zip")`、`build_dep("xim:7zip@26.02")` 读的是同一个 `XLINGS_BUILDDEP_7ZIP_PATH`。之前带命名空间的写法查的是 `XLINGS_BUILDDEP_XIM_7ZIP_PATH`，永远查不到，退回 `dep_install_dir`（它不记录 build 依赖），最后返回 nil。查不到变量时仍退回 `dep_install_dir`。
+
 #### Lua 运行时兼容层
 
 executor 通过 `prelude.lua`（编译时嵌入 `xpkg-lua-stdlib.cppm`）为包脚本提供运行环境。

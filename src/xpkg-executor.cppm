@@ -1,5 +1,34 @@
 module;
 
+// Platform headers for the process layer below (hook output redirection).
+// `import std;` does not provide them, and the named-module purview forbids
+// including them there.
+#if defined(_WIN32)
+// windows.h's min/max macros break std::min({...}) in every module that sees
+// them, and only Windows ever reports it. Both defines come before the include.
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+#else
+#  include <cerrno>
+#  include <fcntl.h>
+#  include <spawn.h>
+#  include <sys/types.h>
+#  include <sys/wait.h>
+#  include <unistd.h>
+#  if defined(__APPLE__)
+#    include <crt_externs.h>
+#  else
+// POSIX leaves this declaration to the application; glibc/musl only declare
+// it under _GNU_SOURCE.
+extern "C" char** environ;
+#  endif
+#endif
+
 export module mcpplibs.xpkg.executor;
 import mcpplibs.xpkg;
 import mcpplibs.xpkg.lua_stdlib;
@@ -69,6 +98,30 @@ struct ExecutionContext {
     DepExport self_exports;
     std::string subos_sysrootdir;
     std::string pkgindex_dir;    // package index repo root (for custom module loading)
+
+    // Where run_hook() sends what a hook's child processes write (0.0.60).
+    //
+    // Empty (the default) is the behaviour of every release before it: children
+    // started by os.execute / system.exec inherit this process's fd 1 and 2,
+    // and only the hook's own print / io.write / io.stderr:write are captured
+    // into HookResult::output. A caller that owns the terminal or a protocol on
+    // stdout has no way to keep a child's output out of it, which is what this
+    // field is for.
+    //
+    // Non-empty: run_hook() truncates the file (creating its directory), writes
+    // the line "# <hook> hook of <pkg_name>@<version>", and for the length of
+    // the hook
+    //   * appends the hook's own print / io.write / io.stderr:write to it, and
+    //   * starts every os.execute child with fd 1 and 2 pointing at it,
+    // so the file reads in the order things happened. HookResult::output is then
+    // the last kMaxHookOutputBytes of that file. system.exec(cmd, { tty = true })
+    // and system.run_in_script(script, true) still inherit the terminal.
+    //
+    // A file that cannot be created or opened never fails the hook: children
+    // get the null device, one warning goes through the log module (and so into
+    // HookResult::output), and the ring buffer stands in for the file.
+    // run_script() and apply_elfpatch_auto() ignore this field.
+    fs::path hook_log;
 };
 
 inline constexpr std::size_t kMaxHookOutputBytes = 16 * 1024;
@@ -176,6 +229,14 @@ void register_os_funcs(lua::State* L) {
         lua::setglobal(L, "os");
         lua::getglobal(L, "os");
     }
+
+    // The native os.execute -- system(), the child inherits fd 1 and 2 -- under
+    // an internal name. While a hook runs with ExecutionContext::hook_log,
+    // os.execute is replaced by a version that redirects the child's output;
+    // a command that needs the terminal (system.exec's `tty`) reaches this one.
+    // Deliberately not an os.* function: recipes should not depend on it.
+    lua::getfield(L, -1, "execute");
+    lua::setglobal(L, "_LIBXPKG_EXEC_INHERIT");
 
     // os.isdir(path) -> bool
     lua::pushcfunction(L, [](lua::State* L) -> int {
@@ -714,9 +775,277 @@ void inject_context(lua::State* L, const mcpplibs::xpkg::ExecutionContext& ctx) 
 constexpr std::string_view HOOK_OUTPUT_TRUNCATED_MARKER =
     "\n[libxpkg: hook output truncated]\n";
 
+// ---- Native process layer: a child's fd 1/2 in a file ----------------------
+//
+// Standalone on purpose -- no lua::, nothing else from this file. The Windows
+// half cannot be compiled by this project's Linux CI, so the block between the
+// markers is kept small enough to be extracted and built (and run, under Wine)
+// on its own. Do not add a dependency on the rest of the file to it.
+//
+// Why a process-level redirect and not "cmd >> log 2>&1" appended to the string:
+// appended, it only redirects the LAST command of "a && b"; and anything put in
+// front of a Windows command changes cmd's /c quote-stripping rule, which
+// pkgs/m/msvc.lua depends on. The command string is passed through untouched.
+
+// BEGIN native-exec
+#if defined(_WIN32)
+using NativeFile = HANDLE;
+inline const NativeFile kNoFile = INVALID_HANDLE_VALUE;
+#else
+using NativeFile = int;
+inline constexpr NativeFile kNoFile = -1;
+#endif
+
+// How a command ended, in Lua 5.4's os.execute vocabulary.
+struct ExecStatus {
+    enum class Kind { Exit, Signal, Failed };
+    Kind kind = Kind::Failed;
+    int code = 0;          // exit status, signal number, or the OS error
+    std::string message;   // Failed only
+};
+
+// An append-only handle to `path`, which must already exist. On Windows it is
+// inheritable: it becomes the child's stdout and stderr.
+NativeFile open_append(const fs::path& path) {
+#if defined(_WIN32)
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    // FILE_APPEND_DATA alone: every write lands at the end of the file, whoever
+    // holds the handle, so the parent's and the child's writes stay in order.
+    return ::CreateFileW(path.c_str(), FILE_APPEND_DATA,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                         &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+#else
+    return ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+#endif
+}
+
+void close_file(NativeFile file) {
+    if (file == kNoFile) return;
+#if defined(_WIN32)
+    ::CloseHandle(file);
+#else
+    ::close(file);
+#endif
+}
+
+bool write_all(NativeFile file, std::string_view bytes) {
+    while (!bytes.empty()) {
+#if defined(_WIN32)
+        const std::size_t chunk = bytes.size() < (1u << 20) ? bytes.size() : (1u << 20);
+        DWORD written = 0;
+        if (!::WriteFile(file, bytes.data(), static_cast<DWORD>(chunk), &written, nullptr) ||
+            written == 0) {
+            return false;
+        }
+#else
+        const ssize_t written = ::write(file, bytes.data(), bytes.size());
+        if (written < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+#endif
+        bytes.remove_prefix(static_cast<std::size_t>(written));
+    }
+    return true;
+}
+
+// Run `cmd` through the system shell -- what system() does -- with the child's
+// stdout and stderr on `out` (kNoFile: the null device), stdin inherited, and
+// wait for it.
+ExecStatus run_shell(const char* cmd, NativeFile out) {
+    ExecStatus status;
+#if defined(_WIN32)
+    // The command line UCRT system() builds: "<COMSPEC> /c <cmd>", the pieces
+    // joined by single spaces with no quoting, so cmd's /c quote-stripping sees
+    // exactly what it sees under os.execute. The narrow (ACP) API is deliberate
+    // for the same reason: system() is narrow too.
+    const char* env = std::getenv("COMSPEC");
+    const std::string comspec = (env && *env) ? env : "cmd.exe";
+    std::string commandLine = comspec + " /c " + cmd;
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE sink = out;
+    HANDLE nul = INVALID_HANDLE_VALUE;
+    if (sink == INVALID_HANDLE_VALUE) {
+        nul = ::CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                            &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        sink = nul;
+    }
+
+    STARTUPINFOA startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
+    startup.hStdOutput = sink;
+    startup.hStdError = sink;
+    PROCESS_INFORMATION process{};
+    // With COMSPEC unset, system() finds cmd.exe on the search path; a bare
+    // name as lpApplicationName would only be looked for in the current
+    // directory, so let CreateProcess parse the command line instead.
+    const bool fromEnv = env && *env;
+    const BOOL started = ::CreateProcessA(fromEnv ? comspec.c_str() : nullptr,
+                                          commandLine.data(),
+                                          nullptr, nullptr, TRUE, 0, nullptr, nullptr,
+                                          &startup, &process);
+    if (started) {
+        ::CloseHandle(process.hThread);
+        ::WaitForSingleObject(process.hProcess, INFINITE);
+        DWORD exitCode = 1;
+        ::GetExitCodeProcess(process.hProcess, &exitCode);
+        ::CloseHandle(process.hProcess);
+        status.kind = ExecStatus::Kind::Exit;
+        status.code = static_cast<int>(exitCode);
+    } else {
+        status.code = static_cast<int>(::GetLastError());
+        status.message = "cannot start " + comspec + " (error " +
+                         std::to_string(status.code) + ")";
+    }
+    if (nul != INVALID_HANDLE_VALUE) ::CloseHandle(nul);
+#else
+    posix_spawn_file_actions_t actions;
+    int error = ::posix_spawn_file_actions_init(&actions);
+    if (error == 0) {
+        if (out != kNoFile) {
+            error = ::posix_spawn_file_actions_adddup2(&actions, out, 1);
+        } else {
+            error = ::posix_spawn_file_actions_addopen(&actions, 1, "/dev/null",
+                                                       O_WRONLY, 0);
+        }
+        if (error == 0) error = ::posix_spawn_file_actions_adddup2(&actions, 1, 2);
+        if (error == 0) {
+            char* const argv[] = { const_cast<char*>("sh"), const_cast<char*>("-c"),
+                                   const_cast<char*>(cmd), nullptr };
+#  if defined(__APPLE__)
+            char** const envp = *_NSGetEnviron();
+#  else
+            char** const envp = environ;
+#  endif
+            pid_t pid = 0;
+            error = ::posix_spawn(&pid, "/bin/sh", &actions, nullptr, argv, envp);
+            if (error == 0) {
+                int raw = 0;
+                pid_t reaped = 0;
+                do {
+                    reaped = ::waitpid(pid, &raw, 0);
+                } while (reaped < 0 && errno == EINTR);
+                if (reaped < 0) {
+                    error = errno;
+                } else if (WIFEXITED(raw)) {
+                    status.kind = ExecStatus::Kind::Exit;
+                    status.code = WEXITSTATUS(raw);
+                } else if (WIFSIGNALED(raw)) {
+                    status.kind = ExecStatus::Kind::Signal;
+                    status.code = WTERMSIG(raw);
+                } else {
+                    status.kind = ExecStatus::Kind::Exit;
+                    status.code = raw;
+                }
+            }
+        }
+        ::posix_spawn_file_actions_destroy(&actions);
+    }
+    if (status.kind == ExecStatus::Kind::Failed) {
+        status.code = error;
+        status.message = std::strerror(error);
+    }
+#endif
+    return status;
+}
+// END native-exec
+
+std::string printable(const fs::path& path) {
+    // path::string() can throw on Windows for a name the ACP cannot spell, and
+    // this is only ever used to word a warning.
+    try {
+        return path.string();
+    } catch (...) {
+        return "<unprintable path>";
+    }
+}
+
+// The file one run_hook() writes when ExecutionContext::hook_log is set.
+class HookLog {
+    fs::path path_;
+    NativeFile file_ = kNoFile;
+    bool active_ = false;    // a hook is running with a log requested
+    bool readable_ = false;  // the file exists and no write to it has failed
+
+public:
+    HookLog() = default;
+    ~HookLog() { end(); }
+    HookLog(const HookLog&) = delete;
+    HookLog& operator=(const HookLog&) = delete;
+
+    // Start a log. `active()` is true afterwards even when the file could not
+    // be made: the caller asked for the children's output to stay off the
+    // terminal, and the null device does that. Returns why the file is
+    // unavailable, or an empty string.
+    std::string begin(const fs::path& path, std::string_view header) {
+        end();
+        // Absolute now: a hook may os.cd() away, and the file is read back by
+        // this name after it returns.
+        std::error_code ec;
+        path_ = fs::absolute(path, ec);
+        if (ec) path_ = path;
+        active_ = true;
+        readable_ = false;
+
+        if (path_.has_parent_path()) fs::create_directories(path_.parent_path(), ec);
+        {
+            std::ofstream out(path_, std::ios::binary | std::ios::trunc);
+            out.write(header.data(), static_cast<std::streamsize>(header.size()));
+            out.close();
+            if (out.fail()) return "cannot create " + printable(path_);
+        }
+        file_ = open_append(path_);
+        if (file_ == kNoFile) return "cannot open " + printable(path_) + " for append";
+        readable_ = true;
+        return {};
+    }
+
+    bool active() const { return active_; }
+    // The handle a child's stdout and stderr should be; kNoFile is the null device.
+    NativeFile file() const { return file_; }
+
+    // The hook's own output, in the order it happened relative to the children's.
+    void append(std::string_view bytes) {
+        if (file_ == kNoFile || bytes.empty()) return;
+        if (!write_all(file_, bytes)) readable_ = false;
+    }
+
+    void end() {
+        active_ = false;
+        close_file(std::exchange(file_, kNoFile));
+    }
+
+    // The last `limit` bytes of the file, or nothing when it cannot stand in for
+    // the ring buffer (never created, or a write to it failed). Valid after end().
+    std::optional<std::string> tail(std::size_t limit) const {
+        if (!readable_) return std::nullopt;
+        std::ifstream in(path_, std::ios::binary);
+        if (!in) return std::nullopt;
+        in.seekg(0, std::ios::end);
+        const auto size = static_cast<std::streamoff>(in.tellg());
+        if (size < 0) return std::nullopt;
+        const auto skip = size > static_cast<std::streamoff>(limit)
+                              ? size - static_cast<std::streamoff>(limit)
+                              : std::streamoff{0};
+        in.seekg(skip);
+        std::string bytes(static_cast<std::size_t>(size - skip), '\0');
+        in.read(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        bytes.resize(static_cast<std::size_t>(in.gcount()));
+        return bytes;
+    }
+};
+
 class HookOutput {
     std::string bytes_;
     bool truncated_ = false;
+    HookLog* log_ = nullptr;  // also receives everything appended, while set
 
     static bool is_continuation_byte_(unsigned char byte) {
         return (byte & 0xc0) == 0x80;
@@ -782,8 +1111,11 @@ public:
         truncated_ = false;
     }
 
+    void attach(HookLog* log) { log_ = log; }
+
     void append(std::string_view bytes) {
         if (bytes.empty()) return;
+        if (log_) log_->append(bytes);
         if (bytes.size() >= kMaxHookOutputBytes) {
             truncated_ = truncated_ || !bytes_.empty() ||
                          bytes.size() > kMaxHookOutputBytes;
@@ -870,9 +1202,71 @@ int capture_stderr_write(lua::State* L) {
     return lua::gettop(L);
 }
 
+// os.execute while a hook runs with a log: the same call with the same results
+// as Lua 5.4's, but the child's fd 1 and 2 are the log. Upvalue 1 is the
+// HookLog, upvalue 2 the original os.execute.
+int hooked_os_execute(lua::State* L) {
+    auto* log = static_cast<HookLog*>(lua::touserdata(L, lua::upvalueindex(1)));
+    unsigned long long length = 0;
+    // Nothing with a destructor may be live across this call: a bad argument
+    // raises through it, exactly as it does in the original.
+    const char* cmd = lua::L_optlstring(L, 1, nullptr, &length);
+    if (!cmd || !log || !log->active()) {
+        // os.execute() with no command asks whether a shell exists, and a
+        // reference kept past the hook must behave like the original again.
+        const int argumentCount = lua::gettop(L);
+        lua::pushvalue(L, lua::upvalueindex(2));
+        lua::insert(L, 1);
+        lua::call(L, argumentCount, lua::MULTRET);
+        return lua::gettop(L);
+    }
+
+    const ExecStatus status = run_shell(cmd, log->file());
+    switch (status.kind) {
+        case ExecStatus::Kind::Exit:
+            // luaL_execresult: success is true, any other status is fail.
+            if (status.code == 0) lua::pushboolean(L, 1);
+            else lua::pushnil(L);
+            lua::pushstring(L, "exit");
+            break;
+        case ExecStatus::Kind::Signal:
+            lua::pushnil(L);
+            lua::pushstring(L, "signal");
+            break;
+        case ExecStatus::Kind::Failed:
+            // luaL_fileresult: fail, message, errno.
+            lua::pushnil(L);
+            lua::pushstring(L, status.message.c_str());
+            break;
+    }
+    lua::pushinteger(L, status.code);
+    return 3;
+}
+
+// One warning through the log module. Called with capture already installed,
+// so it lands in HookResult::output and not on the terminal.
+void warn_through_log_module(lua::State* L, const std::string& message) {
+    const int top = lua::gettop(L);
+    lua::getglobal(L, "_LIBXPKG_MODULES");
+    if (lua::type(L, -1) == lua::TTABLE) {
+        lua::getfield(L, -1, "log");
+        if (lua::type(L, -1) == lua::TTABLE) {
+            lua::getfield(L, -1, "warn");
+            if (lua::type(L, -1) == lua::TFUNCTION) {
+                lua::pushstring(L, "%s");
+                lua::pushstring(L, message.c_str());
+                lua::pcall(L, 2, 0, 0);
+            }
+        }
+    }
+    lua::settop(L, top);
+}
+
 class HookCapture {
     lua::State* L_ = nullptr;
     HookOutput& output_;
+    HookLog* log_ = nullptr;
+    int osExecuteRef_ = 0;
     int printRef_ = 0;
     int ioRef_ = 0;
     int ioWriteRef_ = 0;
@@ -882,6 +1276,21 @@ class HookCapture {
 
     void restore_() {
         if (!L_) return;
+
+        if (osExecuteRef_ != 0) {
+            lua::getglobal(L_, "os");
+            if (lua::type(L_, -1) == lua::TTABLE) {
+                lua::rawgeti(L_, lua::REGISTRYINDEX, osExecuteRef_);
+                lua::setfield(L_, -2, "execute");
+            }
+            lua::pop(L_, 1);
+            lua::L_unref(L_, lua::REGISTRYINDEX, osExecuteRef_);
+            osExecuteRef_ = 0;
+        }
+        if (log_) {
+            output_.attach(nullptr);
+            log_->end();
+        }
 
         lua::rawgeti(L_, lua::REGISTRYINDEX, ioRef_);
         lua::rawgeti(L_, lua::REGISTRYINDEX, ioWriteRef_);
@@ -907,9 +1316,11 @@ class HookCapture {
     }
 
 public:
-    HookCapture(lua::State* L, HookOutput& output)
-        : L_(L), output_(output) {
+    // `log` is null for a hook that asked for none: nothing below changes then.
+    HookCapture(lua::State* L, HookOutput& output, HookLog* log = nullptr)
+        : L_(L), output_(output), log_(log) {
         output_.reset();
+        output_.attach(log_);
 
         lua::getglobal(L_, "print");
         printRef_ = lua::L_ref(L_, lua::REGISTRYINDEX);
@@ -948,6 +1359,19 @@ public:
         lua::pushcclosure(L_, capture_stderr_write, 3);
         lua::setfield(L_, -2, "write");
         lua::pop(L_, 2);
+
+        if (log_) {
+            lua::getglobal(L_, "os");
+            if (lua::type(L_, -1) == lua::TTABLE) {
+                lua::getfield(L_, -1, "execute");
+                osExecuteRef_ = lua::L_ref(L_, lua::REGISTRYINDEX);
+                lua::pushlightuserdata(L_, log_);
+                lua::rawgeti(L_, lua::REGISTRYINDEX, osExecuteRef_);
+                lua::pushcclosure(L_, hooked_os_execute, 2);
+                lua::setfield(L_, -2, "execute");
+            }
+            lua::pop(L_, 1);
+        }
     }
 
     ~HookCapture() { restore_(); }
@@ -957,6 +1381,14 @@ public:
 
     std::string finish() {
         restore_();
+        if (log_) {
+            // The file holds the children's output as well as the hook's own,
+            // in order; the ring buffer only ever saw the latter.
+            if (auto tail = log_->tail(kMaxHookOutputBytes + 1)) {
+                output_.reset();
+                output_.append(*tail);
+            }
+        }
         return output_.finish();
     }
 };
@@ -972,6 +1404,8 @@ class PackageExecutor {
     fs::path    pkg_ ;
     std::unique_ptr<detail::HookOutput> hookOutput_ =
         std::make_unique<detail::HookOutput>();
+    std::unique_ptr<detail::HookLog> hookLog_ =
+        std::make_unique<detail::HookLog>();
 
 public:
     explicit PackageExecutor(lua::State* L, fs::path pkg)
@@ -987,7 +1421,8 @@ public:
     PackageExecutor(PackageExecutor&& o) noexcept
         : L_(std::exchange(o.L_, nullptr)),
           pkg_(std::move(o.pkg_)),
-          hookOutput_(std::move(o.hookOutput_)) {}
+          hookOutput_(std::move(o.hookOutput_)),
+          hookLog_(std::move(o.hookLog_)) {}
 
     PackageExecutor& operator=(PackageExecutor&& o) noexcept {
         if (this != &o) {
@@ -995,6 +1430,7 @@ public:
             L_   = std::exchange(o.L_, nullptr);
             pkg_ = std::move(o.pkg_);
             hookOutput_ = std::move(o.hookOutput_);
+            hookLog_ = std::move(o.hookLog_);
         }
         return *this;
     }
@@ -1020,7 +1456,21 @@ public:
                                .error   = "hook not found: " + std::string(name) };
         }
 
-        detail::HookCapture capture(L_, *hookOutput_);
+        detail::HookLog* log = nullptr;
+        std::string logProblem;
+        if (!ctx.hook_log.empty()) {
+            log = hookLog_.get();
+            logProblem = log->begin(
+                ctx.hook_log,
+                "# " + std::string(name) + " hook of " + ctx.pkg_name + "@" +
+                    ctx.version + "\n");
+        }
+        detail::HookCapture capture(L_, *hookOutput_, log);
+        if (!logProblem.empty()) {
+            detail::warn_through_log_module(
+                L_, "hook output log unavailable (" + logProblem +
+                        "); output of child processes is discarded");
+        }
         HookResult result;
         if (lua::pcall(L_, 0, 1, 0) == lua::OK) {
             int t = lua::type(L_, -1);

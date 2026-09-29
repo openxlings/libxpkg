@@ -504,7 +504,10 @@ end
 -- Resolution order:
 --   1. Env var XLINGS_BUILDDEP_<UPPER_NAME>_PATH (injected by the
 --      xlings installer when the consumer's `build` deps were resolved
---      to a concrete version).
+--      to a concrete version). <UPPER_NAME> is the dep's bare name --
+--      namespace and @version dropped, then upper-cased with every
+--      non-alphanumeric mapped to `_` -- exactly as xlings derives it, so
+--      "xim:7zip", "7zip" and "xim:7zip@26.02" all read XLINGS_BUILDDEP_7ZIP_PATH.
 --   2. Fallback: scan xpkgs the same way `dep_install_dir` does.
 --      Returns highest available version when version is omitted.
 --
@@ -513,8 +516,17 @@ function M.build_dep(dep_name, dep_version)
     local log = _get_log()
     if not dep_name or dep_name == "" then return nil end
 
-    local function _upper(s) return (s:gsub("[^%w]", "_")):upper() end
-    local env_key  = "XLINGS_BUILDDEP_" .. _upper(dep_name) .. "_PATH"
+    -- Must spell the name the way xlings does when it exports the variable
+    -- (installer.cpp): drop from the first '@', then up to and including the
+    -- first ':', then upper-case alphanumerics and map the rest to '_'.
+    local function _env_name(s)
+        local at = s:find("@", 1, true)
+        if at then s = s:sub(1, at - 1) end
+        local colon = s:find(":", 1, true)
+        if colon then s = s:sub(colon + 1) end
+        return (s:gsub("[^%w]", "_")):upper()
+    end
+    local env_key  = "XLINGS_BUILDDEP_" .. _env_name(dep_name) .. "_PATH"
     local env_path = os.getenv(env_key)
     local install_dir
     if env_path and env_path ~= "" and os.isdir(env_path) then

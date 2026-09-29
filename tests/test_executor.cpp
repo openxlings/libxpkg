@@ -3242,3 +3242,439 @@ TEST(ExecutorTest, PkgInfo_UniqueRecordWithNoPayloadOnDiskIsStillAMiss) {
     EXPECT_NE(result.output.find("missing payload"), std::string::npos)
         << "an absent payload must say so:\n" << result.output;
 }
+
+// ---- ExecutionContext::hook_log: child-process output of a hook (0.0.60) ----
+//
+// Children started by os.execute inherit this process's fd 1 and 2, which is
+// exactly what testing::internal::CaptureStdout/CaptureStderr swap out -- so a
+// marker that shows up in the captured text reached "the terminal", and one that
+// does not was kept off it.
+
+namespace {
+
+std::string slurp(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(in), {});
+}
+
+std::vector<std::string> split_lines(std::string_view text) {
+    std::vector<std::string> lines;
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        auto end = text.find('\n', begin);
+        if (end == std::string_view::npos) end = text.size();
+        std::string line(text.substr(begin, end - begin));
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        lines.push_back(std::move(line));
+        begin = end + 1;
+    }
+    return lines;
+}
+
+fs::path write_hook_package(const fs::path& dir, std::string_view name,
+                            std::string_view body) {
+    const fs::path pkg = dir / (std::string(name) + ".lua");
+    write_text(pkg,
+        "package = { name = \"" + std::string(name) +
+        "\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "local system = import(\"xim.libxpkg.system\")\n" + std::string(body));
+    return pkg;
+}
+
+struct Escaped {
+    std::string out, err;
+};
+
+template <typename Fn>
+Escaped run_captured(Fn&& fn) {
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+    fn();
+    Escaped escaped;
+    escaped.out = testing::internal::GetCapturedStdout();
+    escaped.err = testing::internal::GetCapturedStderr();
+    return escaped;
+}
+
+} // namespace
+
+TEST(ExecutorTest, HookLog_ChildOutputAndPrintLandInOrderNotOnTheTerminal) {
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-order-");
+    const fs::path pkg = write_hook_package(temp, "hook-log-order",
+        "function install()\n"
+        "    print(\"MARK-1-print\")\n"
+        "    os.execute(\"echo MARK-2-child-out\")\n"
+        "    os.execute(\"echo MARK-3-child-err 1>&2\")\n"
+        "    io.write(\"MARK-4-io-write\\n\")\n"
+        "    io.stderr:write(\"MARK-5-io-stderr\\n\")\n"
+        "    os.execute(\"echo MARK-6-child-last\")\n"
+        "    return true\n"
+        "end\n");
+    const fs::path logPath = temp / "logs" / "hooks" / "order.log";
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    auto ctx = make_context(temp / "install", "linux");
+    ctx.pkg_name = "hook-log-order";
+    ctx.version = "0.0.1";
+    ctx.hook_log = logPath;
+
+    HookResult result;
+    const auto escaped = run_captured([&] {
+        result = exec->run_hook(HookType::Install, ctx);
+    });
+
+    EXPECT_TRUE(result.success) << result.error << "\n" << result.output;
+    EXPECT_EQ(escaped.out.find("MARK-"), std::string::npos)
+        << "a child reached the process's stdout:\n" << escaped.out;
+    EXPECT_EQ(escaped.err.find("MARK-"), std::string::npos)
+        << "a child reached the process's stderr:\n" << escaped.err;
+
+    const std::string logged = slurp(logPath);
+    EXPECT_EQ(logged.rfind("# install hook of hook-log-order@0.0.1\n", 0), 0u) << logged;
+    for (const std::string& text : {logged, result.output}) {
+        std::size_t previous = 0;
+        for (const char* marker : {"MARK-1-print", "MARK-2-child-out", "MARK-3-child-err",
+                                   "MARK-4-io-write", "MARK-5-io-stderr",
+                                   "MARK-6-child-last"}) {
+            const auto at = text.find(marker);
+            ASSERT_NE(at, std::string::npos) << marker << " missing from:\n" << text;
+            EXPECT_GE(at, previous) << marker << " is out of order in:\n" << text;
+            previous = at;
+        }
+    }
+    EXPECT_EQ(result.output.rfind("# install hook of hook-log-order@0.0.1\n", 0), 0u)
+        << result.output;
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, HookLog_EmptyKeepsTheChildrenOnTheInheritedStreams) {
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-empty-");
+    const fs::path pkg = write_hook_package(temp, "hook-log-empty",
+        "function install()\n"
+        "    print(\"MARK-print\")\n"
+        "    os.execute(\"echo MARK-child-out\")\n"
+        "    os.execute(\"echo MARK-child-err 1>&2\")\n"
+        "    return true\n"
+        "end\n");
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    auto ctx = make_context(temp / "install", "linux");
+
+    HookResult legacy;
+    const auto before = run_captured([&] {
+        legacy = exec->run_hook(HookType::Install, ctx);
+    });
+    EXPECT_TRUE(legacy.success) << legacy.error;
+    EXPECT_NE(before.out.find("MARK-child-out"), std::string::npos) << before.out;
+    EXPECT_NE(before.err.find("MARK-child-err"), std::string::npos) << before.err;
+    EXPECT_EQ(before.out.find("MARK-print"), std::string::npos);
+    EXPECT_NE(legacy.output.find("MARK-print"), std::string::npos);
+    EXPECT_EQ(legacy.output.find("MARK-child"), std::string::npos) << legacy.output;
+    EXPECT_EQ(legacy.output.find("# install hook"), std::string::npos) << legacy.output;
+
+    // The same executor with a log, then without one again: nothing the
+    // logged run installed may outlive it.
+    ctx.hook_log = temp / "empty.log";
+    HookResult logged;
+    const auto during = run_captured([&] {
+        logged = exec->run_hook(HookType::Install, ctx);
+    });
+    EXPECT_EQ(during.out.find("MARK-"), std::string::npos) << during.out;
+    EXPECT_EQ(during.err.find("MARK-"), std::string::npos) << during.err;
+    EXPECT_NE(logged.output.find("MARK-child-out"), std::string::npos) << logged.output;
+
+    ctx.hook_log.clear();
+    const auto after = run_captured([&] {
+        legacy = exec->run_hook(HookType::Install, ctx);
+    });
+    EXPECT_NE(after.out.find("MARK-child-out"), std::string::npos)
+        << "os.execute stayed redirected after the hook returned:\n" << after.out;
+    EXPECT_NE(after.err.find("MARK-child-err"), std::string::npos) << after.err;
+    EXPECT_EQ(legacy.output.find("MARK-child"), std::string::npos) << legacy.output;
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, HookLog_ExecuteReturnsWhatLuaOsExecuteReturns) {
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-triples-");
+    std::string body =
+        "local function show(...)\n"
+        "    local parts = {}\n"
+        "    for i = 1, select('#', ...) do parts[i] = tostring((select(i, ...))) end\n"
+        "    print(\"RESULT \" .. table.concat(parts, \" \"))\n"
+        "end\n"
+        "function install()\n"
+        "    show(os.execute(\"exit 0\"))\n"
+        "    show(os.execute(\"exit 3\"))\n"
+        "    show(os.execute())\n"
+#ifndef _WIN32
+        "    show(os.execute(\"kill -TERM $$\"))\n"
+        "    show(os.execute(\"exit 300\"))\n"
+#endif
+        "    return true\n"
+        "end\n";
+    const fs::path pkg = write_hook_package(temp, "hook-log-triples", body);
+
+    auto results = [&](const fs::path& hookLog) {
+        auto exec = create_executor(pkg);
+        EXPECT_TRUE(exec.has_value());
+        auto ctx = make_context(temp / "install", "linux");
+        ctx.hook_log = hookLog;
+        const auto result = exec->run_hook(HookType::Install, ctx);
+        EXPECT_TRUE(result.success) << result.error << "\n" << result.output;
+        std::vector<std::string> lines;
+        for (auto& line : split_lines(result.output)) {
+            if (line.rfind("RESULT ", 0) == 0) lines.push_back(std::move(line));
+        }
+        return lines;
+    };
+
+    const auto native = results({});
+    const auto redirected = results(temp / "triples.log");
+
+    EXPECT_EQ(redirected, native)
+        << "the redirecting os.execute must answer exactly like Lua's";
+    ASSERT_GE(redirected.size(), 3u);
+    EXPECT_EQ(redirected[0], "RESULT true exit 0");
+    EXPECT_EQ(redirected[1], "RESULT nil exit 3");
+    EXPECT_EQ(redirected[2], "RESULT true");
+#ifndef _WIN32
+    ASSERT_EQ(redirected.size(), 5u);
+    EXPECT_EQ(redirected[3], "RESULT nil signal 15");
+    EXPECT_EQ(redirected[4], "RESULT nil exit 44");  // 300 & 0xff
+#endif
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, HookLog_TtyOptOutReachesTheTerminalAndNotTheLog) {
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-tty-");
+    const fs::path pkg = write_hook_package(temp, "hook-log-tty",
+        "function install()\n"
+        "    system.exec(\"echo MARK-tty\", { tty = true })\n"
+        "    system.exec(\"echo MARK-logged\")\n"
+        "    system.exec(\"echo MARK-logged-too\", { tty = false })\n"
+        "    return true\n"
+        "end\n");
+    const fs::path logPath = temp / "tty.log";
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    auto ctx = make_context(temp / "install", "linux");
+    ctx.hook_log = logPath;
+
+    HookResult result;
+    const auto escaped = run_captured([&] {
+        result = exec->run_hook(HookType::Install, ctx);
+    });
+
+    EXPECT_TRUE(result.success) << result.error << "\n" << result.output;
+    EXPECT_NE(escaped.out.find("MARK-tty"), std::string::npos) << escaped.out;
+    EXPECT_EQ(escaped.out.find("MARK-logged"), std::string::npos) << escaped.out;
+    const std::string logged = slurp(logPath);
+    const auto loggedLines = split_lines(logged);
+    EXPECT_EQ(logged.find("MARK-tty"), std::string::npos) << logged;
+    EXPECT_NE(std::ranges::find(loggedLines, "MARK-logged"), loggedLines.end()) << logged;
+    EXPECT_NE(std::ranges::find(loggedLines, "MARK-logged-too"), loggedLines.end()) << logged;
+    EXPECT_EQ(result.output.find("MARK-tty"), std::string::npos) << result.output;
+
+    fs::remove_all(temp);
+}
+
+#ifndef _WIN32
+TEST(ExecutorTest, HookLog_RunInScriptIsLoggedUnlessAdmin) {
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-script-");
+    const fs::path pkg = write_hook_package(temp, "hook-log-script",
+        "function install()\n"
+        "    system.run_in_script(\"#!/bin/sh\\necho MARK-script-out\\necho MARK-script-err >&2\\n\")\n"
+        "    return true\n"
+        "end\n");
+    const fs::path logPath = temp / "script.log";
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    auto ctx = make_context(temp / "install", "linux");
+    ctx.hook_log = logPath;
+
+    HookResult result;
+    const auto escaped = run_captured([&] {
+        result = exec->run_hook(HookType::Install, ctx);
+    });
+
+    EXPECT_TRUE(result.success) << result.error << "\n" << result.output;
+    EXPECT_EQ(escaped.out.find("MARK-"), std::string::npos) << escaped.out;
+    EXPECT_EQ(escaped.err.find("MARK-"), std::string::npos) << escaped.err;
+    const std::string logged = slurp(logPath);
+    EXPECT_NE(logged.find("MARK-script-out"), std::string::npos) << logged;
+    EXPECT_NE(logged.find("MARK-script-err"), std::string::npos) << logged;
+
+    fs::remove_all(temp);
+}
+#endif
+
+TEST(ExecutorTest, HookLog_UnopenableLogNeverFailsTheHook) {
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-unopenable-");
+    const fs::path pkg = write_hook_package(temp, "hook-log-unopenable",
+        "function install()\n"
+        "    print(\"MARK-kept\")\n"
+        "    local ok = os.execute(\"echo MARK-lost-child\")\n"
+        "    assert(ok == true, \"the command must still run\")\n"
+        "    return true\n"
+        "end\n");
+    // A path below a regular file can be neither created nor opened.
+    const fs::path blocker = temp / "blocker";
+    write_text(blocker, "not a directory");
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    auto ctx = make_context(temp / "install", "linux");
+    ctx.hook_log = blocker / "hooks" / "x.log";
+
+    HookResult result;
+    const auto escaped = run_captured([&] {
+        result = exec->run_hook(HookType::Install, ctx);
+    });
+
+    EXPECT_TRUE(result.success) << result.error << "\n" << result.output;
+    EXPECT_EQ(escaped.out.find("MARK-lost-child"), std::string::npos)
+        << "with no log the child's output goes to the null device, not the terminal:\n"
+        << escaped.out;
+    EXPECT_NE(result.output.find("MARK-kept"), std::string::npos) << result.output;
+    EXPECT_NE(result.output.find("hook output log unavailable"), std::string::npos)
+        << result.output;
+    const auto first = result.output.find("hook output log unavailable");
+    EXPECT_EQ(result.output.find("hook output log unavailable", first + 1),
+              std::string::npos) << "the warning must be given once:\n" << result.output;
+    EXPECT_EQ(escaped.out.find("hook output log unavailable"), std::string::npos);
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, HookLog_CreatesItsDirectoryAndStartsEveryRunFresh) {
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-fresh-");
+    const fs::path pkg = write_hook_package(temp, "hook-log-fresh",
+        "function install()\n"
+        "    print(\"MARK-\" .. tostring(_RUNTIME.args[1]))\n"
+        "    return true\n"
+        "end\n");
+    const fs::path logPath = temp / "a" / "b" / "fresh.log";
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    auto ctx = make_context(temp / "install", "linux");
+    ctx.hook_log = logPath;
+
+    ctx.args = {"first"};
+    EXPECT_TRUE(exec->run_hook(HookType::Install, ctx).success);
+    ctx.args = {"second"};
+    EXPECT_TRUE(exec->run_hook(HookType::Install, ctx).success);
+
+    const std::string logged = slurp(logPath);
+    EXPECT_EQ(logged.find("MARK-first"), std::string::npos) << logged;
+    EXPECT_NE(logged.find("MARK-second"), std::string::npos) << logged;
+    EXPECT_EQ(logged.find("# install hook"), 0u) << logged;
+    EXPECT_EQ(logged.find("# install hook", 1), std::string::npos) << logged;
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, HookLog_OutputIsTheTailOfAFileThatKeepsEverything) {
+    constexpr std::size_t outputCap = 16 * 1024;
+    constexpr std::string_view truncatedMarker =
+        "\n[libxpkg: hook output truncated]\n";
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-tail-");
+    const fs::path pkg = write_hook_package(temp, "hook-log-tail",
+        "function install()\n"
+        "    io.write(\"HEAD-MARK\")\n"
+        "    io.write(string.rep(\"x\", 40000))\n"
+        "    os.execute(\"echo TAIL-MARK\")\n"
+        "    return true\n"
+        "end\n");
+    const fs::path logPath = temp / "tail.log";
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    auto ctx = make_context(temp / "install", "linux");
+    ctx.hook_log = logPath;
+    const auto result = exec->run_hook(HookType::Install, ctx);
+
+    EXPECT_TRUE(result.success) << result.error;
+    EXPECT_LE(result.output.size(), outputCap + truncatedMarker.size());
+    EXPECT_NE(result.output.find("TAIL-MARK"), std::string::npos);
+    EXPECT_EQ(result.output.find("HEAD-MARK"), std::string::npos);
+    EXPECT_EQ(result.output.find(truncatedMarker), 0u) << "the cut must be announced";
+    EXPECT_TRUE(is_valid_utf8(result.output));
+
+    const std::string logged = slurp(logPath);
+    EXPECT_GT(logged.size(), 40000u);
+    EXPECT_NE(logged.find("HEAD-MARK"), std::string::npos)
+        << "the file is the full record; only HookResult::output is a tail";
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, HookLog_ScriptsAreNotIntercepted) {
+    const fs::path temp = make_temp_dir("libxpkg-hook-log-script-main-");
+    const fs::path pkg = temp / "script-main.lua";
+    write_text(pkg,
+        "package = { name = \"script-main\", xpm = { linux = { [\"0.0.1\"] = {} } } }\n"
+        "function xpkg_main()\n"
+        "    os.execute(\"echo MARK-script-child\")\n"
+        "end\n");
+    const fs::path logPath = temp / "script-main.log";
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = "linux";
+    ctx.hook_log = logPath;
+
+    HookResult result;
+    const auto escaped = run_captured([&] { result = exec->run_script(ctx); });
+
+    EXPECT_TRUE(result.success) << result.error;
+    EXPECT_NE(escaped.out.find("MARK-script-child"), std::string::npos) << escaped.out;
+    EXPECT_FALSE(fs::exists(logPath)) << "run_script has no hook to log";
+
+    fs::remove_all(temp);
+}
+
+TEST(ExecutorTest, PkgInfo_BuildDepReadsTheVariableXlingsExports) {
+    const fs::path temp = make_temp_dir("libxpkg-build-dep-name-");
+    const fs::path sevenZip = temp / "payloads" / "7zip";
+    const fs::path myTool = temp / "payloads" / "my-tool";
+    fs::create_directories(sevenZip);
+    fs::create_directories(myTool);
+    // xlings exports the bare name: no namespace, no @version, upper-cased,
+    // everything that is not alphanumeric mapped to '_'.
+    ScopedEnvVar sevenZipVar("XLINGS_BUILDDEP_7ZIP_PATH", sevenZip.string());
+    ScopedEnvVar myToolVar("XLINGS_BUILDDEP_MY_TOOL_PATH", myTool.string());
+
+    const fs::path pkg = write_hook_package(temp, "build-dep-name",
+        "local pkginfo = import(\"xim.libxpkg.pkginfo\")\n"
+        "local function expect(spelling, dir)\n"
+        "    local dep = pkginfo.build_dep(spelling)\n"
+        "    assert(dep ~= nil, spelling .. \" resolved to nothing\")\n"
+        "    assert(dep.path == dir, spelling .. \" -> \" .. tostring(dep.path))\n"
+        "end\n"
+        "function install()\n"
+        "    expect(\"xim:7zip\", [[" + sevenZip.string() + "]])\n"
+        "    expect(\"7zip\", [[" + sevenZip.string() + "]])\n"
+        "    expect(\"xim:7zip@26.02\", [[" + sevenZip.string() + "]])\n"
+        "    expect(\"7zip@26.02\", [[" + sevenZip.string() + "]])\n"
+        "    expect(\"xim:my-tool@1.0\", [[" + myTool.string() + "]])\n"
+        "    expect(\"my-tool\", [[" + myTool.string() + "]])\n"
+        "    return true\n"
+        "end\n");
+
+    auto exec = create_executor(pkg);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    const auto result = exec->run_hook(HookType::Install,
+                                       make_context(temp / "install", "linux"));
+    EXPECT_TRUE(result.success) << result.error << "\n" << result.output;
+
+    fs::remove_all(temp);
+}

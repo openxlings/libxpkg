@@ -883,7 +883,12 @@ ExecStatus run_shell(const char* cmd, NativeFile out) {
     startup.hStdOutput = sink;
     startup.hStdError = sink;
     PROCESS_INFORMATION process{};
-    const BOOL started = ::CreateProcessA(comspec.c_str(), commandLine.data(),
+    // With COMSPEC unset, system() finds cmd.exe on the search path; a bare
+    // name as lpApplicationName would only be looked for in the current
+    // directory, so let CreateProcess parse the command line instead.
+    const bool fromEnv = env && *env;
+    const BOOL started = ::CreateProcessA(fromEnv ? comspec.c_str() : nullptr,
+                                          commandLine.data(),
                                           nullptr, nullptr, TRUE, 0, nullptr, nullptr,
                                           &startup, &process);
     if (started) {

@@ -919,9 +919,6 @@ function M.closure_lib_paths(opt)
         end
     end
 
-    local sysroot = _RUNTIME and _RUNTIME.subos_sysrootdir
-    if sysroot and sysroot ~= "" then _push(path.join(sysroot, "lib")) end
-
     return values
 end
 

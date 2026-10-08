@@ -1173,6 +1173,45 @@ TEST(ExecutorTest, HostLinkInterposer_ReportsAnUnservedVendorClosure) {
     fs::remove_all(temp_dir);
 }
 
+TEST(ExecutorTest, Elfpatch_ClosureRemainsPayloadDirectAcrossScopes) {
+    const fs::path tempDir = make_temp_dir("libxpkg-elfpatch-scope-");
+    const fs::path installDir = tempDir / "payload";
+    const fs::path pkgPath = tempDir / "consumer.lua";
+    fs::create_directories(installDir);
+    write_text(pkgPath, R"lua(
+        package = { spec = "1", name = "consumer",
+            xpm = { linux = { ["1.0.0"] = {} } } }
+        local elfpatch = import("xim.libxpkg.elfpatch")
+        function config()
+            local paths = elfpatch.closure_lib_paths()
+            assert(#paths == 3, "unexpected closure: " .. table.concat(paths, ":"))
+            assert(paths[1] == "/store/consumer/lib")
+            assert(paths[2] == "/store/declared/lib")
+            assert(paths[3] == "/store/resolved/lib")
+            local explicit = elfpatch.closure_lib_paths({ deps_list = {} })
+            assert(#explicit == 1 and explicit[1] == paths[1],
+                "empty dependency override included scope libraries")
+            return true
+        end
+    )lua");
+    for (const auto scope : {"/home/subos/first", "/home/subos/second"}) {
+        auto exec = create_executor(pkgPath);
+        ASSERT_TRUE(exec.has_value()) << (exec ? "" : exec.error());
+        auto ctx = make_context(installDir, "linux");
+        ctx.subos_sysrootdir = scope;
+        ctx.self_exports.libdirs = {"/store/consumer/lib"};
+        ctx.deps_list = {"declared@1", "resolved@1", "build@1"};
+        ctx.runtime_deps_list = {"declared@1", "resolved@1"};
+        ctx.build_deps_list = {"build@1"};
+        ctx.deps_exports["declared@1"].libdirs = {"/store/declared/lib"};
+        ctx.resolved_deps["resolved@1"].libdirs = {"/store/resolved/lib"};
+        ctx.resolved_deps["build@1"].libdirs = {"/store/build/lib"};
+        const auto result = exec->run_hook(HookType::Config, ctx);
+        EXPECT_TRUE(result.success) << result.error << "\n" << result.output;
+    }
+    fs::remove_all(tempDir);
+}
+
 TEST(ExecutorTest, PkgInfo_UsesExplicitDependencyStoreRoots) {
     const fs::path tempDir = make_temp_dir("libxpkg-pkginfo-roots-");
     const fs::path registryRoot = tempDir / "registry" / "data" / "xpkgs";

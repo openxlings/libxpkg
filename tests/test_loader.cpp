@@ -2,6 +2,7 @@
 #include <filesystem>
 #include <string_view>
 
+import std;
 import mcpplibs.xpkg;
 import mcpplibs.xpkg.loader;
 import mcpplibs.xpkg.compat;
@@ -644,4 +645,118 @@ TEST(CompatTest, MissingPerArchChecksumFailsClosed) {
     });
     ASSERT_FALSE(resolved.has_value());
     EXPECT_NE(resolved.error().find("no checksum for arch"), std::string::npos);
+}
+
+namespace {
+
+fs::path boundary_test_dir(std::string_view name) {
+    auto dir = fs::temp_directory_path() / std::format("libxpkg-loader-{}-{}", name,
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    fs::create_directories(dir);
+    return dir;
+}
+
+void write_boundary_fixture(const fs::path& path, std::string_view text) {
+    fs::create_directories(path.parent_path());
+    std::ofstream out(path);
+    ASSERT_TRUE(out);
+    out << text;
+}
+
+}  // namespace
+
+TEST(LoaderBoundaryTest, MetadataDoesNotExecuteRecipeTopLevelOnTheCaller) {
+    auto dir = boundary_test_dir("metadata");
+    const auto marker = dir / "host-ran";
+    const auto recipe = dir / "metadata.lua";
+    write_boundary_fixture(recipe, "assert(io.open([[" + marker.string() + "]], 'w')):close()\n"
+        "package = {name = 'local-name'}\n");
+    int calls = 0;
+    auto loaded = load_package(recipe, {"linux", "arm64"}, [&](const MetadataInvocation& request)
+        -> std::expected<Package, std::string> {
+        ++calls;
+        EXPECT_EQ(request.package, recipe);
+        EXPECT_EQ(request.context.platform, "linux");
+        EXPECT_EQ(request.context.arch, "arm64");
+        Package result;
+        result.name = "remote-name";
+        result.description = "worker metadata";
+        return result;
+    });
+    ASSERT_TRUE(loaded) << loaded.error();
+    EXPECT_EQ(loaded->name, "remote-name");
+    EXPECT_EQ(loaded->description, "worker metadata");
+    EXPECT_EQ(calls, 1);
+    EXPECT_FALSE(fs::exists(marker));
+    auto legacy = load_package(recipe);
+    ASSERT_TRUE(legacy) << legacy.error();
+    EXPECT_EQ(legacy->name, "local-name");
+    EXPECT_TRUE(fs::is_regular_file(marker));
+    fs::remove_all(dir);
+}
+
+TEST(LoaderBoundaryTest, FailureDoesNotFallbackToEvaluatingTheRecipe) {
+    auto dir = boundary_test_dir("refusal");
+    const auto marker = dir / "host-ran";
+    const auto recipe = dir / "metadata.lua";
+    write_boundary_fixture(recipe, "assert(io.open([[" + marker.string() + "]], 'w')):close()\n"
+        "package = {name = 'unsafe'}\n");
+    EXPECT_FALSE(load_package(recipe, {}, MetadataBoundary{}));
+    auto failed = load_package(recipe, {}, [](const MetadataInvocation&)
+        -> std::expected<Package, std::string> { return std::unexpected("isolation unavailable"); });
+    EXPECT_FALSE(failed);
+    EXPECT_NE(failed.error().find("isolation unavailable"), std::string::npos);
+    EXPECT_FALSE(fs::exists(marker));
+    fs::remove_all(dir);
+}
+
+TEST(LoaderBoundaryTest, IndexBuildAndEveryRecipeCrossTheirOwnBoundaries) {
+    auto dir = boundary_test_dir("index");
+    const auto marker = dir / "host-ran";
+    write_boundary_fixture(dir / "pkgindex-build.lua",
+        "assert(io.open([[" + marker.string() + "]], 'w')):close()\nfunction install() return true end\n");
+    write_boundary_fixture(dir / "pkgs" / "a" / "a.lua",
+        "assert(io.open([[" + marker.string() + "]], 'w')):close()\npackage = {name = 'unsafe'}\n");
+    int builds = 0, metadata = 0;
+    std::string output;
+    LoaderBoundaries boundaries{
+        .metadata = [&](const MetadataInvocation& request) -> std::expected<Package, std::string> {
+            ++metadata;
+            EXPECT_EQ(request.context.platform, "linux");
+            Package p;
+            p.name = "safe";
+            return p;
+        },
+        .index_build = [&](const fs::path& repository, const BuildOutput& sink)
+            -> std::expected<void, std::string> {
+            ++builds;
+            EXPECT_EQ(repository, dir);
+            if (sink) sink("worker build progress");
+            return {};
+        },
+    };
+    auto index = build_index(dir, "sandbox", {"linux", "x86_64"}, boundaries,
+        [&](std::string_view text) { output += text; });
+    ASSERT_TRUE(index) << index.error();
+    EXPECT_EQ(builds, 1);
+    EXPECT_EQ(metadata, 1);
+    EXPECT_EQ(output, "worker build progress");
+    EXPECT_TRUE(index->entries.contains("sandbox:safe"));
+    EXPECT_FALSE(fs::exists(marker));
+    boundaries.index_build = {};
+    EXPECT_FALSE(build_index(dir, "sandbox", {}, boundaries));
+    EXPECT_EQ(metadata, 1) << "metadata cannot run after a refused build script";
+    EXPECT_FALSE(fs::exists(marker));
+    boundaries.index_build = [](const fs::path&, const BuildOutput&) -> std::expected<void, std::string> {
+        return std::unexpected("worker refused the build");
+    };
+    EXPECT_FALSE(build_index(dir, "sandbox", {}, boundaries));
+    EXPECT_FALSE(fs::exists(marker));
+    fs::remove(dir / "pkgindex-build.lua");
+    boundaries.metadata = [](const MetadataInvocation&) -> std::expected<Package, std::string> {
+        return std::unexpected("worker refused metadata");
+    };
+    EXPECT_FALSE(build_index(dir, "sandbox", {}, boundaries)) << "refusal must not become a healthy empty index";
+    EXPECT_FALSE(fs::exists(marker));
+    fs::remove_all(dir);
 }

@@ -210,3 +210,49 @@ libxpkg/
 - [完整设计方案](.agents/plans/2026-03-01-libxpkg-design.md)
 - [mcpp-style-ref | 现代C++编码/项目风格参考](https://github.com/mcpp-community/mcpp-style-ref)
 - [xim-pkgindex | 包索引仓库](https://github.com/d2learn/xim-pkgindex)
+
+## 外置 Hook 执行边界
+
+需要限制 recipe 权限的消费者可以使用 `create_executor(path, ExecutionBoundary)`。
+这个重载先发出 `load` 请求，不在调用进程创建 Lua state、加载标准库或执行
+recipe 顶层代码。边界为空、初始化失败、传输失败时返回错误，不会回退到本地执行。
+不传边界的原有 factory 和 `ExecutionContext` 保持原来的行为。
+
+`HookInvocation` 和 `HookResponse` 是不依赖 JSON 库的协议数据。消费者负责
+序列化、传输、进程隔离和返回效果的校验；`kHookBoundaryProtocol` 是协议版本。
+请求的动作是 `load`、`run_hook`、`run_script`、`elfpatch` 和 `set_log_level`。
+`load` 返回五个 hook 的存在标记，后续请求返回 `HookResult` 以及累计的
+`XvmOp`、`InstallRequest` 快照。快照与原有 accessor 的语义相同，不能把每次
+响应当作仅包含新增效果的列表再次全部应用。
+
+消费者在受限进程内创建一个 `HookWorker`，经 `dispatch()` 处理请求。一个
+worker 只加载一个 package，并在 install、config 等调用之间保持同一个
+`PackageExecutor`。这样 recipe 的 Lua 全局状态不会丢失，每次 hook 的上下文
+仍会更新；hook log、`system.exec(..., { tty = true })` 和旧 recipe 保持原来的
+运行语义。`apply_install_stamp_if_empty()` 是消费者的派生数据记账，不执行
+recipe Lua，仍由消费者在所有安装路径完成后调用。
+
+这套接口本身不提供沙箱。worker 必须由消费者在权限已经限制的进程里启动，
+且限制必须覆盖加载 recipe、整个 Lua hook、`io.open`、`io.popen`、原生
+`os.execute` 和它们的后代，不能仅拦截 `system.exec`。控制协议应使用单独的
+socket 或文件描述符：顶层 recipe 和 script 可以输出到 stdout，把 stdout
+同时当作 NDJSON 协议会让 recipe 输出混入控制响应。
+
+metadata loader 和 `build_index()` 是另一条执行路径。当前 loader 会执行
+recipe 顶层 Lua，index builder 会执行 `pkgindex-build.lua`；其中的
+`register_loader_sandbox` 是兼容 stub，不是 OS 权限边界。只接入外置 hook
+factory 并不代表 metadata、index builder 或所有 recipe Lua 都已隔离。
+
+消费者还可以通过 `load_package(path, LoaderContext, MetadataBoundary)` 接入
+受限 metadata worker。这个重载只转交 `MetadataInvocation` 并接收 `Package`，
+不会先在宿主执行一次 Lua；边界为空、失败或抛异常均返回错误。worker 内使用
+原有 loader，因此仍只有一套 recipe 解析器。
+
+重建 index 时使用带 `LoaderBoundaries` 的 `build_index()` 重载。metadata 和
+`pkgindex-build.lua` 分别跨越 `metadata`、`index_build` 边界；存在 build script
+却没有它的边界时直接拒绝，不在宿主运行 build script 或其 git checkout。
+与旧 builder 跳过损坏 recipe 的行为不同，外置边界失败会使整次重建失败，
+不能把权限拒绝视为成功生成一个空 index。消费者需要让 metadata worker
+只读 recipe/index，把 builder 的写权限限于 index 的派生输出，同时校验返回
+metadata 与效果。旧签名保持旧行为；只有实际接入这些 overload，才覆盖了
+metadata 与 index build 两条路径。

@@ -197,6 +197,33 @@ struct InstallRequest {
 
 enum class HookType { Installed, Build, Install, Config, Uninstall };
 
+inline constexpr int kHookBoundaryProtocol = 1;
+enum class HookAction { Load, RunHook, RunScript, Elfpatch, SetLogLevel };
+std::string_view hook_action_name(HookAction action);
+std::optional<HookAction> hook_action_from_string(std::string_view name);
+
+// Plain data for an external worker protocol. The consumer supplies transport,
+// process isolation and validation of returned effects; this library supplies
+// neither a sandbox nor an alternate Lua executor.
+struct HookInvocation {
+    HookAction action { HookAction::Load };
+    fs::path package;
+    HookType hook { HookType::Installed };
+    ExecutionContext context;
+    std::string log_level;
+};
+
+struct HookResponse {
+    HookResult result;
+    std::array<bool, 5> hooks{};  // indexed by HookType, only Load publishes them
+    // Cumulative snapshots, exactly as the local executor's accessors return.
+    std::vector<XvmOp> xvm_ops;
+    std::vector<InstallRequest> install_requests;
+};
+
+using ExecutionBoundary = std::function<std::expected<HookResponse, std::string>(const HookInvocation&)>;
+
+
 } // export namespace mcpplibs::xpkg
 
 // Implementation detail (not exported)
@@ -1402,6 +1429,12 @@ export namespace mcpplibs::xpkg {
 class PackageExecutor {
     lua::State* L_   = nullptr;
     fs::path    pkg_ ;
+    ExecutionBoundary boundary_;
+    HookResponse boundaryResponse_;
+    ExecutionContext boundaryContext_;
+    std::string boundaryError_;
+    HookResult execute_external_(HookAction action, const ExecutionContext& ctx,
+                                 HookType hook = HookType::Installed, std::string_view logLevel = {});
     std::unique_ptr<detail::HookOutput> hookOutput_ =
         std::make_unique<detail::HookOutput>();
     std::unique_ptr<detail::HookLog> hookLog_ =
@@ -1410,6 +1443,8 @@ class PackageExecutor {
 public:
     explicit PackageExecutor(lua::State* L, fs::path pkg)
         : L_(L), pkg_(std::move(pkg)) {}
+
+    PackageExecutor(fs::path pkg, ExecutionBoundary boundary, HookResponse loaded);
 
     ~PackageExecutor() {
         if (L_) { lua::close(L_); L_ = nullptr; }
@@ -1421,6 +1456,10 @@ public:
     PackageExecutor(PackageExecutor&& o) noexcept
         : L_(std::exchange(o.L_, nullptr)),
           pkg_(std::move(o.pkg_)),
+          boundary_(std::move(o.boundary_)),
+          boundaryResponse_(std::move(o.boundaryResponse_)),
+          boundaryContext_(std::move(o.boundaryContext_)),
+          boundaryError_(std::move(o.boundaryError_)),
           hookOutput_(std::move(o.hookOutput_)),
           hookLog_(std::move(o.hookLog_)) {}
 
@@ -1429,6 +1468,10 @@ public:
             if (L_) lua::close(L_);
             L_   = std::exchange(o.L_, nullptr);
             pkg_ = std::move(o.pkg_);
+            boundary_ = std::move(o.boundary_);
+            boundaryResponse_ = std::move(o.boundaryResponse_);
+            boundaryContext_ = std::move(o.boundaryContext_);
+            boundaryError_ = std::move(o.boundaryError_);
             hookOutput_ = std::move(o.hookOutput_);
             hookLog_ = std::move(o.hookLog_);
         }
@@ -1436,6 +1479,7 @@ public:
     }
 
     bool has_hook(HookType hook) const {
+        if (boundary_) return boundaryResponse_.hooks.at(static_cast<std::size_t>(hook));
         auto name = detail::hook_name(hook);
         lua::getglobal(L_, std::string(name).c_str());
         bool found = (lua::type(L_, -1) == lua::TFUNCTION);
@@ -1444,6 +1488,7 @@ public:
     }
 
     HookResult run_hook(HookType hook, const ExecutionContext& ctx) {
+        if (boundary_) return execute_external_(HookAction::RunHook, ctx, hook);
         // Inject context before each hook call
         detail::inject_context(L_, ctx);
 
@@ -1552,6 +1597,7 @@ public:
     // Run elfpatch.apply_auto() if the install hook set elfpatch_auto flag.
     // Returns {scanned, patched, failed} counts. Safe to call unconditionally.
     HookResult apply_elfpatch_auto() {
+        if (boundary_) return execute_external_(HookAction::Elfpatch, boundaryContext_);
         constexpr const char* script = R"__LUA__(
             local ep = _LIBXPKG_MODULES and _LIBXPKG_MODULES["elfpatch"]
             if not ep then return "no-ep 0 0 0" end
@@ -1579,6 +1625,7 @@ public:
     }
 
     std::vector<XvmOp> xvm_operations() {
+        if (boundary_) return boundaryResponse_.xvm_ops;
         std::vector<XvmOp> ops;
         lua::getglobal(L_, "_XVM_OPS");
         if (lua::type(L_, -1) != lua::TTABLE) {
@@ -1654,6 +1701,7 @@ public:
 
     // Run the script's xpkg_main() function with arguments.
     HookResult run_script(const ExecutionContext& ctx) {
+        if (boundary_) return execute_external_(HookAction::RunScript, ctx);
         detail::inject_context(L_, ctx);
 
         lua::newtable(L_);
@@ -1686,6 +1734,11 @@ public:
 
     // Set log level for Lua scripts: "debug", "info", "warn", "error", "silent"
     void set_log_level(std::string_view level) {
+        if (boundary_) {
+            auto result = execute_external_(HookAction::SetLogLevel, boundaryContext_, HookType::Installed, level);
+            if (!result.success) boundaryError_ = result.error;
+            return;
+        }
         std::string script = std::string("local log = _LIBXPKG_MODULES and _LIBXPKG_MODULES['log']; ")
             + "if log and log.set_level then log.set_level('" + std::string(level) + "') end";
         if (lua::L_loadstring(L_, script.c_str()) == lua::OK) {
@@ -1696,6 +1749,7 @@ public:
     }
 
     std::vector<InstallRequest> install_requests() {
+        if (boundary_) return boundaryResponse_.install_requests;
         std::vector<InstallRequest> reqs;
         lua::getglobal(L_, "_INSTALL_REQUESTS");
         if (lua::type(L_, -1) != lua::TTABLE) {
@@ -1759,5 +1813,21 @@ create_executor(const fs::path& pkg_path) {
 
     return PackageExecutor(L, pkg_path);
 }
+
+
+// The external boundary runs even the package's top-level Lua in the worker.
+// An empty or failing boundary is an error; it never falls back to local Lua.
+std::expected<PackageExecutor, std::string>
+create_executor(const fs::path& pkg_path, ExecutionBoundary boundary);
+
+// Use only INSIDE the consumer's isolated worker. One instance is kept for
+// one package, so recipe globals and cumulative effects survive hook calls.
+class HookWorker {
+    std::optional<PackageExecutor> executor_;
+    fs::path package_;
+
+public:
+    std::expected<HookResponse, std::string> dispatch(const HookInvocation& invocation);
+};
 
 } // export namespace mcpplibs::xpkg

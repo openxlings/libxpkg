@@ -21,9 +21,33 @@ export namespace mcpplibs::xpkg {
 // and how to show it. Without one, nothing changes.
 using BuildOutput = std::function<void(std::string_view)>;
 
+struct LoaderContext {
+    std::string platform;
+    std::string arch;
+};
+
+struct MetadataInvocation {
+    fs::path package;
+    LoaderContext context;
+};
+using MetadataBoundary = std::function<std::expected<Package, std::string>(const MetadataInvocation&)>;
+using IndexBuildBoundary = std::function<std::expected<void, std::string>(const fs::path&, const BuildOutput&)>;
+
+struct LoaderBoundaries {
+    MetadataBoundary metadata;
+    IndexBuildBoundary index_build;
+};
+
+
 } // export namespace mcpplibs::xpkg
 
 namespace mcpplibs::xpkg::loader_detail {
+
+std::expected<PackageIndex, std::string>
+build_index_impl(const fs::path& repo_dir, const std::string& defaultNamespace,
+                 const BuildOutput& buildOutput, const LoaderContext& context,
+                 const LoaderBoundaries* boundaries);
+
 
 // Register loader sandbox: no-op import() + defensive stubs for non-standard
 // globals. This gives the loader a self-contained pure Lua 5.4 environment
@@ -725,10 +749,6 @@ bool run_pkgindex_build(const fs::path& repo_dir, const BuildOutput& output) {
 
 export namespace mcpplibs::xpkg {
 
-struct LoaderContext {
-    std::string platform;
-    std::string arch;
-};
 
 std::expected<Package, std::string>
 load_package(const fs::path& pkg_path, const LoaderContext& context) {
@@ -787,76 +807,23 @@ load_package(const fs::path& pkg_path) {
     return load_package(pkg_path, {});
 }
 
+// External metadata execution never evaluates the recipe in the calling process.
+// An empty/failing boundary is refused, never a request to use the local loader.
+std::expected<Package, std::string>
+load_package(const fs::path& pkg_path, const LoaderContext& context, MetadataBoundary boundary);
+
 std::expected<PackageIndex, std::string>
 build_index(const fs::path& repo_dir, const std::string& defaultNamespace,
             const BuildOutput& buildOutput) {
-    PackageIndex index;
-    auto pkgs_dir = repo_dir / "pkgs";
-    if (!fs::is_directory(pkgs_dir))
-        return std::unexpected("pkgs/ directory not found in: " + repo_dir.string());
-
-    // Run pkgindex-build.lua if present (generates complete package files)
-    loader_detail::run_pkgindex_build(repo_dir, buildOutput);
-
-    std::vector<fs::path> packagePaths;
-    for (auto& letter_dir : fs::directory_iterator(pkgs_dir)) {
-        if (!letter_dir.is_directory()) continue;
-        for (auto& entry : fs::directory_iterator(letter_dir)) {
-            if (entry.path().extension() != ".lua") continue;
-            packagePaths.push_back(entry.path().lexically_normal());
-        }
-    }
-    std::ranges::sort(packagePaths);
-
-    for (auto& packagePath : packagePaths) {
-        auto result = load_package(packagePath);
-        if (!result) continue;  // skip malformed packages
-        auto& pkg = *result;
-
-        PackageIdentity identity {
-            .namespaceName = pkg.namespace_.empty()
-                ? defaultNamespace
-                : pkg.namespace_,
-            .name = pkg.name,
-        };
-        auto canonicalName = identity.canonical_name();
-
-        IndexEntry indexEntry;
-        indexEntry.identity = std::move(identity);
-        indexEntry.canonicalName = canonicalName;
-        indexEntry.entryKey = canonicalName;
-        indexEntry.name = pkg.name;
-        indexEntry.path = packagePath;
-        indexEntry.type = pkg.type;
-        indexEntry.description = pkg.description;
-
-        auto existing = index.entries.find(indexEntry.entryKey);
-        if (existing != index.entries.end()) {
-            return std::unexpected(std::format(
-                "duplicate package identity '{}': '{}' conflicts with '{}'",
-                canonicalName,
-                existing->second.path.string(),
-                packagePath.string()));
-        }
-
-        index.entries.emplace(indexEntry.entryKey, std::move(indexEntry));
-        index.identityEntries[canonicalName].push_back(canonicalName);
-        index.shortNames[pkg.name].push_back(canonicalName);
-    }
-
-    for (auto& [_, candidates] : index.identityEntries) {
-        std::ranges::sort(candidates);
-        auto uniqueEnd = std::ranges::unique(candidates).begin();
-        candidates.erase(uniqueEnd, candidates.end());
-    }
-    for (auto& [_, candidates] : index.shortNames) {
-        std::ranges::sort(candidates);
-        auto uniqueEnd = std::ranges::unique(candidates).begin();
-        candidates.erase(uniqueEnd, candidates.end());
-    }
-
-    return index;
+    return loader_detail::build_index_impl(repo_dir, defaultNamespace, buildOutput, {}, nullptr);
 }
+
+// Both executable paths (metadata and pkgindex-build.lua) cross the supplied
+// boundaries. Unlike the legacy builder, a boundary failure fails the build.
+std::expected<PackageIndex, std::string>
+build_index(const fs::path& repo_dir, const std::string& defaultNamespace,
+            const LoaderContext& context, const LoaderBoundaries& boundaries,
+            const BuildOutput& buildOutput = {});
 
 std::expected<PackageIndex, std::string>
 build_index(const fs::path& repo_dir, const std::string& defaultNamespace = "") {

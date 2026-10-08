@@ -3678,3 +3678,165 @@ TEST(ExecutorTest, PkgInfo_BuildDepReadsTheVariableXlingsExports) {
 
     fs::remove_all(temp);
 }
+
+TEST(ExecutionBoundaryTest, FactoryDoesNotExecuteAnyRecipeLuaOnTheHost) {
+    const auto temp = make_temp_dir("libxpkg-boundary-deferred-");
+    const auto marker = temp / "top-level-ran";
+    const auto recipe = temp / "deferred.lua";
+    write_text(recipe, "local f = assert(io.open([[" + marker.string() + "]], 'w'))\n"
+                       "f:write('top level'); f:close()\n"
+                       "function install() error('must never run on host') end\n");
+    int calls = 0;
+    auto exec = create_executor(recipe, [&](const HookInvocation& request)
+        -> std::expected<HookResponse, std::string> {
+        ++calls;
+        EXPECT_EQ(request.package, recipe);
+        HookResponse response;
+        response.result.success = true;
+        response.hooks[static_cast<std::size_t>(HookType::Install)] = true;
+        return response;
+    });
+    ASSERT_TRUE(exec) << exec.error();
+    EXPECT_EQ(calls, 1);
+    EXPECT_TRUE(exec->has_hook(HookType::Install));
+    EXPECT_FALSE(exec->has_hook(HookType::Config));
+    EXPECT_FALSE(fs::exists(marker));
+    EXPECT_TRUE(exec->run_hook(HookType::Install, {}).success);
+    EXPECT_EQ(calls, 2);
+    EXPECT_FALSE(fs::exists(marker));
+    fs::remove_all(temp);
+}
+
+TEST(ExecutionBoundaryTest, TheLegacyFactoryStillLoadsAndRunsLocally) {
+    const auto temp = make_temp_dir("libxpkg-boundary-legacy-");
+    const auto marker = temp / "top-level-ran";
+    const auto recipe = temp / "local.lua";
+    write_text(recipe, "local f = assert(io.open([[" + marker.string() + "]], 'w'))\n"
+                       "f:write('top level'); f:close()\n"
+                       "function install() return true end\n");
+    auto exec = create_executor(recipe);
+    ASSERT_TRUE(exec) << exec.error();
+    EXPECT_TRUE(fs::is_regular_file(marker));
+    EXPECT_TRUE(exec->run_hook(HookType::Install, {}).success);
+    fs::remove_all(temp);
+}
+
+TEST(ExecutionBoundaryTest, OneWorkerRetainsRecipeStateAndCumulativeEffectsAcrossHooks) {
+    const auto temp = make_temp_dir("libxpkg-boundary-effects-");
+    const auto recipe = temp / "effects.lua";
+    write_text(recipe, R"LUA(
+        import('xim.libxpkg.xvm')
+        import('xim.libxpkg.pkgmanager')
+        local installed = false
+        function install()
+            installed = true
+            xvm.add('first', {version = '1.0.0', args = {'with space', '--flag'},
+                             envs = {MODE = 'one'}, binding = 'suite@1'})
+            pkgmanager.install('xim:first@1.0.0')
+            return true
+        end
+        function config()
+            assert(installed, 'recipe state was lost between hooks')
+            xvm.add('second', {type = 'files', src = 'share/data', dst = 'usr/share/data'})
+            pkgmanager.remove('xim:old')
+            return true
+        end
+    )LUA");
+    // This local callback checks the worker protocol, not OS isolation.
+    HookWorker worker;
+    auto exec = create_executor(recipe, [&](const HookInvocation& request) { return worker.dispatch(request); });
+    ASSERT_TRUE(exec) << exec.error();
+    EXPECT_TRUE(exec->has_hook(HookType::Config));
+    auto install = make_context(temp / "payload", "linux");
+    ASSERT_TRUE(exec->run_hook(HookType::Install, install).success);
+    ASSERT_EQ(exec->xvm_operations().size(), 1u);
+    ASSERT_EQ(exec->install_requests().size(), 1u);
+    auto config = install;
+    config.install_dir = temp / "new-payload";
+    ASSERT_TRUE(exec->run_hook(HookType::Config, config).success);
+    auto ops = exec->xvm_operations();
+    ASSERT_EQ(ops.size(), 2u);
+    EXPECT_EQ(ops[0].name, "first");
+    EXPECT_EQ(ops[0].args, (std::vector<std::string>{"with space", "--flag"}));
+    ASSERT_EQ(ops[0].envs.size(), 1u);
+    EXPECT_EQ(ops[0].envs[0], (std::pair<std::string, std::string>{"MODE", "one"}));
+    EXPECT_EQ(ops[0].binding, "suite@1");
+    EXPECT_EQ(ops[1].name, "second");
+    EXPECT_EQ(ops[1].bindir, config.install_dir.string());
+    EXPECT_EQ(ops[1].src, "share/data");
+    EXPECT_EQ(ops[1].dst, "usr/share/data");
+    auto requests = exec->install_requests();
+    ASSERT_EQ(requests.size(), 2u);
+    EXPECT_EQ(requests[0].op, "install");
+    EXPECT_EQ(requests[0].target, "xim:first@1.0.0");
+    EXPECT_EQ(requests[1].op, "remove");
+    EXPECT_EQ(requests[1].target, "xim:old");
+    EXPECT_FALSE(exec->has_hook(HookType::Uninstall));
+    fs::remove_all(temp);
+}
+
+TEST(ExecutionBoundaryTest, FailuresNeverFallBackToExecutingTheRecipeLocally) {
+    const auto temp = make_temp_dir("libxpkg-boundary-failure-");
+    const auto marker = temp / "must-not-run";
+    const auto recipe = temp / "unsafe.lua";
+    write_text(recipe, "assert(io.open([[" + marker.string() + "]], 'w')):close()\n"
+                       "function install() return true end\n");
+    EXPECT_FALSE(create_executor(recipe, ExecutionBoundary{}));
+    auto load_failure = create_executor(recipe, [](const HookInvocation&)
+        -> std::expected<HookResponse, std::string> { return std::unexpected("worker unavailable"); });
+    EXPECT_FALSE(load_failure);
+    auto exec = create_executor(recipe, [](const HookInvocation& request)
+        -> std::expected<HookResponse, std::string> {
+        if (request.action != HookAction::Load) return std::unexpected("worker died");
+        HookResponse response;
+        response.result.success = true;
+        response.hooks[static_cast<std::size_t>(HookType::Install)] = true;
+        return response;
+    });
+    ASSERT_TRUE(exec) << exec.error();
+    const auto result = exec->run_hook(HookType::Install, {});
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(result.error.find("worker died"), std::string::npos);
+    EXPECT_FALSE(fs::exists(marker));
+    exec->set_log_level("info");
+    EXPECT_FALSE(exec->run_hook(HookType::Install, {}).success);
+    EXPECT_FALSE(fs::exists(marker));
+    fs::remove_all(temp);
+}
+
+TEST(ExecutionBoundaryTest, WorkerRefusesMissingLoadPackageChangesAndUnknownActions) {
+    HookWorker worker;
+    EXPECT_FALSE(worker.dispatch({.action = HookAction::RunHook, .package = HELLO_PKG}));
+    auto loaded = worker.dispatch({.action = HookAction::Load, .package = HELLO_PKG});
+    ASSERT_TRUE(loaded) << loaded.error();
+    EXPECT_FALSE(worker.dispatch({.action = HookAction::Load, .package = HELLO_PKG}));
+    EXPECT_FALSE(worker.dispatch({.action = HookAction::RunHook, .package = "another.lua"}));
+    EXPECT_FALSE(worker.dispatch({.action = static_cast<HookAction>(99), .package = HELLO_PKG}));
+    EXPECT_FALSE(worker.dispatch({.action = HookAction::RunHook, .package = HELLO_PKG,
+                                 .hook = static_cast<HookType>(99)}));
+    EXPECT_FALSE(worker.dispatch({.action = HookAction::SetLogLevel, .package = HELLO_PKG,
+                                 .log_level = "info'); os.execute('unsafe') --"}));
+    EXPECT_FALSE(hook_action_from_string("unknown"));
+    EXPECT_EQ(hook_action_from_string("run_hook"), HookAction::RunHook);
+}
+
+TEST(ExecutionBoundaryTest, MovingADeferredExecutorRetainsTheWorkerAndHookLogContext) {
+    const auto temp = make_temp_dir("libxpkg-boundary-log-");
+    const auto recipe = temp / "logged.lua";
+    write_text(recipe, "function install() print('worker captured this'); return true end\n");
+    HookWorker worker;
+    auto exec = create_executor(recipe, [&](const HookInvocation& request) { return worker.dispatch(request); });
+    ASSERT_TRUE(exec) << exec.error();
+    auto moved = std::move(*exec);
+    moved.set_log_level("info");
+    auto ctx = make_context(temp, "linux");
+    ctx.hook_log = temp / "hooks" / "install.log";
+    const auto result = moved.run_hook(HookType::Install, ctx);
+    ASSERT_TRUE(result.success) << result.error;
+    EXPECT_NE(result.output.find("worker captured this"), std::string::npos);
+    std::ifstream in(ctx.hook_log);
+    const std::string log{std::istreambuf_iterator<char>(in), {}};
+    EXPECT_NE(log.find("worker captured this"), std::string::npos);
+    EXPECT_TRUE(moved.has_hook(HookType::Install));
+    fs::remove_all(temp);
+}

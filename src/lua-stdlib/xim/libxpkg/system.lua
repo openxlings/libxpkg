@@ -27,6 +27,25 @@ function M.exec(cmd, opt)
     end
 end
 
+-- A step only an administrator may take (chown root a sandbox helper, a
+-- setuid bit), DECLARED, never run here: the host decides who is asked, when
+-- and whether anyone can be (a recipe's own `sudo` waits on a terminal that
+-- an unattended install does not have). `argv` is the command as a list,
+-- `why` one line a person reads before saying yes. It reaches the host as a
+-- deferred request: op "admin", target = why, then each word, separated by
+-- the ASCII unit separator (0x1F).
+function M.admin_step(argv, why)
+    if type(argv) ~= "table" or #argv == 0 then error("system.admin_step: argv is a non-empty list") end
+    local words = { tostring(why or "") }
+    for _, w in ipairs(argv) do
+        w = tostring(w)
+        if w:find("\31", 1, true) then error("system.admin_step: a word holds the separator") end
+        table.insert(words, w)
+    end
+    if not _INSTALL_REQUESTS then _INSTALL_REQUESTS = {} end
+    table.insert(_INSTALL_REQUESTS, {op = "admin", target = table.concat(words, "\31")})
+end
+
 function M.rundir()           return _RUNTIME and _RUNTIME.run_dir or nil end
 function M.xpkgdir()          return _RUNTIME and _RUNTIME.xpkg_dir or nil end
 function M.bindir()           return _RUNTIME and _RUNTIME.bin_dir or nil end

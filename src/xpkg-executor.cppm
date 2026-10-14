@@ -191,8 +191,9 @@ struct XvmOp {
 };
 
 struct InstallRequest {
-    std::string op;      // "install" | "remove"
-    std::string target;  // e.g. "scode:linux-headers@5.11.1"
+    std::string op;      // "install" | "remove" | "admin" (system.admin_step)
+    std::string target;  // e.g. "scode:linux-headers@5.11.1"; for "admin": why, then
+                         // each word of the command, joined by '\x1f'
 };
 
 enum class HookType { Installed, Build, Install, Config, Uninstall };

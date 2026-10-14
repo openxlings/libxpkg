@@ -136,6 +136,22 @@ system.run_in_script(script, true)               -- admin（sudo）同理
 
 旧版本的 `system.exec` 忽略 `tty`，而它本来就是直通终端，所以 recipe 可以无条件采用。直通用的原始 `os.execute` 只以内部名 `_LIBXPKG_EXEC_INHERIT` 暴露，不是公开的 `os.*` 函数。
 
+**需要管理员权限的步骤：声明，不执行（0.0.63）。** recipe 不自己 `sudo`：无人值守的安装里没有终端可问，
+等待会一直挂住；有人在场时，问谁、何时问、记录在哪里，应由宿主统一决定。用 `system.admin_step(argv, why)`
+声明一步（`argv` 是命令的词列表，`why` 是一行给人看的理由），它作为延后请求交给宿主
+（`install_requests()` 里 `op == "admin"`，`target` 是 why 加上各个词，以 ASCII 单元分隔符 0x1F 连接）。
+宿主在安装结束后一次性询问并执行，没人可问时记为待办。旧版本没有这个函数，recipe 先判断再用：
+
+```lua
+if system.admin_step then
+    system.admin_step({"chown", "root:root", sandbox}, "Chromium's sandbox helper must be root's")
+else
+    log.warn("run as root: chown root:root %s && chmod 4755 %s", sandbox, sandbox)
+end
+```
+
+`system.run_in_script(script, true)` 仍直接经 `sudo` 执行，只为已有 recipe 保留；新 recipe 用 `admin_step`。
+
 #### `pkginfo.build_dep` 的名字规范化（0.0.60）
 
 xlings 导出 `XLINGS_BUILDDEP_<NAME>_PATH` 时先去掉 `@版本`，再去掉命名空间前缀，再把字母数字转大写、其余转 `_`。`build_dep` 现在按同一规则拼变量名，`build_dep("xim:7zip")`、`build_dep("7zip")`、`build_dep("xim:7zip@26.02")` 读的是同一个 `XLINGS_BUILDDEP_7ZIP_PATH`。之前带命名空间的写法查的是 `XLINGS_BUILDDEP_XIM_7ZIP_PATH`，永远查不到，退回 `dep_install_dir`（它不记录 build 依赖），最后返回 nil。查不到变量时仍退回 `dep_install_dir`。

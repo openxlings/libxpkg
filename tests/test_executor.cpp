@@ -3760,6 +3760,28 @@ TEST(ExecutionBoundaryTest, TheLegacyFactoryStillLoadsAndRunsLocally) {
     fs::remove_all(temp);
 }
 
+TEST(ExecutorTest, AnAdminStepIsDeclaredNotRun) {
+    const auto temp = make_temp_dir("libxpkg-admin-step-");
+    const auto recipe = temp / "admin.lua";
+    const auto marker = temp / "ran";
+    write_text(recipe, std::string(R"LUA(
+        import('xim.libxpkg.system')
+        function install()
+            system.admin_step({'touch', ')LUA") + marker.string() + R"LUA('}, 'a file only root may make')
+            return true
+        end
+    )LUA");
+    auto exec = create_executor(recipe);
+    ASSERT_TRUE(exec) << exec.error();
+    ASSERT_TRUE(exec->run_hook(HookType::Install, make_context(temp / "payload", "linux")).success);
+    EXPECT_FALSE(fs::exists(marker)) << "declared, never run by the recipe";
+    auto requests = exec->install_requests();
+    ASSERT_EQ(requests.size(), 1u);
+    EXPECT_EQ(requests[0].op, "admin");
+    EXPECT_EQ(requests[0].target, "a file only root may make\x1ftouch\x1f" + marker.string());
+    fs::remove_all(temp);
+}
+
 TEST(ExecutionBoundaryTest, OneWorkerRetainsRecipeStateAndCumulativeEffectsAcrossHooks) {
     const auto temp = make_temp_dir("libxpkg-boundary-effects-");
     const auto recipe = temp / "effects.lua";

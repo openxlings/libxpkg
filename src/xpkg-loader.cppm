@@ -500,6 +500,7 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                         res.sha256 = get_str(L, res_idx, "sha256");
                         res.ref    = get_str(L, res_idx, "ref");
                         res.revision = get_nonneg_int(L, res_idx, "revision");
+                        res.min_client = get_str(L, res_idx, "min_client");
 
                         // ---- V2 multi-arch shapes ----
                         // Scheme C / res: `sha256` is a per-arch TABLE rather

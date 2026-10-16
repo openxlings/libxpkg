@@ -785,3 +785,11 @@ TEST(LoaderTest, InheritingPlatformKeepsItsOwnVersionsAndFollowsChains) {
     // A cycle ends the chain; nothing is invented.
     EXPECT_FALSE(entries.contains("a") && !entries.at("a").empty());
 }
+
+TEST(LoaderTest, AVersionNamesTheOldestClientThatCanUseIt) {
+    auto result = load_package(PKGINDEX / "pkgs/v/v2inherits.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result->xpm.entries.at("linux").at("1.1.0").min_client, "2026.10.16.2");
+    EXPECT_EQ(result->xpm.entries.at("macosx").at("1.1.0").min_client, "2026.10.16.2");
+    EXPECT_TRUE(result->xpm.entries.at("linux").at("1.0.0").min_client.empty());
+}

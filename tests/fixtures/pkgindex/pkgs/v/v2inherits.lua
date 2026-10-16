@@ -6,6 +6,7 @@ package = {
             deps = { "xim:zlib" },
             ["latest"] = { ref = "1.0.0" },
             ["1.0.0"] = { url = "https://example.test/1.0.0.tar.gz", sha256 = "aa" },
+            ["1.1.0"] = { url = "https://example.test/1.1.0.tar.gz", sha256 = "cc", min_client = "2026.10.16.2" },
         },
         -- V1 platform reference
         macosx = { ref = "linux" },

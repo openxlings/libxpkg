@@ -760,3 +760,36 @@ TEST(LoaderBoundaryTest, IndexBuildAndEveryRecipeCrossTheirOwnBoundaries) {
     EXPECT_FALSE(fs::exists(marker));
     fs::remove_all(dir);
 }
+
+TEST(LoaderTest, PlatformReferenceIsInheritanceNotAVersion) {
+    auto result = load_package(PKGINDEX / "pkgs/v/v2inherits.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& entries = result->xpm.entries;
+    // `macosx = { ref = "linux" }` holds linux's versions, not one named "ref".
+    ASSERT_TRUE(entries.contains("macosx"));
+    EXPECT_FALSE(entries.at("macosx").contains("ref"));
+    EXPECT_EQ(entries.at("macosx").at("latest").ref, "1.0.0");
+    EXPECT_EQ(entries.at("macosx").at("1.0.0").url, "https://example.test/1.0.0.tar.gz");
+    EXPECT_EQ(result->xpm.deps.at("macosx"), std::vector<std::string>{"xim:zlib"});
+    EXPECT_EQ(result->xpm.inherits.at("macosx"), "linux");
+}
+
+TEST(LoaderTest, InheritingPlatformKeepsItsOwnVersionsAndFollowsChains) {
+    auto result = load_package(PKGINDEX / "pkgs/v/v2inherits.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& entries = result->xpm.entries;
+    EXPECT_EQ(entries.at("windows").at("2.0.0").url, "https://example.test/2.0.0.zip");
+    EXPECT_EQ(entries.at("windows").at("1.0.0").url, "https://example.test/1.0.0.tar.gz");
+    EXPECT_FALSE(entries.contains("linux") && entries.at("linux").contains("2.0.0"));
+    EXPECT_EQ(entries.at("ubuntu").at("1.0.0").sha256, "aa");
+    // A cycle ends the chain; nothing is invented.
+    EXPECT_FALSE(entries.contains("a") && !entries.at("a").empty());
+}
+
+TEST(LoaderTest, AVersionNamesTheOldestClientThatCanUseIt) {
+    auto result = load_package(PKGINDEX / "pkgs/v/v2inherits.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    EXPECT_EQ(result->xpm.entries.at("linux").at("1.1.0").min_client, "2026.10.16.2");
+    EXPECT_EQ(result->xpm.entries.at("macosx").at("1.1.0").min_client, "2026.10.16.2");
+    EXPECT_TRUE(result->xpm.entries.at("linux").at("1.0.0").min_client.empty());
+}

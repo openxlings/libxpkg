@@ -52,6 +52,10 @@ struct PlatformResource {
     // states none. A client records the revision it installed and treats a
     // different recipe revision as not installed (xpkg V2 spec, "revision").
     int revision = 0;
+    // The oldest client that can use this version (`min_client =
+    // "2026.10.16.1"`): a client resolving a package with no version named
+    // passes over the versions it cannot use. Empty when the entry states none.
+    std::string min_client;
 };
 
 // What this package exposes to consumers/xlings at install/runtime.

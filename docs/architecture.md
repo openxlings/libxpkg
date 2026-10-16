@@ -75,6 +75,8 @@ graph TD
 - `build_index(repo_dir)` — 扫描 `pkgs/` 目录构建 `PackageIndex`
 - `build_index(repo_dir, ns, BuildOutput)` — 同上；索引自带的 `pkgindex-build.lua` 用 `io.write` / `print` 写出的内容原样、按顺序交给 `BuildOutput`，不再写到进程的 stdout。构建脚本用 `\r[i/n] …\033[K` 画进度，只有调用方知道自己的输出去向（终端、文件还是管道），所以由它决定怎么显示（0.0.59）
 - `load_index_db(path)` / `save_index_db(index, path)` — JSON 格式索引持久化
+- 平台继承：平台段的 `inherits = "<平台>"` 与 V1 写法 `{ ref = "<平台>" }` 都表示继承。加载时沿继承链补齐：本平台缺少的版本取自被继承的平台，`deps`、`exports`、`source` 在本平台未声明时同样继承；遇到环或不存在的平台即停止。平台级的 `ref` 不再生成名为 `ref` 的版本（0.0.64）
+- 版本条目的 `min_client`：能使用该版本的最旧客户端版本，解析为 `PlatformResource::min_client`。未指定版本时，客户端据此跳过自己不能使用的版本（0.0.64）
 
 ### mcpplibs.xpkg.index — 索引层
 

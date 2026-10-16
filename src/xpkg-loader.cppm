@@ -237,6 +237,41 @@ PackageStatus parse_status(const std::string& s) {
     return PackageStatus::Dev;
 }
 
+// A platform that inherits another holds what it does not declare itself:
+// the versions it lacks, and its deps, exports and source when it has none.
+// The chain is followed (ubuntu -> debian -> linux); a cycle or an unknown
+// platform ends it. Done once, here, so every reader of `entries` sees the
+// platform the client looks up as complete.
+void resolve_inheritance(PlatformMatrix& xpm) {
+    for (auto& [platform, first] : xpm.inherits) {
+        std::unordered_set<std::string> seen{platform};
+        for (auto parent = first; !parent.empty() && seen.insert(parent).second;) {
+            // Copied before inserting: an insertion may rehash the map.
+            if (auto from = xpm.entries.find(parent); from != xpm.entries.end()) {
+                auto versions = from->second;
+                auto& own = xpm.entries[platform];
+                for (auto& [version, resource] : versions)
+                    own.try_emplace(version, std::move(resource));
+            }
+            auto inherit = [&](auto& field) {
+                if (auto from = field.find(parent);
+                        from != field.end() && !field.contains(platform)) {
+                    auto value = from->second;
+                    field.emplace(platform, std::move(value));
+                }
+            };
+            inherit(xpm.deps);
+            inherit(xpm.runtime_deps);
+            inherit(xpm.build_deps);
+            inherit(xpm.exports);
+            inherit(xpm.platform_sources);
+            inherit(xpm.platform_source_mirrors);
+            auto next = xpm.inherits.find(parent);
+            parent = next == xpm.inherits.end() ? std::string{} : next->second;
+        }
+    }
+}
+
 // Parse xpm platform matrix from the package table at idx
 PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
     PlatformMatrix xpm;
@@ -381,12 +416,22 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
             }
             lua::pop(L, 1);  // pop deps field
 
-            // Parse inherits if present
+            // Inheritance: `inherits = "linux"`, or the V1 spelling
+            // `macosx = { ref = "linux" }` (xpackage V1 spec, "platform
+            // reference"). A platform-level `ref` names a platform, never a
+            // version; before 0.0.64 it became a version named "ref" whose
+            // url was "linux" (luban-fonts on macOS and Windows, 2026-10-16).
             lua::getfield(L, plat_idx, "inherits");
             if (lua::type(L, -1) == lua::TSTRING) {
                 xpm.inherits[platform] = lua::tostring(L, -1);
             }
             lua::pop(L, 1);  // pop inherits field
+            if (!xpm.inherits.contains(platform)) {
+                lua::getfield(L, plat_idx, "ref");
+                if (lua::type(L, -1) == lua::TSTRING)
+                    xpm.inherits[platform] = lua::tostring(L, -1);
+                lua::pop(L, 1);  // pop ref field
+            }
 
             // Parse exports block. Schema (all sub-fields optional):
             //   exports = {
@@ -439,8 +484,8 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                 // (parsed above) that would otherwise leak in as a bogus
                 // version entry; `deps`/`inherits` likewise.
                 if (!version.empty() && version != "deps"
-                        && version != "inherits" && version != "exports"
-                        && version != "source") {
+                        && version != "inherits" && version != "ref"
+                        && version != "exports" && version != "source") {
                     PlatformResource res;
                     if (lua::type(L, -1) == lua::TTABLE) {
                         int res_idx = lua::gettop(L);
@@ -455,6 +500,7 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                         res.sha256 = get_str(L, res_idx, "sha256");
                         res.ref    = get_str(L, res_idx, "ref");
                         res.revision = get_nonneg_int(L, res_idx, "revision");
+                        res.min_client = get_str(L, res_idx, "min_client");
 
                         // ---- V2 multi-arch shapes ----
                         // Scheme C / res: `sha256` is a per-arch TABLE rather
@@ -518,6 +564,7 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
     }
 
     lua::pop(L, 1);  // pop xpm table
+    resolve_inheritance(xpm);
     return xpm;
 }
 

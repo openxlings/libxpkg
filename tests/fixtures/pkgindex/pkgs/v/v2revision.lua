@@ -17,6 +17,7 @@ package = {
                 url      = "https://ex/v2revision-1.1.0.tar.gz",
                 sha256   = "bbbb",
                 revision = 2,
+                floor    = 1,
             },
             ["1.2.0"] = {
                 x86_64  = { url = "https://ex/v2revision-1.2.0-x86_64.tar.gz",  sha256 = "cccc" },
@@ -32,6 +33,12 @@ package = {
                 url      = "https://ex/v2revision-1.4.0.tar.gz",
                 sha256   = "ffff",
                 revision = -1,
+            },
+            ["1.5.0"] = {
+                url      = "https://ex/v2revision-1.5.0.tar.gz",
+                sha256   = "abab",
+                revision = 1,
+                floor    = 4,
             },
         },
     },

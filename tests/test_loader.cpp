@@ -397,6 +397,25 @@ TEST(LoaderTest, V2_Revision_ParsedPerVersionEntry) {
     EXPECT_EQ(plat.at("latest").ref, "1.2.0");
 }
 
+// `floor`: the oldest installed revision still usable. Absent is 0 (every
+// installed revision stays usable); a floor above the revision reads as the
+// revision, so a malformed entry never declares every payload unusable.
+TEST(LoaderTest, V2_Floor_ParsedAndBoundedByRevision) {
+    auto result = load_package(PKGINDEX / "pkgs/v/v2revision.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+    auto& plat = result->xpm.entries.at("linux");
+    EXPECT_EQ(plat.at("1.0.0").floor, 0);
+    EXPECT_EQ(plat.at("1.1.0").floor, 1);
+    EXPECT_EQ(plat.at("1.2.0").floor, 0);
+    EXPECT_EQ(plat.at("1.5.0").floor, 1);   // 4 > revision 1
+
+    auto direct = resolve_resource(result->xpm, {
+        .name = "v2revision", .version = "1.1.0",
+        .platform = "linux", .arch = "x86_64", .ext = ""});
+    ASSERT_TRUE(direct.has_value()) << direct.error();
+    EXPECT_EQ(direct->floor, 1);
+}
+
 // The resolver reports the revision of the entry that supplies the payload,
 // so a client asking for an alias learns the revision it will install.
 TEST(LoaderTest, V2_Revision_ResolvedThroughRef) {

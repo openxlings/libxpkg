@@ -52,6 +52,14 @@ struct PlatformResource {
     // states none. A client records the revision it installed and treats a
     // different recipe revision as not installed (xpkg V2 spec, "revision").
     int revision = 0;
+    // The oldest packaging revision of this version that is still usable
+    // (`floor = N`, 0 <= N <= revision): a client keeps an installed payload
+    // whose recorded revision is at least the floor, and replaces one below
+    // it. 0 when the entry states none -- every installed revision stays
+    // usable, and a raised `revision` only changes what a new install gets
+    // (xpkg V2 spec, "floor"). A floor above the revision reads as the
+    // revision.
+    int floor = 0;
     // The oldest client that can use this version (`min_client =
     // "2026.10.16.1"`): a client resolving a package with no version named
     // passes over the versions it cannot use. Empty when the entry states none.

@@ -145,6 +145,15 @@ struct Package {
     std::vector<std::string> categories, keywords, programs, archs;
     bool xvm_enable = false;
     PlatformMatrix xpm;
+    // Namespaced data for other programs (`extensions = { luban = {...} }`):
+    // each first-level key names the program that reads it. libxpkg and xlings
+    // keep it and hand it on unchanged, never interpreting it; it does not
+    // change what is installed (xpkg V2 spec, "extensions"). JSON text of an
+    // object with sorted keys; empty when the recipe states none.
+    std::string extensions;
+    // What the loader dropped while reading the recipe, one line each (an
+    // `extensions` value JSON cannot carry, an `extensions` over the limit).
+    std::vector<std::string> warnings;
     ~Package();
 };
 

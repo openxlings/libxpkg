@@ -812,3 +812,82 @@ TEST(LoaderTest, AVersionNamesTheOldestClientThatCanUseIt) {
     EXPECT_EQ(result->xpm.entries.at("macosx").at("1.1.0").min_client, "2026.10.16.2");
     EXPECT_TRUE(result->xpm.entries.at("linux").at("1.0.0").min_client.empty());
 }
+
+// ---- extensions (xpkg V2, libxpkg 0.0.66) ----
+
+static fs::path write_recipe(std::string_view test_name, std::string_view extensions) {
+    auto dir = fs::temp_directory_path() / ("libxpkg-ext-" + std::string(test_name));
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    auto file = dir / "pkg.lua";
+    std::ofstream out(file);
+    out << "package = {\n  spec = \"1\", name = \"ext\", description = \"d\",\n"
+        << extensions
+        << "\n  xpm = { linux = { [\"1.0.0\"] = { url = \"https://example.com/a.tar.gz\", sha256 = \"00\" } } },\n}\n";
+    return file;
+}
+
+TEST(LoaderTest, Extensions_KeptAsCanonicalJson) {
+    auto file = write_recipe("canonical",
+        "  extensions = { luban = { tier = 2, gpu = \"better\", size = 1.5, preview = false,\n"
+        "    title = { zh = \"标题\", en = \"Title \\\"q\\\"\" }, highlights = { \"cmake\", \"yazi\" }, empty = {} } },");
+    auto p = load_package(file);
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_EQ(p->extensions,
+        R"({"luban":{"empty":[],"gpu":"better","highlights":["cmake","yazi"],"preview":false,"size":1.5,"tier":2,"title":{"en":"Title \"q\"","zh":"标题"}}})");
+    EXPECT_TRUE(p->warnings.empty());
+}
+
+TEST(LoaderTest, Extensions_AbsentIsEmpty) {
+    auto p = load_package(write_recipe("absent", ""));
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_TRUE(p->extensions.empty());
+    EXPECT_TRUE(p->warnings.empty());
+}
+
+TEST(LoaderTest, Extensions_DropsWhatJsonCannotCarry) {
+    auto p = load_package(write_recipe("types",
+        "  extensions = { luban = { tier = 1, hook = function() end, [3] = \"x\", inf = math.huge } },"));
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_EQ(p->extensions, R"({"luban":{"tier":1}})");
+    EXPECT_EQ(p->warnings.size(), 3u);
+}
+
+TEST(LoaderTest, Extensions_SelfReferenceEndsAtTheDepthLimit) {
+    auto p = load_package(write_recipe("cycle",
+        "  extensions = (function() local t = { luban = {} }; t.luban.self = t.luban; return t end)(),"));
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_TRUE(p->extensions.starts_with(R"({"luban":{"self":{"self":)"));
+    EXPECT_FALSE(p->warnings.empty());
+}
+
+TEST(LoaderTest, Extensions_OverTheLimitIsDroppedWhole) {
+    auto p = load_package(write_recipe("size",
+        "  extensions = { luban = { summary = string.rep(\"x\", 5000), tier = 1 } },"));
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_TRUE(p->extensions.empty());
+    ASSERT_EQ(p->warnings.size(), 1u);
+    EXPECT_NE(p->warnings[0].find("over the 4096 limit"), std::string::npos);
+}
+
+TEST(LoaderTest, Extensions_NotATableIsDropped) {
+    auto p = load_package(write_recipe("scalar", "  extensions = \"luban\","));
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_TRUE(p->extensions.empty());
+    EXPECT_EQ(p->warnings.size(), 1u);
+    auto list = load_package(write_recipe("list", "  extensions = { \"a\", \"b\" },"));
+    ASSERT_TRUE(list.has_value()) << list.error();
+    EXPECT_TRUE(list->extensions.empty());
+    EXPECT_EQ(list->warnings.size(), 1u);
+}
+
+// A loader that predates `extensions` reads known fields by name and has no
+// check for unknown keys: a recipe with `extensions` loads, the rest unchanged.
+TEST(LoaderTest, Extensions_DoNotChangeTheOtherFields) {
+    auto with = load_package(write_recipe("with", "  extensions = { luban = { tier = 3 } },"));
+    auto without = load_package(write_recipe("without", ""));
+    ASSERT_TRUE(with.has_value() && without.has_value());
+    EXPECT_EQ(with->name, without->name);
+    EXPECT_EQ(with->description, without->description);
+    EXPECT_EQ(with->xpm.entries.size(), without->xpm.entries.size());
+}

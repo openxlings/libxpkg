@@ -223,6 +223,157 @@ std::vector<std::string> get_str_array(lua::State* L, int idx, const char* key) 
     return result;
 }
 
+// ---- extensions: namespaced data the loader keeps as JSON text ----
+//
+// `extensions = { luban = { tier = 2, title = { en = "labwc" } } }` is read by
+// the program each first-level key names; libxpkg and xlings keep it and hand
+// it on unchanged (xpkg V2 spec, "extensions"). The loader turns the Lua table
+// into canonical JSON text: object keys sorted, a table whose keys are exactly
+// 1..n an array, an empty table an array. A value JSON cannot carry (a
+// function, userdata, a non-finite number, a non-string key outside an array)
+// is dropped with a warning; a table nested deeper than kExtensionsMaxDepth is
+// dropped the same way (a table that holds itself ends there). The whole
+// `extensions` is dropped, with a warning, when its text is over
+// kExtensionsMaxBytes -- never cut, so half of it is never read as all of it.
+inline constexpr std::size_t kExtensionsMaxBytes = 4096;
+inline constexpr int kExtensionsMaxDepth = 16;
+
+void json_quote(std::string& out, std::string_view s) {
+    out += '"';
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default:
+                if (c < 0x20) out += std::format("\\u{:04x}", static_cast<unsigned>(c));
+                else out += static_cast<char>(c);
+        }
+    }
+    out += '"';
+}
+
+std::string lua_string_at(lua::State* L, int idx) {
+    unsigned long long len = 0;
+    const char* p = lua::tolstring(L, idx, &len);
+    return p ? std::string(p, static_cast<std::size_t>(len)) : std::string{};
+}
+
+// Appends the value at `idx` as JSON; false (and a warning) when it is dropped.
+bool lua_to_json(lua::State* L, int idx, std::string& out, const std::string& where,
+                 std::vector<std::string>& warnings, int depth) {
+    idx = lua::absindex(L, idx);
+    switch (lua::type(L, idx)) {
+        case lua::TSTRING:
+            json_quote(out, lua_string_at(L, idx));
+            return true;
+        case lua::TBOOLEAN:
+            out += lua::toboolean(L, idx) ? "true" : "false";
+            return true;
+        case lua::TNUMBER: {
+            if (lua::isinteger(L, idx)) {
+                out += std::to_string(lua::tointeger(L, idx));
+                return true;
+            }
+            const double v = lua::tonumber(L, idx);
+            if (!std::isfinite(v)) {
+                warnings.push_back(where + ": a number that is not finite, dropped");
+                return false;
+            }
+            out += std::format("{}", v);
+            return true;
+        }
+        case lua::TTABLE: break;
+        default:
+            warnings.push_back(where + ": a value of a type JSON cannot carry, dropped");
+            return false;
+    }
+    if (depth >= kExtensionsMaxDepth) {
+        warnings.push_back(where + ": nested deeper than " + std::to_string(kExtensionsMaxDepth) + ", dropped");
+        return false;
+    }
+    // Count the keys; the table is an array when they are exactly 1..n.
+    std::size_t keys = 0;
+    bool allStrings = true;
+    lua::pushnil(L);
+    while (lua::next(L, idx)) {
+        ++keys;
+        if (lua::type(L, -2) != lua::TSTRING) allStrings = false;
+        lua::pop(L, 1);
+    }
+    const auto n = static_cast<std::size_t>(lua::rawlen(L, idx));
+    if (keys == 0 || (n == keys && !allStrings)) {
+        out += '[';
+        bool first = true;
+        for (std::size_t i = 1; i <= n; ++i) {
+            lua::rawgeti(L, idx, static_cast<lua::Integer>(i));
+            std::string item;
+            if (lua_to_json(L, -1, item, where + "[" + std::to_string(i) + "]", warnings, depth + 1)) {
+                if (!first) out += ',';
+                out += item;
+                first = false;
+            }
+            lua::pop(L, 1);
+        }
+        out += ']';
+        return true;
+    }
+    std::vector<std::string> names;
+    lua::pushnil(L);
+    while (lua::next(L, idx)) {
+        if (lua::type(L, -2) == lua::TSTRING) names.push_back(lua_string_at(L, -2));
+        else warnings.push_back(where + ": a key that is not a string, dropped");
+        lua::pop(L, 1);
+    }
+    std::ranges::sort(names);
+    out += '{';
+    bool first = true;
+    for (const auto& name : names) {
+        lua::pushstring(L, name.c_str());
+        lua::rawget(L, idx);
+        std::string item;
+        if (lua_to_json(L, -1, item, where + "." + name, warnings, depth + 1)) {
+            if (!first) out += ',';
+            json_quote(out, name);
+            out += ':';
+            out += item;
+            first = false;
+        }
+        lua::pop(L, 1);
+    }
+    out += '}';
+    return true;
+}
+
+// The package's `extensions` as JSON text of an object, or "" when it has none.
+std::string get_extensions(lua::State* L, int idx, std::vector<std::string>& warnings) {
+    lua::getfield(L, idx, "extensions");
+    std::string out;
+    const int type = lua::type(L, -1);
+    if (type == lua::TTABLE) {
+        std::vector<std::string> notes;
+        std::string text;
+        lua_to_json(L, -1, text, "extensions", notes, 0);
+        if (text.size() > kExtensionsMaxBytes) {
+            warnings.push_back(std::format("extensions: {} bytes, over the {} limit, dropped",
+                                           text.size(), kExtensionsMaxBytes));
+        } else if (text.starts_with('[') && text != "[]") {
+            warnings.push_back("extensions: a list, not a table of namespaces, dropped");
+        } else {
+            for (auto& note : notes) warnings.push_back(std::move(note));
+            out = text == "[]" ? std::string{} : std::move(text);
+        }
+    } else if (type != lua::TNIL) {
+        warnings.push_back("extensions: not a table, dropped");
+    }
+    lua::pop(L, 1);
+    return out;
+}
+
 PackageType parse_type(const std::string& s) {
     if (s == "script")   return PackageType::Script;
     if (s == "template") return PackageType::Template;
@@ -845,6 +996,7 @@ load_package(const fs::path& pkg_path, const LoaderContext& context) {
     p.archs       = loader_detail::get_str_array(L, pkg_idx, "archs");
     p.programs    = loader_detail::get_str_array(L, pkg_idx, "programs");
     p.xpm         = loader_detail::parse_xpm(L, pkg_idx);
+    p.extensions  = loader_detail::get_extensions(L, pkg_idx, p.warnings);
 
     lua::close(L);
     return p;

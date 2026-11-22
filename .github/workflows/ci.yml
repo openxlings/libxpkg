@@ -46,3 +46,52 @@ jobs:
       # filtered — they can't run on a Linux runner.
       - name: Run tests
         run: mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*
+
+  # The one function that runs a command line through the shell
+  # (src/xpkg-shell.cppm, libxpkg#52) differs per OS: `cmd /d /s /c` on
+  # Windows, `/bin/sh -c` elsewhere. Its tests run on each of the three; the
+  # rest of the suite is Linux's (above).
+  shell:
+    name: shell tests (${{ matrix.os }}, mcpp)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      XLINGS_NON_INTERACTIVE: '1'
+      MCPP_VERSION: 2026.11.22.1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xlings (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.sh | bash
+          test -x "$HOME/.xlings/bin/xlings"
+          echo "$HOME/.xlings/subos/current/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.xlings/bin" >> "$GITHUB_PATH"
+
+      - name: Install xlings (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $script = "$env:TEMP\xlings-quick-install.ps1"
+          Invoke-WebRequest -UseBasicParsing -ErrorAction Stop `
+            -Uri https://raw.githubusercontent.com/openxlings/xlings/main/tools/other/quick_install.ps1 `
+            -OutFile $script
+          & $script
+          if (-not (Test-Path "$env:USERPROFILE\.xlings\bin\xlings.exe")) { exit 1 }
+          "$env:USERPROFILE\.xlings\subos\current\bin" >> $env:GITHUB_PATH
+          "$env:USERPROFILE\.xlings\bin" >> $env:GITHUB_PATH
+
+      - name: Install mcpp
+        shell: bash
+        run: |
+          xlings install "mcpp@${MCPP_VERSION}" -y
+          xlings use mcpp "${MCPP_VERSION}"
+          mcpp --version
+
+      - name: Run the shell tests
+        shell: bash
+        run: mcpp test test_shell --toolchain llvm@23.1.3

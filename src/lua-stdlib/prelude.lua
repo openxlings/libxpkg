@@ -128,63 +128,15 @@ os.cp = function(src, dst, opts)
     outf:write(content); outf:close()
     return true
 end
--- POSIX: shell-escape a glob pattern, keeping glob meta-chars raw so the
--- shell still expands them. Quoting the whole pattern (e.g. "/tmp/x/v*")
--- suppresses globbing — `ls -d "/tmp/x/v*"` would only match a file
--- literally named `v*`. Instead we backslash-escape characters that need
--- shell quoting (whitespace, $, `, ', ", redirects, etc.) and leave glob
--- meta (* ? [ ] ~) untouched.
-local _SHELL_META_NO_GLOB = " \t\r\n$`'\"<>|&;()!\\"
-local function _shell_glob_escape(s)
-    local out = {}
-    for i = 1, #s do
-        local c = s:sub(i, i)
-        if _SHELL_META_NO_GLOB:find(c, 1, true) then
-            out[#out+1] = "\\"
-        end
-        out[#out+1] = c
-    end
-    return table.concat(out)
-end
-
-os.dirs = function(pattern)
-    local result = {}
-    local sep = _PATH_SEP
-    local cmd
-    if sep == "\\" then
-        -- cmd.exe `dir` does its own wildcard expansion on the pattern
-        -- argument, so quoting is safe and required for paths with spaces.
-        cmd = 'dir /B /AD "' .. pattern .. '" 2>nul'
-    else
-        -- POSIX `ls` does NOT expand globs itself; the shell does. Escape
-        -- shell metachars but leave glob meta raw so expansion still works.
-        cmd = 'ls -d ' .. _shell_glob_escape(pattern) .. ' 2>/dev/null'
-    end
-    local f = io.popen(cmd)
-    if f then
-        for line in f:lines() do
-            local clean = line:gsub("[\r\n]+$", "")  -- strip CRLF
-            if clean ~= "" and os.isdir(clean) then
-                table.insert(result, clean)
-            end
-        end
-        f:close()
-    end
-    return result
-end
+-- os.dirs, os.iorun and os.execute (so os.exec below) are the executor's C++
+-- functions, registered after this prelude runs (register_os_funcs); a command
+-- line reaches the shell only through xpkg-shell.cppm.
 os.sleep = function(ms) end  -- stub
 os.cd = function(dir)
     if not dir then return false end
     -- Fallback: pure Lua cannot chdir; C++ override replaces this after prelude
     _CURRENT_DIR = dir
     return true
-end
-os.iorun = function(cmd)
-    local f = io.popen(cmd .. " 2>/dev/null")
-    if not f then return "" end
-    local output = f:read("*a")
-    f:close()
-    return output or ""
 end
 os.setenv = function(k, v)
     if _PATH_SEP == "\\" then

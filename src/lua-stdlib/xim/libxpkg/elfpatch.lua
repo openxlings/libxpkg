@@ -34,11 +34,6 @@ local function _null_redirect()
     return " >/dev/null 2>&1"
 end
 
-local function _err_redirect()
-    if _RUNTIME and _RUNTIME.platform == "windows" then return " 2>NUL" end
-    return " 2>/dev/null"
-end
-
 local function _exec_ok(cmd)
     local ok, _, code = os.execute(cmd .. _null_redirect())
     if ok == true or ok == 0 then return true end
@@ -46,12 +41,10 @@ local function _exec_ok(cmd)
     return false
 end
 
+-- stdout of `cmd`, its stderr discarded: os.iorun, the executor's one way to
+-- read a command's output (xpkg-shell.cppm).
 local function _iorun(cmd)
-    local f = io.popen(cmd .. _err_redirect())
-    if not f then return nil end
-    local output = f:read("*a")
-    f:close()
-    return output
+    return os.iorun(cmd)
 end
 
 -- Which package's payload provides each tool.
@@ -373,12 +366,8 @@ end
 -- harmlessly later anyway.
 local function _has_pt_interp(filepath, patch_tool)
     if not patch_tool then return true end
-    local cmd = _shell_quote(patch_tool.program)
-        .. " --print-interpreter " .. _shell_quote(filepath) .. _err_redirect()
-    local h = io.popen(cmd, "r")
-    if not h then return true end
-    local out = h:read("*a") or ""
-    h:close()
+    local out = _iorun(_shell_quote(patch_tool.program)
+        .. " --print-interpreter " .. _shell_quote(filepath)) or ""
     return out:gsub("%s+", "") ~= ""
 end
 
@@ -424,9 +413,9 @@ local function _collect_targets(target, opts)
     end
 
     local binaries = {}
-    local f = io.popen(find_cmd .. " 2>/dev/null")
-    if f then
-        for line in f:lines() do
+    local listing = _iorun(find_cmd)
+    if listing then
+        for line in listing:gmatch("[^\n]+") do
             local filepath = _trim(line)
             if filepath and filepath ~= "" then
                 if not include_shared_libs then
@@ -442,7 +431,6 @@ local function _collect_targets(target, opts)
                 ::continue::
             end
         end
-        f:close()
     end
     return binaries
 end

@@ -15,7 +15,8 @@ xpkg (聚合 target)         ← add_deps("xpkg") 引入以下全部模块
 ├── mcpplibs.xpkg          ← 纯 C++ 数据模型，零外部依赖
 ├── mcpplibs.xpkg.loader   ← 依赖 model + lua 库；解析 .lua 文件
 ├── mcpplibs.xpkg.index    ← 依赖 model；纯 C++ 索引操作
-└── mcpplibs.xpkg.executor ← 依赖 model + lua 库；执行钩子
+├── mcpplibs.xpkg.executor ← 依赖 model + shell + lua 库；执行钩子
+└── mcpplibs.xpkg.shell    ← 依赖 lua 库；经 shell 运行一行命令的唯一函数
 ```
 
 ### 依赖关系
@@ -79,6 +80,7 @@ graph TD
 - 版本条目的 `min_client`：能使用该版本的最旧客户端版本，解析为 `PlatformResource::min_client`。未指定版本时，客户端据此跳过自己不能使用的版本（0.0.64）
 - 版本条目的 `floor`：该版本仍可用的最旧打包修订号（`0 ≤ floor ≤ revision`，缺省 0），解析为 `PlatformResource::floor`，`resolve_resource` 随 `ref` 报告解析到的条目的值；高于 `revision` 时按 `revision` 读。客户端保留记录修订号不低于它的已装载荷，替换低于它的（0.0.65）
 - 包级的 `extensions`：按命名空间区分的扩展数据（`extensions = { luban = { ... } }`），第一层键是读它的程序。加载为 `Package::extensions`：对象的 JSON 文本（键排序；键恰为 1..n 的表与空表是数组），原样交给调用方，libxpkg 不解释。JSON 表达不了的值（函数、userdata、非有限数、数组之外的非字符串键）、嵌套超过 16 层的表丢弃，序列化后超过 4 KiB 时整个丢弃（不截断）；每次丢弃在 `Package::warnings` 里记一行。只改 `extensions` 不改变安装的内容，不 bump `revision`；旧加载器按名字取已知字段，读到它时忽略（0.0.66）
+- 包级的 `host_facts`：包的 `config()` 所依据的宿主文件，按平台列出绝对路径（`host_facts = { linux = { "/sys/module/nvidia/version" } }`），解析为 `Package::host_facts`（平台 → 路径，保持书写顺序，去重）。它是数据而不是钩子：客户端在配置时记录这些文件内容的摘要，在使用配置的地方比较，不同则重新运行 `config()`，比较不运行包的任何代码。不是绝对路径的条目（`/...`、`C:\...`、`C:/...`、`\\server\...` 之外）、类型不对的值、写成列表而不是按平台的表，丢弃并在 `Package::warnings` 里记一行。缺省时为空，行为与此前相同；旧加载器按名字取已知字段，读到它时忽略（0.0.67）
 
 ### mcpplibs.xpkg.index — 索引层
 
@@ -126,10 +128,10 @@ hook 里的 `print` / `io.write` / `io.stderr:write` 一直被 `run_hook` 捕获
 实现约束：
 
 - **只在 `run_hook` 里接管 `os.execute`**，返回时恢复。`run_script`、`apply_elfpatch_auto` 不受影响；`io.popen` / `os.iorun` 本来就捕获输出，也不改。
-- **命令字符串原样交给 shell，不拼接重定向。** 在末尾拼 `>> log 2>&1` 对 `a && b` 只重定向最后一条；在 Windows 上，在命令前加任何字符都会改变 cmd `/c` 的去引号规则，而 `pkgs/m/msvc.lua` 依赖这条规则。所以重定向做在进程层面：POSIX 用 `posix_spawn("/bin/sh", "-c", cmd)` + `adddup2`，Windows 用 `CreateProcessA(COMSPEC, "<COMSPEC> /c <cmd>")` + `STARTF_USESTDHANDLES`（命令行与 UCRT `system()` 构造的一致，同样用窄字符 API）。stdin 保持继承。
+- **命令字符串原样交给 shell，不拼接重定向。** 在末尾拼 `>> log 2>&1` 对 `a && b` 只重定向最后一条。重定向做在进程层面，由经 shell 运行一行命令的唯一函数完成（见下文 `mcpplibs.xpkg.shell`）。stdin 保持继承。
 - **返回值与 Lua 5.4 的 `os.execute` 一致**：退出码 0 → `true, "exit", 0`；退出码 n → `nil, "exit", n`；被信号杀死 → `nil, "signal", s`；`os.execute()` 无参仍问“有没有 shell”。`ret == 0 or ret == true` 之类的现有判断不受影响。
 - **日志打不开不让 hook 失败**：子进程的输出去 `/dev/null`（Windows 是 `NUL`），经 `log` 模块警告一次（因此出现在 `HookResult::output` 里），`HookResult::output` 退回环形缓冲区。
-- 与 `system()` 的一个已知差异：等待子进程期间不像 `system()` 那样忽略 SIGINT/SIGQUIT。
+- 与 `system()` 的一个已知差异：等待子进程期间不像 `system()` 那样忽略 SIGINT/SIGQUIT。这一点对经 shell 运行的每一行命令都成立（0.0.67 起 `os.execute` 不再经 `system()`）。
 
 需要终端的命令（提示、密码、要给用户看的输出）显式退出重定向：
 
@@ -155,6 +157,21 @@ end
 ```
 
 `system.run_in_script(script, true)` 仍直接经 `sudo` 执行，只为已有 recipe 保留；新 recipe 用 `admin_step`。
+
+#### 经 shell 运行一行命令：`mcpplibs.xpkg.shell`（0.0.67）
+
+经 shell 运行一行命令只有一个函数 `shell::run(line, streams)`（`src/xpkg-shell.cppm`）。`os.execute`（因而 `os.exec`、`system.exec`、`system.run_in_script`）、`os.iorun`、hook log 对子进程输出的重定向、`pkgindex-build.lua` 的 `os.execute` 与它之前的 `git checkout` 都调用它；libxpkg 自带的 Lua 模块读取命令输出时用 `os.iorun`，不再用 `io.popen`。
+
+| 系统 | 命令行 |
+|------|--------|
+| Windows | `"<COMSPEC>" /d /s /c "<整行>"`（`COMSPEC` 未设置时为 `cmd.exe`），`CreateProcessA` |
+| 其他 | `posix_spawn("/bin/sh", ["sh", "-c", <整行>])` |
+
+- **`/s` 使去引号规则确定。** 没有 `/s` 时，`cmd /c` 遇到以引号开头且不止一对引号的命令行，会去掉第一个与最后一个引号：`"C:\a b\tool.exe" --version` 实际执行的是 `C:\a b\tool.exe" --version`。加上 `/s` 并给整行再包一层引号后，`cmd` 只去掉这层外引号，整行按调用者所写的执行。`/d` 不运行注册表中的 AutoRun 命令。
+- **输出以管道读取。** `Streams` 为 stdout 与 stderr 各选一种去向：继承（`Inherit`）、空设备（`Null`）、文件（`File`，hook log 用）、管道（`Capture`，读入 `Run::output`）。之前 `os.iorun` 在调用者的命令行末尾拼 ` 2>nul > "<临时文件>"`，再交给 `std::system`；在 Windows 上，上面的去引号规则把这段重定向移进了引号内，输出没有写进临时文件，`os.iorun` 返回空串（libxpkg#52）。现在命令行不被改写，调用者自带的重定向（`> file`、`2>&1`）照常生效。
+- **`os.iorun(cmd)`** 返回 stdout，丢弃 stderr；**`os.execute(cmd)`** 的返回值与 Lua 5.4 一致（见上文），无参时回答“有 shell”。
+- **兼容。** 索引中已有的绕过写法在修复后仍然成立：`call "<程序>" ...`、经 `os.exec` 运行的 `cmd.exe /d /s /c "<bat>"`、以未加引号的程序开头的命令行，都按所写的执行。它们可以在索引所支持的最低客户端包含 0.0.67 之后删除。
+- 单元测试（`tests/test_shell.cpp`）在 Linux、macOS 与 Windows 上运行：带引号且含空格的程序路径读回输出；调用者自带的重定向仍然生效；退出码；`os.iorun` 与 `os.execute` 经同一函数。
 
 #### `pkginfo.build_dep` 的名字规范化（0.0.60）
 
@@ -194,7 +211,8 @@ libxpkg/
 │   ├── xpkg.cppm              # mcpplibs.xpkg (数据模型)
 │   ├── xpkg-loader.cppm       # mcpplibs.xpkg.loader
 │   ├── xpkg-index.cppm        # mcpplibs.xpkg.index
-│   └── xpkg-executor.cppm     # mcpplibs.xpkg.executor
+│   ├── xpkg-executor.cppm     # mcpplibs.xpkg.executor
+│   └── xpkg-shell.cppm        # mcpplibs.xpkg.shell（经 shell 运行一行命令）
 ├── tests/
 │   ├── main.cpp
 │   ├── test_loader.cpp

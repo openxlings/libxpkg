@@ -1,8 +1,7 @@
 module;
 
-// Platform headers for the process layer below (hook output redirection).
-// `import std;` does not provide them, and the named-module purview forbids
-// including them there.
+// Platform headers for the hook log's file layer below. `import std;` does not
+// provide them, and the named-module purview forbids including them there.
 #if defined(_WIN32)
 // windows.h's min/max macros break std::min({...}) in every module that sees
 // them, and only Windows ever reports it. Both defines come before the include.
@@ -16,22 +15,14 @@ module;
 #else
 #  include <cerrno>
 #  include <fcntl.h>
-#  include <spawn.h>
 #  include <sys/types.h>
-#  include <sys/wait.h>
 #  include <unistd.h>
-#  if defined(__APPLE__)
-#    include <crt_externs.h>
-#  else
-// POSIX leaves this declaration to the application; glibc/musl only declare
-// it under _GNU_SOURCE.
-extern "C" char** environ;
-#  endif
 #endif
 
 export module mcpplibs.xpkg.executor;
 import mcpplibs.xpkg;
 import mcpplibs.xpkg.lua_stdlib;
+import mcpplibs.xpkg.shell;
 import mcpplibs.capi.lua;
 import std;
 
@@ -258,12 +249,15 @@ void register_os_funcs(lua::State* L) {
         lua::getglobal(L, "os");
     }
 
-    // The native os.execute -- system(), the child inherits fd 1 and 2 -- under
-    // an internal name. While a hook runs with ExecutionContext::hook_log,
-    // os.execute is replaced by a version that redirects the child's output;
-    // a command that needs the terminal (system.exec's `tty`) reaches this one.
+    // os.execute runs through shell::run, the one way a command line reaches
+    // the shell (libxpkg#52); the child inherits fd 1 and 2. While a hook runs
+    // with ExecutionContext::hook_log, os.execute is replaced by a version that
+    // sends the child's output to the log; a command that needs the terminal
+    // (system.exec's `tty`) reaches this one under an internal name.
     // Deliberately not an os.* function: recipes should not depend on it.
-    lua::getfield(L, -1, "execute");
+    lua::pushcfunction(L, shell::lua_execute);
+    lua::setfield(L, -2, "execute");
+    lua::pushcfunction(L, shell::lua_execute);
     lua::setglobal(L, "_LIBXPKG_EXEC_INHERIT");
 
     // os.isdir(path) -> bool
@@ -397,34 +391,10 @@ void register_os_funcs(lua::State* L) {
     });
     lua::setfield(L, -2, "isfile");
 
-    // os.iorun(cmd) -> string  (capture stdout, discard stderr)
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* cmd = lua::tostring(L, 1);
-        if (!cmd) { lua::pushstring(L, ""); return 1; }
-        // Build a temp path for capturing output
-        std::error_code ec;
-        auto tmp = fs::temp_directory_path(ec) / ("xpkg_iorun_" +
-            std::to_string(std::hash<std::string>{}(std::string(cmd) +
-                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))));
-        std::string full(cmd);
-#ifdef _WIN32
-        full += " 2>nul > \"" + tmp.string() + "\"";
-#else
-        full += " 2>/dev/null > \"" + tmp.string() + "\"";
-#endif
-        std::system(full.c_str());
-        std::ifstream ifs(tmp);
-        std::string out;
-        if (ifs.good()) {
-            std::ostringstream ss;
-            ss << ifs.rdbuf();
-            out = ss.str();
-        }
-        ifs.close();
-        fs::remove(tmp, ec);
-        lua::pushstring(L, out.c_str());
-        return 1;
-    });
+    // os.iorun(cmd) -> string: stdout read through a pipe, stderr discarded.
+    // Nothing is appended to the caller's line, so a redirect it carries
+    // keeps its meaning and a quoted program path is not re-quoted.
+    lua::pushcfunction(L, shell::lua_iorun);
     lua::setfield(L, -2, "iorun");
 
     lua::pop(L, 1); // pop os table
@@ -803,34 +773,13 @@ void inject_context(lua::State* L, const mcpplibs::xpkg::ExecutionContext& ctx) 
 constexpr std::string_view HOOK_OUTPUT_TRUNCATED_MARKER =
     "\n[libxpkg: hook output truncated]\n";
 
-// ---- Native process layer: a child's fd 1/2 in a file ----------------------
+// ---- Native file layer: the hook log a child's fd 1/2 are pointed at ----
 //
-// Standalone on purpose -- no lua::, nothing else from this file. The Windows
-// half cannot be compiled by this project's Linux CI, so the block between the
-// markers is kept small enough to be extracted and built (and run, under Wine)
-// on its own. Do not add a dependency on the rest of the file to it.
-//
-// Why a process-level redirect and not "cmd >> log 2>&1" appended to the string:
-// appended, it only redirects the LAST command of "a && b"; and anything put in
-// front of a Windows command changes cmd's /c quote-stripping rule, which
-// pkgs/m/msvc.lua depends on. The command string is passed through untouched.
+// The child itself is started by shell::run (xpkg-shell.cppm), the one place a
+// command line reaches the shell; this block only opens and writes the file.
 
-// BEGIN native-exec
-#if defined(_WIN32)
-using NativeFile = HANDLE;
-inline const NativeFile kNoFile = INVALID_HANDLE_VALUE;
-#else
-using NativeFile = int;
-inline constexpr NativeFile kNoFile = -1;
-#endif
-
-// How a command ended, in Lua 5.4's os.execute vocabulary.
-struct ExecStatus {
-    enum class Kind { Exit, Signal, Failed };
-    Kind kind = Kind::Failed;
-    int code = 0;          // exit status, signal number, or the OS error
-    std::string message;   // Failed only
-};
+using NativeFile = shell::NativeFile;
+inline const NativeFile kNoFile = shell::kNoFile;
 
 // An append-only handle to `path`, which must already exist. On Windows it is
 // inheritable: it becomes the child's stdout and stderr.
@@ -852,7 +801,7 @@ NativeFile open_append(const fs::path& path) {
 void close_file(NativeFile file) {
     if (file == kNoFile) return;
 #if defined(_WIN32)
-    ::CloseHandle(file);
+    ::CloseHandle(static_cast<HANDLE>(file));
 #else
     ::close(file);
 #endif
@@ -863,7 +812,8 @@ bool write_all(NativeFile file, std::string_view bytes) {
 #if defined(_WIN32)
         const std::size_t chunk = bytes.size() < (1u << 20) ? bytes.size() : (1u << 20);
         DWORD written = 0;
-        if (!::WriteFile(file, bytes.data(), static_cast<DWORD>(chunk), &written, nullptr) ||
+        if (!::WriteFile(static_cast<HANDLE>(file), bytes.data(), static_cast<DWORD>(chunk),
+                         &written, nullptr) ||
             written == 0) {
             return false;
         }
@@ -878,112 +828,6 @@ bool write_all(NativeFile file, std::string_view bytes) {
     }
     return true;
 }
-
-// Run `cmd` through the system shell -- what system() does -- with the child's
-// stdout and stderr on `out` (kNoFile: the null device), stdin inherited, and
-// wait for it.
-ExecStatus run_shell(const char* cmd, NativeFile out) {
-    ExecStatus status;
-#if defined(_WIN32)
-    // The command line UCRT system() builds: "<COMSPEC> /c <cmd>", the pieces
-    // joined by single spaces with no quoting, so cmd's /c quote-stripping sees
-    // exactly what it sees under os.execute. The narrow (ACP) API is deliberate
-    // for the same reason: system() is narrow too.
-    const char* env = std::getenv("COMSPEC");
-    const std::string comspec = (env && *env) ? env : "cmd.exe";
-    std::string commandLine = comspec + " /c " + cmd;
-
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    HANDLE sink = out;
-    HANDLE nul = INVALID_HANDLE_VALUE;
-    if (sink == INVALID_HANDLE_VALUE) {
-        nul = ::CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        sink = nul;
-    }
-
-    STARTUPINFOA startup{};
-    startup.cb = sizeof(startup);
-    startup.dwFlags = STARTF_USESTDHANDLES;
-    startup.hStdInput = ::GetStdHandle(STD_INPUT_HANDLE);
-    startup.hStdOutput = sink;
-    startup.hStdError = sink;
-    PROCESS_INFORMATION process{};
-    // With COMSPEC unset, system() finds cmd.exe on the search path; a bare
-    // name as lpApplicationName would only be looked for in the current
-    // directory, so let CreateProcess parse the command line instead.
-    const bool fromEnv = env && *env;
-    const BOOL started = ::CreateProcessA(fromEnv ? comspec.c_str() : nullptr,
-                                          commandLine.data(),
-                                          nullptr, nullptr, TRUE, 0, nullptr, nullptr,
-                                          &startup, &process);
-    if (started) {
-        ::CloseHandle(process.hThread);
-        ::WaitForSingleObject(process.hProcess, INFINITE);
-        DWORD exitCode = 1;
-        ::GetExitCodeProcess(process.hProcess, &exitCode);
-        ::CloseHandle(process.hProcess);
-        status.kind = ExecStatus::Kind::Exit;
-        status.code = static_cast<int>(exitCode);
-    } else {
-        status.code = static_cast<int>(::GetLastError());
-        status.message = "cannot start " + comspec + " (error " +
-                         std::to_string(status.code) + ")";
-    }
-    if (nul != INVALID_HANDLE_VALUE) ::CloseHandle(nul);
-#else
-    posix_spawn_file_actions_t actions;
-    int error = ::posix_spawn_file_actions_init(&actions);
-    if (error == 0) {
-        if (out != kNoFile) {
-            error = ::posix_spawn_file_actions_adddup2(&actions, out, 1);
-        } else {
-            error = ::posix_spawn_file_actions_addopen(&actions, 1, "/dev/null",
-                                                       O_WRONLY, 0);
-        }
-        if (error == 0) error = ::posix_spawn_file_actions_adddup2(&actions, 1, 2);
-        if (error == 0) {
-            char* const argv[] = { const_cast<char*>("sh"), const_cast<char*>("-c"),
-                                   const_cast<char*>(cmd), nullptr };
-#  if defined(__APPLE__)
-            char** const envp = *_NSGetEnviron();
-#  else
-            char** const envp = environ;
-#  endif
-            pid_t pid = 0;
-            error = ::posix_spawn(&pid, "/bin/sh", &actions, nullptr, argv, envp);
-            if (error == 0) {
-                int raw = 0;
-                pid_t reaped = 0;
-                do {
-                    reaped = ::waitpid(pid, &raw, 0);
-                } while (reaped < 0 && errno == EINTR);
-                if (reaped < 0) {
-                    error = errno;
-                } else if (WIFEXITED(raw)) {
-                    status.kind = ExecStatus::Kind::Exit;
-                    status.code = WEXITSTATUS(raw);
-                } else if (WIFSIGNALED(raw)) {
-                    status.kind = ExecStatus::Kind::Signal;
-                    status.code = WTERMSIG(raw);
-                } else {
-                    status.kind = ExecStatus::Kind::Exit;
-                    status.code = raw;
-                }
-            }
-        }
-        ::posix_spawn_file_actions_destroy(&actions);
-    }
-    if (status.kind == ExecStatus::Kind::Failed) {
-        status.code = error;
-        status.message = std::strerror(error);
-    }
-#endif
-    return status;
-}
-// END native-exec
 
 std::string printable(const fs::path& path) {
     // path::string() can throw on Windows for a name the ACP cannot spell, and
@@ -1249,25 +1093,10 @@ int hooked_os_execute(lua::State* L) {
         return lua::gettop(L);
     }
 
-    const ExecStatus status = run_shell(cmd, log->file());
-    switch (status.kind) {
-        case ExecStatus::Kind::Exit:
-            // luaL_execresult: success is true, any other status is fail.
-            if (status.code == 0) lua::pushboolean(L, 1);
-            else lua::pushnil(L);
-            lua::pushstring(L, "exit");
-            break;
-        case ExecStatus::Kind::Signal:
-            lua::pushnil(L);
-            lua::pushstring(L, "signal");
-            break;
-        case ExecStatus::Kind::Failed:
-            // luaL_fileresult: fail, message, errno.
-            lua::pushnil(L);
-            lua::pushstring(L, status.message.c_str());
-            break;
-    }
-    lua::pushinteger(L, status.code);
+    const shell::Status status =
+        shell::run(std::string_view(cmd, length),
+                   { shell::Sink::File, shell::Sink::File, log->file() }).status;
+    shell::push_status(L, status);
     return 3;
 }
 

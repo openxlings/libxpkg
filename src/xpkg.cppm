@@ -151,8 +151,17 @@ struct Package {
     // change what is installed (xpkg V2 spec, "extensions"). JSON text of an
     // object with sorted keys; empty when the recipe states none.
     std::string extensions;
+    // Host files whose contents the package's config() reads to decide what it
+    // configures (`host_facts = { linux = { "/sys/module/nvidia/version" } }`):
+    // platform -> absolute paths, in the order written. A client records a
+    // digest of these files when it configures the package and compares it
+    // where the configuration is used; a different digest means config() runs
+    // again (xpkg V2 spec, "host_facts"). Data, never a hook: checking it runs
+    // none of the recipe's code. Empty when the recipe states none.
+    std::unordered_map<std::string, std::vector<std::string>> host_facts;
     // What the loader dropped while reading the recipe, one line each (an
-    // `extensions` value JSON cannot carry, an `extensions` over the limit).
+    // `extensions` value JSON cannot carry, an `extensions` over the limit, a
+    // `host_facts` entry that is not an absolute path).
     std::vector<std::string> warnings;
     ~Package();
 };

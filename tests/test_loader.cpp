@@ -891,3 +891,57 @@ TEST(LoaderTest, Extensions_DoNotChangeTheOtherFields) {
     EXPECT_EQ(with->description, without->description);
     EXPECT_EQ(with->xpm.entries.size(), without->xpm.entries.size());
 }
+
+// ---- host_facts (xpkg V2, libxpkg 0.0.67) ----
+
+TEST(LoaderTest, HostFacts_KeptPerPlatformInOrder) {
+    auto p = load_package(write_recipe("host-facts",
+        "  host_facts = { linux = { \"/sys/module/nvidia/version\", \"/proc/driver/nvidia/version\",\n"
+        "                           \"/sys/module/nvidia/version\" },\n"
+        "                 windows = { \"C:\\\\Windows\\\\System32\\\\nvapi64.dll\" } },"));
+    ASSERT_TRUE(p.has_value()) << p.error();
+    ASSERT_EQ(p->host_facts.size(), 2u);
+    EXPECT_EQ(p->host_facts.at("linux"),
+              (std::vector<std::string>{ "/sys/module/nvidia/version",
+                                         "/proc/driver/nvidia/version" }));
+    EXPECT_EQ(p->host_facts.at("windows"),
+              (std::vector<std::string>{ "C:\\Windows\\System32\\nvapi64.dll" }));
+    EXPECT_TRUE(p->warnings.empty());
+}
+
+TEST(LoaderTest, HostFacts_AbsentIsEmpty) {
+    auto p = load_package(write_recipe("host-facts-absent", ""));
+    ASSERT_TRUE(p.has_value()) << p.error();
+    EXPECT_TRUE(p->host_facts.empty());
+    EXPECT_TRUE(p->warnings.empty());
+}
+
+TEST(LoaderTest, HostFacts_DropsWhatIsNotAnAbsolutePath) {
+    auto p = load_package(write_recipe("host-facts-bad",
+        "  host_facts = { linux = { \"relative/version\", 7, \"/sys/module/nvidia/version\" },\n"
+        "                 macosx = \"/usr/lib/x\" },"));
+    ASSERT_TRUE(p.has_value()) << p.error();
+    ASSERT_EQ(p->host_facts.size(), 1u);
+    EXPECT_EQ(p->host_facts.at("linux"),
+              (std::vector<std::string>{ "/sys/module/nvidia/version" }));
+    EXPECT_EQ(p->warnings.size(), 3u);
+
+    auto list = load_package(write_recipe("host-facts-list",
+        "  host_facts = { \"/sys/module/nvidia/version\" },"));
+    ASSERT_TRUE(list.has_value()) << list.error();
+    EXPECT_TRUE(list->host_facts.empty());
+    ASSERT_EQ(list->warnings.size(), 1u);
+    EXPECT_NE(list->warnings[0].find("not a table of platforms"), std::string::npos);
+}
+
+// A loader that predates `host_facts` reads known fields by name: a recipe
+// stating it loads, every other field unchanged.
+TEST(LoaderTest, HostFacts_DoNotChangeTheOtherFields) {
+    auto with = load_package(write_recipe("host-facts-with",
+        "  host_facts = { linux = { \"/sys/module/nvidia/version\" } },"));
+    auto without = load_package(write_recipe("host-facts-without", ""));
+    ASSERT_TRUE(with.has_value() && without.has_value());
+    EXPECT_EQ(with->name, without->name);
+    EXPECT_EQ(with->xpm.entries.size(), without->xpm.entries.size());
+    EXPECT_TRUE(without->host_facts.empty());
+}

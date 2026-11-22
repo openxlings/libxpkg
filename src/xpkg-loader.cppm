@@ -2,6 +2,7 @@ module;
 
 export module mcpplibs.xpkg.loader;
 import mcpplibs.xpkg;
+import mcpplibs.xpkg.shell;
 import mcpplibs.capi.lua;
 import std;
 
@@ -372,6 +373,71 @@ std::string get_extensions(lua::State* L, int idx, std::vector<std::string>& war
     }
     lua::pop(L, 1);
     return out;
+}
+
+// ---- host_facts: the host files a package's configuration depends on ----
+//
+// `host_facts = { linux = { "/sys/module/nvidia/version" } }`: per platform,
+// the absolute paths of host files whose contents config() reads. The shape
+// is xpm's (platform names as keys). A path that is not absolute in either
+// spelling (`/...`, `C:\...`, `C:/...`, `\\server\...`) is dropped with a
+// warning, as is a value of the wrong type: a fact the client cannot locate
+// is not a fact it can check.
+bool is_absolute_host_path(std::string_view p) {
+    if (p.starts_with('/')) return true;
+    if (p.starts_with("\\\\")) return true;
+    return p.size() >= 3 && std::isalpha(static_cast<unsigned char>(p[0])) &&
+           p[1] == ':' && (p[2] == '\\' || p[2] == '/');
+}
+
+std::unordered_map<std::string, std::vector<std::string>>
+get_host_facts(lua::State* L, int idx, std::vector<std::string>& warnings) {
+    std::unordered_map<std::string, std::vector<std::string>> facts;
+    lua::getfield(L, idx, "host_facts");
+    const int type = lua::type(L, -1);
+    if (type != lua::TTABLE) {
+        if (type != lua::TNIL) warnings.push_back("host_facts: not a table, dropped");
+        lua::pop(L, 1);
+        return facts;
+    }
+    if (lua::rawlen(L, -1) > 0) {
+        warnings.push_back("host_facts: a list, not a table of platforms, dropped");
+        lua::pop(L, 1);
+        return facts;
+    }
+    lua::pushnil(L);
+    while (lua::next(L, -2)) {
+        if (lua::type(L, -2) != lua::TSTRING) {
+            warnings.push_back("host_facts: a key that is not a platform name, dropped");
+            lua::pop(L, 1);
+            continue;
+        }
+        const std::string platform = lua::tostring(L, -2);
+        const std::string where = "host_facts." + platform;
+        if (lua::type(L, -1) != lua::TTABLE) {
+            warnings.push_back(where + ": not a list of paths, dropped");
+            lua::pop(L, 1);
+            continue;
+        }
+        auto& paths = facts[platform];
+        const auto count = static_cast<lua::Integer>(lua::rawlen(L, -1));
+        for (lua::Integer i = 1; i <= count; ++i) {
+            lua::rawgeti(L, -1, i);
+            const std::string at = where + "[" + std::to_string(i) + "]";
+            if (lua::type(L, -1) != lua::TSTRING) {
+                warnings.push_back(at + ": not a string, dropped");
+            } else if (std::string path = lua::tostring(L, -1); !is_absolute_host_path(path)) {
+                warnings.push_back(at + ": not an absolute path, dropped");
+            } else if (std::ranges::find(paths, path) == paths.end()) {
+                paths.push_back(std::move(path));
+            }
+            lua::pop(L, 1);
+        }
+        if (paths.empty()) facts.erase(platform);
+        lua::pop(L, 1);
+    }
+    lua::pop(L, 1);
+    return facts;
 }
 
 PackageType parse_type(const std::string& s) {
@@ -754,6 +820,11 @@ void register_build_sandbox(lua::State* L, const fs::path& script_dir) {
     // Register C++ implementations of os.files / os.isdir on the os table
     lua::getglobal(L, "os");
 
+    // os.execute: the one way a command line reaches the shell (libxpkg#52),
+    // in place of the C library's system().
+    lua::pushcfunction(L, shell::lua_execute);
+    lua::setfield(L, -2, "execute");
+
     // os.files(pattern) -> table of file paths (recursive)
     // Implemented in C++ via std::filesystem — fully cross-platform.
     lua::pushcfunction(L, [](lua::State* L) -> int {
@@ -897,12 +968,8 @@ bool run_pkgindex_build(const fs::path& repo_dir, const BuildOutput& output) {
     // Reset pkgs dir via git to ensure clean state before the build script
     // modifies files. Use git -C to avoid changing working directory.
     if (fs::exists(repo_dir / ".git")) {
-#if defined(_WIN32)
-        auto cmd = "git -C \"" + repo_dir.string() + "\" checkout -- pkgs/ 2>nul";
-#else
-        auto cmd = "git -C \"" + repo_dir.string() + "\" checkout -- pkgs/ 2>/dev/null";
-#endif
-        std::system(cmd.c_str());
+        shell::run("git -C \"" + repo_dir.string() + "\" checkout -- pkgs/",
+                   { shell::Sink::Inherit, shell::Sink::Null });
     }
 
     lua::State* L = lua::L_newstate();
@@ -997,6 +1064,7 @@ load_package(const fs::path& pkg_path, const LoaderContext& context) {
     p.programs    = loader_detail::get_str_array(L, pkg_idx, "programs");
     p.xpm         = loader_detail::parse_xpm(L, pkg_idx);
     p.extensions  = loader_detail::get_extensions(L, pkg_idx, p.warnings);
+    p.host_facts  = loader_detail::get_host_facts(L, pkg_idx, p.warnings);
 
     lua::close(L);
     return p;

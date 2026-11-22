@@ -20,9 +20,7 @@ function M.try_download_and_check(url, dir, sha256)
         return false
     end
     if sha256 then
-        local f = io.popen("sha256sum " .. dest)
-        local out = f and f:read("*l") or ""
-        if f then f:close() end
+        local out = os.iorun(string.format('sha256sum "%s"', dest)) or ""
         local actual = out:match("^(%x+)")
         if actual ~= sha256 then
             if log then log.error("sha256 mismatch for %s", dest) end

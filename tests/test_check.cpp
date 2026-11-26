@@ -183,16 +183,19 @@ TEST(CheckTest, AnIndexIsCheckedRecipeByRecipeAndItsDeclarations) {
 }
 
 // Not a unit test: the rules over a real index, for measuring them
-// (XPKG_CHECK_INDEX=<index>; --gtest_also_run_disabled_tests).
+// (XPKG_CHECK_INDEX=<index>; --gtest_also_run_disabled_tests; each finding
+// too with XPKG_CHECK_VERBOSE=1).
 TEST(CheckTest, DISABLED_ARealIndex) {
     const char* root = std::getenv("XPKG_CHECK_INDEX");
     if (!root) GTEST_SKIP() << "XPKG_CHECK_INDEX names the index";
+    const bool verbose = std::getenv("XPKG_CHECK_VERBOSE") != nullptr;
     std::map<std::string, int> counts;
     std::map<std::string, std::set<std::string>> recipes;
     for (const auto& [file, findings] : check_index(root)) {
         for (const auto& f : findings) {
             ++counts[f.code + " " + f.severity];
             recipes[f.code + " " + f.severity].insert(file);
+            if (verbose) std::println("{}:{}: {} {}: {}", file, f.line, f.severity, f.code, f.message);
         }
     }
     for (const auto& [k, n] : counts) std::println("{:28} {:5} findings in {:4} recipes", k, n, recipes[k].size());

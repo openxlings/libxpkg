@@ -191,28 +191,8 @@ os.mkdir = function(p)
     return true
 end
 
--- path module
-path = {}
-path.join = function(...)
-    local parts = {...}
-    local sep = "/"
-    local result = parts[1] or ""
-    for i = 2, #parts do
-        if parts[i] and parts[i] ~= "" then
-            result = result:gsub("[/\\]+$", "") .. sep .. parts[i]
-        end
-    end
-    return result
-end
-path.filename = function(p)
-    return (p or ""):match("[^/\\]+$") or ""
-end
-path.directory = function(p)
-    return (p or ""):match("^(.*)[/\\][^/\\]+$") or ""
-end
-path.is_absolute = function(p)
-    return (p or ""):sub(1,1) == "/" or (p or ""):match("^%a:[/\\]") ~= nil
-end
+-- path: the module (xim.libxpkg.path), as a global
+path = _LIBXPKG_MODULES["path"]
 
 -- io extensions
 io.readfile = function(p)

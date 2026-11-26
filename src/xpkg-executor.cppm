@@ -23,6 +23,7 @@ export module mcpplibs.xpkg.executor;
 import mcpplibs.xpkg;
 import mcpplibs.xpkg.lua_stdlib;
 import mcpplibs.xpkg.shell;
+import mcpplibs.xpkg.fs;
 import mcpplibs.capi.lua;
 import std;
 
@@ -210,6 +211,17 @@ struct XvmOp {
     std::vector<std::pair<std::string, std::string>> envs; // environment variables
 };
 
+// What a host lends the hooks it runs, as functions (design 2026-11-27 §9.7).
+// libxpkg carries no implementation of them; a call to a port the host did
+// not give is an error of that call, named.
+struct HostPorts {
+    // Unpack `archive` into the directory `dir` (created when missing),
+    // dropping the first `strip` components of every member's path; a member
+    // with fewer components is an error, never dropped. An error message, or
+    // nothing when done.
+    std::function<std::optional<std::string>(const fs::path& archive, const fs::path& dir, int strip)> extract;
+};
+
 struct InstallRequest {
     std::string op;      // "install" | "remove" | "admin" (system.admin_step)
     std::string target;  // e.g. "scode:linux-headers@5.11.1"; for "admin": why, then
@@ -268,390 +280,6 @@ void set_string_field(lua::State* L, std::string_view key, std::string_view val)
     lua::setfield(L, -2, std::string(key).c_str());
 }
 
-// Register C++ std::filesystem implementations of os.isdir and os.dirs.
-// Called after the Lua prelude to override the shell-based versions.
-void register_os_funcs(lua::State* L) {
-    lua::getglobal(L, "os");
-    if (lua::type(L, -1) != lua::TTABLE) {
-        lua::pop(L, 1);
-        lua::newtable(L);
-        lua::setglobal(L, "os");
-        lua::getglobal(L, "os");
-    }
-
-    // os.execute runs through shell::run, the one way a command line reaches
-    // the shell (libxpkg#52); the child inherits fd 1 and 2. While a hook runs
-    // with ExecutionContext::hook_log, os.execute is replaced by a version that
-    // sends the child's output to the log; a command that needs the terminal
-    // (system.exec's `tty`) reaches this one under an internal name.
-    // Deliberately not an os.* function: recipes should not depend on it.
-    lua::pushcfunction(L, shell::lua_execute);
-    lua::setfield(L, -2, "execute");
-    lua::pushcfunction(L, shell::lua_execute);
-    lua::setglobal(L, "_LIBXPKG_EXEC_INHERIT");
-
-    // os.isdir(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        lua::pushboolean(L, fs::is_directory(fs::path(p), ec) ? 1 : 0);
-        return 1;
-    });
-    lua::setfield(L, -2, "isdir");
-
-    // os.dirs(pattern) -> table of absolute dir paths
-    // Accepts "base/*" style pattern; strips trailing /* to get the base directory.
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* pat = lua::tostring(L, 1);
-        lua::newtable(L);
-        if (!pat) return 1;
-        std::string s(pat);
-        // Strip trailing /* or \*
-        if (s.size() >= 2 && s.back() == '*' &&
-            (s[s.size()-2] == '/' || s[s.size()-2] == '\\')) {
-            s.pop_back(); s.pop_back();
-        }
-        while (!s.empty() && (s.back() == '/' || s.back() == '\\'))
-            s.pop_back();
-        fs::path base(s);
-        std::error_code ec;
-        if (!fs::is_directory(base, ec)) return 1;
-        int idx = 1;
-        for (auto& entry : fs::directory_iterator(base, ec)) {
-            if (entry.is_directory(ec)) {
-                lua::pushstring(L, entry.path().string().c_str());
-                lua::rawseti(L, -2, idx++);
-            }
-        }
-        return 1;
-    });
-    lua::setfield(L, -2, "dirs");
-
-    // os.cd(dir) -> bool
-    // Real chdir so that subsequent os.execute / system.exec inherit the new CWD.
-    // Safe: hook calls are wrapped in ScopedCurrentDir_ which restores CWD on return.
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        fs::current_path(fs::path(p), ec);
-        lua::pushboolean(L, ec ? 0 : 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "cd");
-
-    // os.cp(src, dst) -> bool
-    // Mimics `cp -a`: when src is a dir and dst is an existing dir,
-    // copies src as a subdirectory of dst (i.e. dst/src_name/...).
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* src = lua::tostring(L, 1);
-        const char* dst = lua::tostring(L, 2);
-        if (!src || !dst) { lua::pushboolean(L, 0); return 1; }
-        fs::path sp(src), dp(dst);
-        std::error_code ec;
-        // cp -a semantics: dir into existing dir → dst/basename(src)/...
-        if (fs::is_directory(sp, ec) && fs::is_directory(dp, ec))
-            dp /= sp.filename();
-        fs::copy(sp, dp,
-                 fs::copy_options::recursive |
-                 fs::copy_options::copy_symlinks |
-                 fs::copy_options::overwrite_existing, ec);
-        lua::pushboolean(L, ec ? 0 : 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "cp");
-
-    // os.trymv(src, dst) -> bool  (rename, fallback to copy+remove)
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* s = lua::tostring(L, 1);
-        const char* d = lua::tostring(L, 2);
-        if (!s || !d) { lua::pushboolean(L, 0); return 1; }
-        fs::path src(s), dst(d);
-        std::error_code ec;
-        // If dst is existing dir, move into it (unix mv semantics)
-        if (fs::is_directory(dst, ec)) dst /= src.filename();
-        fs::rename(src, dst, ec);
-        if (!ec) { lua::pushboolean(L, 1); return 1; }
-        // Cross-device: copy + remove
-        ec.clear();
-        fs::copy(src, dst,
-                 fs::copy_options::recursive |
-                 fs::copy_options::copy_symlinks |
-                 fs::copy_options::overwrite_existing, ec);
-        if (ec) { lua::pushboolean(L, 0); return 1; }
-        fs::remove_all(src, ec);
-        lua::pushboolean(L, 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "trymv");
-    // Also set os.mv = os.trymv
-    lua::getfield(L, -1, "trymv");
-    lua::setfield(L, -2, "mv");
-
-    // os.tryrm(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        fs::remove_all(fs::path(p), ec);
-        lua::pushboolean(L, 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "tryrm");
-
-    // os.mkdir(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        fs::create_directories(fs::path(p), ec);
-        lua::pushboolean(L, ec ? 0 : 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "mkdir");
-
-    // os.isfile(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        lua::pushboolean(L, fs::is_regular_file(fs::path(p), ec) ? 1 : 0);
-        return 1;
-    });
-    lua::setfield(L, -2, "isfile");
-
-    // os.iorun(cmd) -> string: stdout read through a pipe, stderr discarded.
-    // Nothing is appended to the caller's line, so a redirect it carries
-    // keeps its meaning and a quoted program path is not re-quoted.
-    lua::pushcfunction(L, shell::lua_iorun);
-    lua::setfield(L, -2, "iorun");
-
-    lua::pop(L, 1); // pop os table
-}
-
-// Register C++-backed fs module into _LIBXPKG_MODULES["fs"].
-// Provides filesystem primitives that are missing from the os.* layer:
-// symlink creation/reading, file/dir enumeration, single-file copy, etc.
-// All functions use std::filesystem — no shell commands.
-void register_fs_module(lua::State* L) {
-    lua::newtable(L);  // the fs module table
-
-    // fs.symlink(src, dst) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* src = lua::tostring(L, 1);
-        const char* dst = lua::tostring(L, 2);
-        if (!src || !dst) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        fs::path sp(src);
-        if (fs::is_directory(sp, ec))
-            fs::create_directory_symlink(sp, fs::path(dst), ec);
-        else
-            fs::create_symlink(sp, fs::path(dst), ec);
-        lua::pushboolean(L, ec ? 0 : 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "symlink");
-
-    // fs.readlink(path) -> string | nil
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushnil(L); return 1; }
-        std::error_code ec;
-        auto target = fs::read_symlink(fs::path(p), ec);
-        if (ec) { lua::pushnil(L); return 1; }
-        lua::pushstring(L, target.string().c_str());
-        return 1;
-    });
-    lua::setfield(L, -2, "readlink");
-
-    // fs.is_symlink(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        lua::pushboolean(L, fs::is_symlink(fs::path(p), ec) ? 1 : 0);
-        return 1;
-    });
-    lua::setfield(L, -2, "is_symlink");
-
-    // fs.exists(path) -> bool  (follows symlinks)
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        lua::pushboolean(L, fs::exists(fs::path(p), ec) ? 1 : 0);
-        return 1;
-    });
-    lua::setfield(L, -2, "exists");
-
-    // fs.is_directory(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        lua::pushboolean(L, fs::is_directory(fs::path(p), ec) ? 1 : 0);
-        return 1;
-    });
-    lua::setfield(L, -2, "is_directory");
-
-    // fs.is_file(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        lua::pushboolean(L, fs::is_regular_file(fs::path(p), ec) ? 1 : 0);
-        return 1;
-    });
-    lua::setfield(L, -2, "is_file");
-
-    // fs.mkdir_p(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        fs::create_directories(fs::path(p), ec);
-        lua::pushboolean(L, ec ? 0 : 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "mkdir_p");
-
-    // fs.remove(path) -> bool  (single file or empty dir)
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        lua::pushboolean(L, fs::remove(fs::path(p), ec) ? 1 : 0);
-        return 1;
-    });
-    lua::setfield(L, -2, "remove");
-
-    // fs.remove_all(path) -> bool
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        fs::remove_all(fs::path(p), ec);
-        lua::pushboolean(L, 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "remove_all");
-
-    // fs.copy_file(src, dst) -> bool  (single file, overwrite)
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* src = lua::tostring(L, 1);
-        const char* dst = lua::tostring(L, 2);
-        if (!src || !dst) { lua::pushboolean(L, 0); return 1; }
-        std::error_code ec;
-        fs::copy_file(fs::path(src), fs::path(dst),
-                      fs::copy_options::overwrite_existing, ec);
-        lua::pushboolean(L, ec ? 0 : 1);
-        return 1;
-    });
-    lua::setfield(L, -2, "copy_file");
-
-    // fs.entries(dir) -> table of {path, name, type}
-    // type: "file", "directory", "symlink", "other"
-    // Non-recursive. Returns full paths.
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* dir = lua::tostring(L, 1);
-        lua::newtable(L);
-        if (!dir) return 1;
-        std::error_code ec;
-        fs::path dp(dir);
-        if (!fs::is_directory(dp, ec)) return 1;
-        int idx = 1;
-        for (auto& entry : fs::directory_iterator(dp, ec)) {
-            lua::newtable(L);
-            lua::pushstring(L, entry.path().string().c_str());
-            lua::setfield(L, -2, "path");
-            lua::pushstring(L, entry.path().filename().string().c_str());
-            lua::setfield(L, -2, "name");
-            const char* etype = "other";
-            if (entry.is_symlink(ec))          etype = "symlink";
-            else if (entry.is_regular_file(ec)) etype = "file";
-            else if (entry.is_directory(ec))    etype = "directory";
-            lua::pushstring(L, etype);
-            lua::setfield(L, -2, "type");
-            lua::rawseti(L, -2, idx++);
-        }
-        return 1;
-    });
-    lua::setfield(L, -2, "entries");
-
-    // fs.files(dir, recursive?) -> table of file paths
-    // recursive: optional bool, default false
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* dir = lua::tostring(L, 1);
-        bool recursive = lua::toboolean(L, 2);
-        lua::newtable(L);
-        if (!dir) return 1;
-        std::error_code ec;
-        fs::path dp(dir);
-        if (!fs::is_directory(dp, ec)) return 1;
-        int idx = 1;
-        if (recursive) {
-            for (auto& entry : fs::recursive_directory_iterator(dp, ec)) {
-                if (entry.is_regular_file(ec)) {
-                    lua::pushstring(L, entry.path().string().c_str());
-                    lua::rawseti(L, -2, idx++);
-                }
-            }
-        } else {
-            for (auto& entry : fs::directory_iterator(dp, ec)) {
-                if (entry.is_regular_file(ec)) {
-                    lua::pushstring(L, entry.path().string().c_str());
-                    lua::rawseti(L, -2, idx++);
-                }
-            }
-        }
-        return 1;
-    });
-    lua::setfield(L, -2, "files");
-
-    // fs.dirs(dir) -> table of subdirectory paths (non-recursive)
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* dir = lua::tostring(L, 1);
-        lua::newtable(L);
-        if (!dir) return 1;
-        std::error_code ec;
-        fs::path dp(dir);
-        if (!fs::is_directory(dp, ec)) return 1;
-        int idx = 1;
-        for (auto& entry : fs::directory_iterator(dp, ec)) {
-            if (entry.is_directory(ec)) {
-                lua::pushstring(L, entry.path().string().c_str());
-                lua::rawseti(L, -2, idx++);
-            }
-        }
-        return 1;
-    });
-    lua::setfield(L, -2, "dirs");
-
-    // fs.basename(path) -> string
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushstring(L, ""); return 1; }
-        lua::pushstring(L, fs::path(p).filename().string().c_str());
-        return 1;
-    });
-    lua::setfield(L, -2, "basename");
-
-    // fs.dirname(path) -> string
-    lua::pushcfunction(L, [](lua::State* L) -> int {
-        const char* p = lua::tostring(L, 1);
-        if (!p) { lua::pushstring(L, ""); return 1; }
-        lua::pushstring(L, fs::path(p).parent_path().string().c_str());
-        return 1;
-    });
-    lua::setfield(L, -2, "dirname");
-
-    // Store into _LIBXPKG_MODULES["fs"]
-    lua::getglobal(L, "_LIBXPKG_MODULES");
-    lua::insert(L, -2);       // stack: [modules, fs_table]
-    lua::setfield(L, -2, "fs");  // modules["fs"] = fs_table
-    lua::pop(L, 1);           // pop modules
-}
 
 // _LIBXPKG_ARCHS: the architecture identity table (arch_identities()) for the
 // Lua side, keyed by every canonical name and alias: { machine = e_machine,
@@ -698,6 +326,7 @@ bool load_stdlib(lua::State* L, std::string& err_out) {
         { "elfpatch",   detail::elfpatch_lua   },
         { "json",       detail::json_lua       },
         { "base64",     detail::base64_lua     },
+        { "path",       detail::path_lua       },
     };
 
     for (auto& m : mods) {
@@ -1197,6 +826,149 @@ std::vector<mcpplibs::xpkg::HookNotice> collect_notices(lua::State* L) {
     return notices;
 }
 
+// ---- The process and extraction functions a hook reaches (design §9.6, §9.7) ----
+
+// The command of system.exec / system.run: a string is one shell line, a list
+// is a program and its arguments. Read without raising: what is wrong is
+// returned, and system.lua raises it at the recipe's line.
+std::expected<shell::Command, std::string> read_command(lua::State* L) {
+    shell::Command command;
+    if (lua::type(L, 1) == lua::TSTRING) {
+        command.line = lua::tostring(L, 1);
+    } else if (lua::type(L, 1) == lua::TTABLE) {
+        const auto count = static_cast<lua::Integer>(lua::rawlen(L, 1));
+        if (count == 0) return std::unexpected("the command list is empty");
+        for (lua::Integer i = 1; i <= count; ++i) {
+            lua::rawgeti(L, 1, i);
+            const int type = lua::type(L, -1);
+            if (type != lua::TSTRING && type != lua::TNUMBER) {
+                std::string what = lua::L_typename(L, -1);
+                lua::pop(L, 1);
+                return std::unexpected(std::format("element {} of the command list is a {}, not a string", i, what));
+            }
+            command.argv.emplace_back(lua::tostring(L, -1));
+            lua::pop(L, 1);
+        }
+    } else {
+        return std::unexpected(std::format("the command is a {}, not a string or a list", lua::L_typename(L, 1)));
+    }
+    if (lua::type(L, 2) == lua::TTABLE) {
+        lua::getfield(L, 2, "cwd");
+        if (lua::type(L, -1) == lua::TSTRING) command.cwd = lua::tostring(L, -1);
+        else if (lua::type(L, -1) != lua::TNIL) {
+            lua::pop(L, 1);
+            return std::unexpected("cwd is not a string");
+        }
+        lua::pop(L, 1);
+        lua::getfield(L, 2, "env");
+        if (lua::type(L, -1) == lua::TTABLE) {
+            lua::pushnil(L);
+            while (lua::next(L, -2)) {
+                if (lua::type(L, -2) != lua::TSTRING || lua::type(L, -1) != lua::TSTRING) {
+                    lua::pop(L, 3);
+                    return std::unexpected("env maps names to strings");
+                }
+                command.env.emplace_back(lua::tostring(L, -2), lua::tostring(L, -1));
+                lua::pop(L, 1);
+            }
+        } else if (lua::type(L, -1) != lua::TNIL) {
+            lua::pop(L, 1);
+            return std::unexpected("env is not a table");
+        }
+        lua::pop(L, 1);
+        // Same order on every run: environment entries are a set.
+        std::ranges::sort(command.env);
+    }
+    return command;
+}
+
+bool option_flag(lua::State* L, const char* name) {
+    if (lua::type(L, 2) != lua::TTABLE) return false;
+    lua::getfield(L, 2, name);
+    const bool on = lua::toboolean(L, -1);
+    lua::pop(L, 1);
+    return on;
+}
+
+// _LIBXPKG_SPAWN(cmd, opt) -> status, code, output, message. Never raises:
+// status is "exit" | "signal" | "failed" (could not start) | "refused"
+// (will not start it as written). The child's stdout and stderr go to the
+// hook log while one is kept (the terminal for opt.tty, the result for
+// opt.capture's stdout). Upvalue 1 is the executor's HookLog.
+int lua_spawn(lua::State* L) {
+    auto* log = static_cast<HookLog*>(lua::touserdata(L, lua::upvalueindex(1)));
+    const bool capture = option_flag(L, "capture");
+    const bool tty = option_flag(L, "tty");
+    {
+        auto command = read_command(L);
+        if (!command) {
+            lua::pushstring(L, "refused");
+            lua::pushinteger(L, 0);
+            lua::pushstring(L, "");
+            lua::pushstring(L, command.error().c_str());
+            return 4;
+        }
+        const bool logged = log && log->active() && !tty;
+        shell::Streams streams;
+        streams.out = capture ? shell::Sink::Capture : (logged ? shell::Sink::File : shell::Sink::Inherit);
+        streams.err = logged ? shell::Sink::File : shell::Sink::Inherit;
+        streams.file = logged ? log->file() : shell::kNoFile;
+        const auto ran = shell::spawn(*command, streams);
+        const char* status = "failed";
+        switch (ran.status.kind) {
+            case shell::Status::Kind::Exit:    status = "exit"; break;
+            case shell::Status::Kind::Signal:  status = "signal"; break;
+            case shell::Status::Kind::Failed:  status = "failed"; break;
+            case shell::Status::Kind::Refused: status = "refused"; break;
+        }
+        lua::pushstring(L, status);
+        lua::pushinteger(L, ran.status.code);
+        lua::pushlstring(L, ran.output.data(), ran.output.size());
+        if (ran.status.message.empty()) lua::pushnil(L);
+        else lua::pushstring(L, ran.status.message.c_str());
+    }
+    return 4;
+}
+
+// fs.extract(archive, dir, { strip = n }): the host's extractor (its port),
+// as an action. Upvalue 1 is the executor's HostPorts.
+int lua_extract(lua::State* L) {
+    auto* ports = static_cast<mcpplibs::xpkg::HostPorts*>(lua::touserdata(L, lua::upvalueindex(1)));
+    const char* archive = lua::L_checklstring(L, 1, nullptr);
+    const char* dir = lua::L_checklstring(L, 2, nullptr);
+    lua::Integer strip = 0;
+    bool strip_ok = true;
+    if (lua::type(L, 3) == lua::TTABLE) {
+        lua::getfield(L, 3, "strip");
+        if (lua::isinteger(L, -1)) strip = lua::tointeger(L, -1);
+        else if (lua::type(L, -1) != lua::TNIL) strip_ok = false;
+        lua::pop(L, 1);
+    }
+    bool bad = false;
+    {
+        fsapi::Error error;
+        if (!strip_ok || strip < 0 || strip > 64) {
+            error = fsapi::describe("extract", archive, "strip is a whole number of path components (0 or more)");
+        } else if (!ports || !ports->extract) {
+            error = fsapi::describe("extract", archive, "this host gives hooks no extractor");
+        } else {
+            try {
+                if (auto why = ports->extract(archive, dir, static_cast<int>(strip)))
+                    error = fsapi::describe("extract", archive, *why);
+            } catch (const std::exception& e) {
+                error = fsapi::describe("extract", archive, e.what());
+            }
+        }
+        if (error) {
+            fsapi::push_error(L, *error);
+            bad = true;
+        }
+    }
+    if (bad) return lua::error(L);
+    lua::pushboolean(L, 1);
+    return 1;
+}
+
 // One warning through the log module. Called with capture already installed,
 // so it lands in HookResult::output and not on the terminal.
 void warn_through_log_module(lua::State* L, const std::string& message) {
@@ -1366,10 +1138,38 @@ class PackageExecutor {
         std::make_unique<detail::HookOutput>();
     std::unique_ptr<detail::HookLog> hookLog_ =
         std::make_unique<detail::HookLog>();
+    // Heap-held like the two above: the Lua closures registered in the
+    // constructor keep its address, and the executor may be moved.
+    std::unique_ptr<HostPorts> ports_ = std::make_unique<HostPorts>();
+
+    // The functions whose state is this executor's: the process layer (it
+    // writes to the hook log) and the host's extractor.
+    void register_host_functions_() {
+        lua::pushlightuserdata(L_, hookLog_.get());
+        lua::pushcclosure(L_, detail::lua_spawn, 1);
+        lua::setglobal(L_, "_LIBXPKG_SPAWN");
+        lua::getglobal(L_, "_LIBXPKG_MODULES");
+        if (lua::type(L_, -1) == lua::TTABLE) {
+            lua::getfield(L_, -1, "fs");
+            if (lua::type(L_, -1) == lua::TTABLE) {
+                lua::pushlightuserdata(L_, ports_.get());
+                lua::pushcclosure(L_, detail::lua_extract, 1);
+                lua::setfield(L_, -2, "extract");
+            }
+            lua::pop(L_, 1);
+        }
+        lua::pop(L_, 1);
+    }
 
 public:
     explicit PackageExecutor(lua::State* L, fs::path pkg)
-        : L_(L), pkg_(std::move(pkg)) {}
+        : L_(L), pkg_(std::move(pkg)) {
+        if (L_) register_host_functions_();
+    }
+
+    // What the host lends this package's hooks (fs.extract). A boundary
+    // executor's hooks run elsewhere: the worker sets its own (HookWorker).
+    void set_host_ports(HostPorts ports) { *ports_ = std::move(ports); }
 
     PackageExecutor(fs::path pkg, ExecutionBoundary boundary, HookResponse loaded);
 
@@ -1388,7 +1188,8 @@ public:
           boundaryContext_(std::move(o.boundaryContext_)),
           boundaryError_(std::move(o.boundaryError_)),
           hookOutput_(std::move(o.hookOutput_)),
-          hookLog_(std::move(o.hookLog_)) {}
+          hookLog_(std::move(o.hookLog_)),
+          ports_(std::move(o.ports_)) {}
 
     PackageExecutor& operator=(PackageExecutor&& o) noexcept {
         if (this != &o) {
@@ -1401,6 +1202,7 @@ public:
             boundaryError_ = std::move(o.boundaryError_);
             hookOutput_ = std::move(o.hookOutput_);
             hookLog_ = std::move(o.hookLog_);
+            ports_ = std::move(o.ports_);
         }
         return *this;
     }
@@ -1765,13 +1567,13 @@ create_executor(const fs::path& pkg_path) {
         }
     }
 
+    // Before the recipe runs: its top level may already start a program.
+    PackageExecutor executor(L, pkg_path);
     if (lua::L_dofile(L, pkg_path.string().c_str()) != lua::OK) {
         err = lua::tostring(L, -1);
-        lua::close(L);
         return std::unexpected("failed to load package: " + err);
     }
-
-    return PackageExecutor(L, pkg_path);
+    return executor;
 }
 
 
@@ -1785,8 +1587,11 @@ create_executor(const fs::path& pkg_path, ExecutionBoundary boundary);
 class HookWorker {
     std::optional<PackageExecutor> executor_;
     fs::path package_;
+    HostPorts ports_;
 
 public:
+    // What the hooks this worker runs are lent (the worker is the host).
+    void set_host_ports(HostPorts ports) { ports_ = std::move(ports); }
     std::expected<HookResponse, std::string> dispatch(const HookInvocation& invocation);
 };
 

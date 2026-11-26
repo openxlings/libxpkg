@@ -45,6 +45,7 @@ constexpr Module MODULES[] = {
     {"elfpatch_lua",   "src/lua-stdlib/xim/libxpkg/elfpatch.lua"},
     {"json_lua",       "src/lua-stdlib/xim/libxpkg/json.lua"},
     {"base64_lua",     "src/lua-stdlib/xim/libxpkg/base64.lua"},
+    {"path_lua",       "src/lua-stdlib/xim/libxpkg/path.lua"},
 };
 
 [[noreturn]] void fail(std::string_view what, const fs::path& p) {

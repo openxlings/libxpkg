@@ -68,6 +68,7 @@ std::expected<HookResponse, std::string> HookWorker::dispatch(const HookInvocati
         if (!loaded) return std::unexpected(loaded.error());
         package_ = invocation.package;
         executor_.emplace(std::move(*loaded));
+        executor_->set_host_ports(ports_);
     } else if (!executor_) {
         return std::unexpected("hook worker must load a package before executing it");
     } else if (invocation.package != package_) {

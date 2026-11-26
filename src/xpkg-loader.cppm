@@ -50,10 +50,10 @@ build_index_impl(const fs::path& repo_dir, const std::string& defaultNamespace,
                  const LoaderBoundaries* boundaries);
 
 
-// Register loader sandbox: no-op import() + defensive stubs for non-standard
-// globals. This gives the loader a self-contained pure Lua 5.4 environment
-// that does not depend on any xmake runtime. Stubs ensure legacy or
-// third-party packages can still be loaded without crashing.
+// Register loader sandbox: no-op import() + defensive stubs for the
+// compatibility layer's names (compat.lua), so that reading the `package`
+// table of a recipe of spec "1" or "2" runs none of its hooks and needs none
+// of the executor's modules.
 void register_loader_sandbox(
     lua::State* L,
     std::string_view platform,
@@ -63,8 +63,8 @@ void register_loader_sandbox(
     lua::pushstring(L, std::string(arch).c_str());
     lua::setglobal(L, "__xpkg_arch__");
     lua::L_dostring(L,
-        // no-op import: returns a deep proxy and sets it as a global
-        // (matches xmake behavior where import("platform") sets _G.platform)
+        // no-op import: returns a deep proxy and binds it to the global of the
+        // module's last name, as the executor's import does
         // The proxy returns '' for string operations and nested proxies for
         // chained access like platform.get_config_info().rundir
         "do "
@@ -1024,7 +1024,7 @@ load_package(const fs::path& pkg_path, const LoaderContext& context) {
     if (!L) return std::unexpected("failed to create lua state");
     lua::L_openlibs(L);
 
-    // Register loader sandbox (pure Lua 5.4, no xmake dependency)
+    // Register loader sandbox: stubs for the compatibility layer's names
     loader_detail::register_loader_sandbox(
         L, context.platform, normalize_arch(context.arch));
 

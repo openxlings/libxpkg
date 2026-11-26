@@ -141,6 +141,15 @@ struct ElfpatchResult {
     std::string tool_missing;  // the tool files needed and that was not found
 };
 
+// A call of the compatibility layer that did not do what it names (os.mv,
+// os.cp, os.mkdir, os.exec): it returned false or a failure status as it
+// always did, and is reported here (design 2026-11-27 §9.6).
+struct HookCallFailure {
+    std::string call;  // "os.mv"
+    std::string what;  // its arguments, as text: "<src> -> <dst>"
+    std::string why;   // the system's reason, or how the command ended
+};
+
 struct HookResult {
     bool success = false;
     std::string output, error;
@@ -151,6 +160,9 @@ struct HookResult {
     // Set by apply_elfpatch_auto only. `output` keeps its "<scanned> <patched>
     // <failed>" text for hosts that read it.
     std::optional<ElfpatchResult> elfpatch;
+    // The compatibility layer's calls that failed during this hook, in order
+    // (at most 100).
+    std::vector<HookCallFailure> call_failures;
 };
 
 struct XvmOp {
@@ -230,7 +242,7 @@ struct InstallRequest {
 
 enum class HookType { Installed, Build, Install, Config, Uninstall };
 
-// 2: HookResult carries notices and the elfpatch result.
+// 2: HookResult carries notices, the elfpatch result and call failures.
 inline constexpr int kHookBoundaryProtocol = 2;
 enum class HookAction { Load, RunHook, RunScript, Elfpatch, SetLogLevel };
 std::string_view hook_action_name(HookAction action);
@@ -306,7 +318,7 @@ void inject_arch_identities(lua::State* L) {
     lua::setglobal(L, "_LIBXPKG_ARCHS");
 }
 
-// Load all xim.libxpkg.* modules into _LIBXPKG_MODULES table, then run prelude
+// Load all xim.libxpkg.* modules into _LIBXPKG_MODULES, then the compatibility layer
 bool load_stdlib(lua::State* L, std::string& err_out) {
     // Create empty _LIBXPKG_MODULES table
     lua::newtable(L);
@@ -352,14 +364,14 @@ bool load_stdlib(lua::State* L, std::string& err_out) {
         lua::pop(L, 1);                          // stack: []
     }
 
-    // Load prelude: defines import(), os.*, path.*, etc.
-    if (lua::L_loadstring(L, detail::prelude_lua.data()) != lua::OK) {
-        err_out = "failed to load prelude: " + std::string(lua::tostring(L, -1));
+    // The compatibility layer: import(), the os/io/global names of spec 1 and 2.
+    if (lua::L_loadstring(L, detail::compat_lua.data()) != lua::OK) {
+        err_out = "failed to load the compatibility layer: " + std::string(lua::tostring(L, -1));
         lua::pop(L, 1);
         return false;
     }
     if (lua::pcall(L, 0, 0, 0) != lua::OK) {
-        err_out = "failed to run prelude: " + std::string(lua::tostring(L, -1));
+        err_out = "failed to run the compatibility layer: " + std::string(lua::tostring(L, -1));
         lua::pop(L, 1);
         return false;
     }
@@ -785,10 +797,42 @@ int hooked_os_execute(lua::State* L) {
     return 3;
 }
 
-// _LIBXPKG_NOTICES: the list log.warn / log.error append to while a hook runs.
+// _LIBXPKG_NOTICES: the list log.warn / log.error append to while a hook runs;
+// _LIBXPKG_CALL_FAILURES: the one compat.lua's _LIBXPKG_CALL_FAILED appends to.
 void begin_notices(lua::State* L) {
     lua::newtable(L);
     lua::setglobal(L, "_LIBXPKG_NOTICES");
+    lua::newtable(L);
+    lua::setglobal(L, "_LIBXPKG_CALL_FAILURES");
+}
+
+std::vector<mcpplibs::xpkg::HookCallFailure> collect_call_failures(lua::State* L) {
+    std::vector<mcpplibs::xpkg::HookCallFailure> failures;
+    lua::getglobal(L, "_LIBXPKG_CALL_FAILURES");
+    if (lua::type(L, -1) == lua::TTABLE) {
+        const auto count = static_cast<lua::Integer>(lua::rawlen(L, -1));
+        for (lua::Integer i = 1; i <= count; ++i) {
+            lua::rawgeti(L, -1, i);
+            if (lua::type(L, -1) == lua::TTABLE) {
+                mcpplibs::xpkg::HookCallFailure f;
+                auto text = [&](const char* key) {
+                    lua::getfield(L, -1, key);
+                    std::string v = lua::type(L, -1) == lua::TSTRING ? lua::tostring(L, -1) : "";
+                    lua::pop(L, 1);
+                    return v;
+                };
+                f.call = text("call");
+                f.what = text("what");
+                f.why = text("why");
+                failures.push_back(std::move(f));
+            }
+            lua::pop(L, 1);
+        }
+    }
+    lua::pop(L, 1);
+    lua::pushnil(L);
+    lua::setglobal(L, "_LIBXPKG_CALL_FAILURES");
+    return failures;
 }
 
 std::vector<mcpplibs::xpkg::HookNotice> collect_notices(lua::State* L) {
@@ -1275,6 +1319,7 @@ public:
             result.error = std::string(name) + " hook failed";
         }
         result.notices = detail::collect_notices(L_);
+        result.call_failures = detail::collect_call_failures(L_);
         result.output = capture.finish();
 
         return result;
@@ -1491,6 +1536,7 @@ public:
             lua::pop(L_, 1);
         }
         result.notices = detail::collect_notices(L_);
+        result.call_failures = detail::collect_call_failures(L_);
         return result;
     }
 

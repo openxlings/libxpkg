@@ -8,10 +8,11 @@
 // the repository can be in.
 //
 // It has been in that state. `xvm.files` shipped in 0.0.47 as an edit to the
-// generated file alone; the .lua that is nominally its source never had it. An
-// earlier xmake before_build hook would have regenerated from that stale source
-// and silently deleted the feature from the shipped stdlib. Nothing checked,
-// because a build that reads neither copy cannot notice they disagree.
+// generated file alone; the .lua that is nominally its source never had it. A
+// build step that regenerated before every build would have regenerated from
+// that stale source and silently deleted the feature from the shipped stdlib.
+// Nothing checked, because a build that reads neither copy cannot notice they
+// disagree.
 //
 // Writes go to MCPP_OUT_DIR, never the package root: as a registry dependency
 // this package's root is shared between projects and may be read-only.
@@ -34,7 +35,7 @@ struct Module {
 
 // Order is the load order in xpkg-executor.cppm's load_stdlib.
 constexpr Module MODULES[] = {
-    {"prelude_lua",    "src/lua-stdlib/prelude.lua"},
+    {"compat_lua",     "src/lua-stdlib/compat.lua"},
     {"log_lua",        "src/lua-stdlib/xim/libxpkg/log.lua"},
     {"pkginfo_lua",    "src/lua-stdlib/xim/libxpkg/pkginfo.lua"},
     {"system_lua",     "src/lua-stdlib/xim/libxpkg/system.lua"},

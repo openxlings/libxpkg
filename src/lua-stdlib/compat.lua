@@ -1,14 +1,44 @@
--- prelude.lua: xmake compatibility layer + import() for libxpkg runtime
--- Loaded by PackageExecutor before any package script.
+-- compat.lua: the compatibility layer of the hook environment, and import().
+--
+-- Recipes of spec "1" and "2" were written against names that live here, in
+-- Lua's own tables and the globals: os.mv, os.cp, os.mkdir, os.tryrm,
+-- os.isfile, os.exec, io.readfile, string.replace, the global path, format,
+-- raise, is_host, try, cprint, and an import() that returns a stub for a
+-- module it does not know. Such a name reports a failure by its return value
+-- (or not at all: os.tryrm is always true), so a call written as a statement
+-- loses it.
+--
+-- The layer is frozen (design 2026-11-27 §9.6): every name keeps exactly the
+-- behaviour it has, and no name is added. The interface that replaces it is the
+-- modules (xim.libxpkg.fs, .system, .pkginfo, .path): an action states what
+-- holds when it returns and raises otherwise. A recipe of spec "3" runs in an
+-- environment without this layer. It stays because installed packages keep
+-- the recipe they were installed with, and third-party and local recipes are
+-- not migrated by anyone. What it adds over the old behaviour is a record:
+-- os.mv, os.cp, os.mkdir and os.exec failing are noted for the host
+-- (HookResult::call_failures); what they return is unchanged.
+--
+-- Loaded into every Lua state the executor makes, after the modules; the
+-- module implementations use some of these names themselves.
 
 -- _LIBXPKG_MODULES is populated by C++ before this file runs
 _LIBXPKG_MODULES = _LIBXPKG_MODULES or {}
 
+-- A failed action of this layer, noted for the host (HookResult::call_failures)
+-- while a hook runs; the name keeps returning what it always returned.
+function _LIBXPKG_CALL_FAILED(call, what, why)
+    local list = _LIBXPKG_CALL_FAILURES
+    if type(list) == "table" and #list < 100 then
+        table.insert(list, { call = call, what = what, why = why })
+    end
+end
+
 -- Save Lua's built-in package.config before xpkg scripts overwrite `package` global
 local _PATH_SEP = package.config:sub(1,1)
 
--- import(): maps "xim.libxpkg.X" to preloaded modules
--- Also registers module as global variable (xmake compat: bare import() sets global)
+-- import(): maps "xim.libxpkg.X" to preloaded modules, and binds the module to
+-- the global of its last name as well (import("xim.libxpkg.log") makes `log`),
+-- which is how recipes of spec "1" and "2" use it.
 function import(mod_path)
     local name = mod_path:match("xim%.libxpkg%.(.+)")
     if name and _LIBXPKG_MODULES[name] then
@@ -62,7 +92,8 @@ function import(mod_path)
     return stub
 end
 
--- os.* extensions (xmake compat)
+-- os.*: the file and process names of the layer. The executor replaces most
+-- of these with C++ functions after this file runs (register_os_funcs).
 os.isfile = function(p)
     -- io.open succeeds on directories on Linux (fopen quirk), so also check it's not a dir
     local f = io.open(p, "r")
@@ -112,7 +143,7 @@ os.trymv = function(src, dst)
 end
 os.mv = function(src, dst) return os.trymv(src, dst) end
 os.cp = function(src, dst, opts)
-    -- opts accepted for xmake compat but ignored (cp -a already preserves symlinks)
+    -- opts is accepted and ignored: cp -a already keeps links as links
     -- Try shell cp first (handles directories, symlinks, etc.)
     local sep = _PATH_SEP
     if sep ~= "\\" then
@@ -164,7 +195,12 @@ os.exec = function(cmd)
         end
         if prefix ~= "" then cmd = prefix .. cmd end
     end
-    return os.execute(cmd)
+    local ok, how, code = os.execute(cmd)
+    if not (ok == true or ok == 0) then
+        _LIBXPKG_CALL_FAILED("os.exec", tostring(cmd), how == "exit" and ("exited with " .. tostring(code))
+            or how == "signal" and ("was killed by signal " .. tostring(code)) or tostring(how))
+    end
+    return ok, how, code
 end
 os.tryrm = function(p)
     if not p then return false end
@@ -244,7 +280,8 @@ if not string.trim then
     end
 end
 
--- xmake compat globals
+-- Globals of the layer: the host's platform, string.format and error under
+-- other names.
 function is_host(name)
     local host = _RUNTIME and _RUNTIME.platform or os.host()
     return host == name
@@ -252,10 +289,11 @@ end
 format = string.format
 raise = function(msg) error(msg or "raise called", 2) end
 
--- string.replace: xmake compat (plain text replacement)
+-- string.replace: plain text replacement (not a pattern), as recipes of every
+-- spec use it; a pure function, so it is part of both environments.
 if not string.replace then
     function string.replace(s, old, new, opts)
-        -- Plain text replacement (not pattern); opts accepted for xmake compat but ignored
+        -- Plain text, not a pattern; opts is accepted and ignored
         local result = s
         local i = 1
         while true do
@@ -268,7 +306,9 @@ if not string.replace then
     end
 end
 
--- try/catch: simulates xmake's try { function, catch { function } } syntax
+-- try { function, catch { function } }: runs the first function; when it
+-- raises, the catch function gets the error and try returns nil. A recipe of
+-- spec "3" writes pcall.
 function try(block)
     local fn = block[1]
     local catch_block = block.catch

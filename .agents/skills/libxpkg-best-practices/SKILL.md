@@ -1,6 +1,6 @@
 ---
 name: libxpkg-best-practices
-description: Use when working on libxpkg — adding modules, writing tests, modifying xmake build config, working with Lua hooks, or fixing CI failures on Windows/Linux/macOS
+description: Use when working on libxpkg — adding modules, writing tests, the mcpp build (mcpp.toml, build.mcpp), working with Lua hooks and their two environments, or fixing CI failures on Windows/Linux/macOS
 ---
 
 # libxpkg Best Practices
@@ -12,13 +12,17 @@ libxpkg 是 xpkg 规范的 C++23 参考实现，分为四个子模块。以下�
 ## 模块架构
 
 ```
-mcpplibs.xpkg              ← 纯 C++ 数据模型，零外部依赖
-mcpplibs.xpkg.loader       ← model + lua；解析 .lua 包文件
+mcpplibs.xpkg              ← 纯 C++ 数据模型（含架构身份表），零外部依赖
+mcpplibs.xpkg.compat       ← model；条目的解析（resolve_resource）与架构证据
+mcpplibs.xpkg.loader       ← model + lua；读 recipe 的 package 表、建索引
 mcpplibs.xpkg.index        ← model；纯 C++ 索引操作
-mcpplibs.xpkg.executor     ← model + lua；执行 Lua 钩子
+mcpplibs.xpkg.shell        ← lua；进程层：一行 shell、或程序加参数列表
+mcpplibs.xpkg.fs           ← shell + lua；hook 能用的文件函数（fs 模块、兼容层的 os.*）
+mcpplibs.xpkg.executor     ← 以上 + lua；执行 Lua 钩子，两种环境
 ```
 
-**规则：** 每个模块独立一个测试目标（`xpkg_model_test` 等）。模块间不允许循环依赖。
+**规则：** 测试按文件分（`tests/test_*.cpp` 各是一个测试程序，`mcpp test <名字>` 单跑）。
+模块间不允许循环依赖。
 
 ---
 
@@ -68,12 +72,8 @@ Package::~Package() = default;   // ← outlined symbol，链接方可见
 }
 ```
 
-**修改模块接口后必须：**
-```bash
-xmake clean --all
-xmake build <target>
-```
-否则旧 BMI 缓存会导致 `Bad file data` 错误。
+**修改模块接口后：** `mcpp build` 按依赖重建 BMI。若遇到 `Bad file data` 一类陈旧缓存的错误，
+删掉 `target/` 再 `mcpp build`。
 
 ---
 
@@ -94,73 +94,44 @@ for (auto& [key, members] : index.mutex_groups) {
 
 ---
 
-## 4. xmake 跨平台路径注入
+## 4. 测试里的路径
 
-**问题：** `$(projectdir)` 在 Windows 上展开为反斜杠路径（`D:\a\libxpkg\...`）。直接用 `add_defines` 嵌入 C 字符串字面量时，`\a` 被解释为 BEL 字符，路径损坏。
-
-**错误写法：**
-```lua
-add_defines('XPKG_TEST_PKGINDEX="$(projectdir)/tests/fixtures/pkgindex"')
--- Windows 结果：D:libxpkglibxpkg/tests/...（路径损坏）
-```
-
-**正确写法：** 使用 `on_config` 回调 + `gsub` 规范化为正斜杠：
-```lua
-on_config(function(target)
-    -- Normalize to forward slashes: Windows $(projectdir) contains backslashes
-    -- which are misinterpreted as C escape sequences in string literals.
-    local dir = path.join(os.projectdir(), "tests", "fixtures", "pkgindex")
-    dir = dir:gsub("\\", "/")
-    target:add("defines", 'XPKG_TEST_PKGINDEX="' .. dir .. '"')
-end)
-```
-
-所有注入路径的 `add_defines` 均须改为此模式。
+测试在项目根运行（`mcpp test`），fixture 用相对路径（`tests/fixtures/pkgindex`，见第 6 节）。
+临时文件放在 `fs::temp_directory_path()` 下、每个用例一个目录，用完删除。
+跨平台的用例（进程层、模块接口：`tests/test_shell.cpp`、`tests/test_api.cpp`）在 CI 的三个平台上都跑，
+其余在 Linux 上跑（`.github/workflows/ci.yml`）。
 
 ---
 
-## 5. Lua 钩子文件规范
+## 5. Lua 钩子文件与两种环境
 
-xpkg 包 `.lua` 文件必须正确捕获 `import()` 的返回值：
+recipe 的 `spec` 选择 hook 的环境（设计 2026-11-27 §9.6，规范 `docs/spec/xpkg.md`）：
+
+- `spec = "3"`：标准 Lua 的纯计算部分加 `import` 进来的模块，没有兼容层；一次调用是动作、询问或声明之一，
+  动作没做到就报错，容错只用 `pcall`。
+- `spec` 为 1、2：原样冻结的兼容层（`src/lua-stdlib/compat.lua`）：`os.mv`、`os.cp`、`is_host` 等靠返回值报告失败。
+
+`import("xim.libxpkg.<名字>")` 把模块绑到它最后一段名字上（`fs`、`pkginfo`），也返回它：
 
 ```lua
--- ❌ 错误：import() 不注入全局，pkginfo/xvm 为 nil
+package = { spec = "3", name = "demo", xpm = { linux = { ["1.0.0"] = { url = "...", sha256 = { x86_64 = "..." }, strip = 1 } } } }
+
+import("xim.libxpkg.fs")
 import("xim.libxpkg.pkginfo")
 import("xim.libxpkg.xvm")
 
--- ✅ 正确：捕获为局部变量
-local pkginfo = import("xim.libxpkg.pkginfo")
-local xvm     = import("xim.libxpkg.xvm")
-```
-
-**钩子函数模板：**
-```lua
--- installed() — 检查是否已安装，返回版本字符串或 nil
-function installed()
-    local dir = pkginfo.install_dir()
-    if dir and io.exists(dir .. "/.installed") then
-        return pkginfo.version()
-    end
-    return nil
-end
-
--- install() — 安装逻辑
 function install()
-    local dir = pkginfo.install_dir()
-    os.execute('mkdir -p "' .. dir .. '"')
-    io.writefile(dir .. "/.installed", pkginfo.version())
-    if xvm then xvm.add(pkginfo.name(), pkginfo.version(), dir) end
+    -- 落地已由宿主完成：内容在 pkginfo.install_dir() 里
+    fs.chmod(path.join(pkginfo.install_dir(), "bin", "demo"), "+x")
 end
 
--- uninstall() — 卸载逻辑
-function uninstall()
-    local dir = pkginfo.install_dir()
-    os.remove(dir .. "/.installed")
-    if xvm and xvm.has(pkginfo.name()) then
-        xvm.remove(pkginfo.name())
-    end
+function config()
+    xvm.add("demo")
 end
 ```
+
+**别把动作当成会返回 false 的调用：** 新接口的动作失败即报错，返回值没有需要检查的。
+要容忍失败就写 `pcall(fs.remove, p)`。
 
 ---
 
@@ -197,7 +168,7 @@ static const fs::path PKGINDEX{ XPKG_TEST_PKGINDEX };
 import mcpplibs.xpkg;
 ```
 
-功能更丰富的目标（`lifecycle`）通过 `add_deps` 传递完整依赖链，`std` 模块会提前就绪，可安全使用 `import std;`。
+功能更丰富的目标（`lifecycle`）依赖整个库，`std` 模块会提前就绪，可安全使用 `import std;`。
 
 ---
 
@@ -206,8 +177,8 @@ import mcpplibs.xpkg;
 | 场景 | 解决方案 |
 |------|----------|
 | 链接失败 `~_Vector_impl` `-O2` | 析构函数类体外 `= default` |
-| 神秘构建错误 `Bad file data` | `xmake clean --all` |
-| 路径在 Windows 损坏 | `on_config` + `gsub("\\", "/")` |
-| Lua hook 中 pkginfo 为 nil | `local pkginfo = import(...)` |
+| 神秘构建错误 `Bad file data` | 删掉 `target/` 再 `mcpp build` |
+| 一个用例要在三个平台上跑 | 放进 `test_shell.cpp` 或 `test_api.cpp` |
+| `spec = "3"` 的 hook 里调用不存在 | 它属于兼容层；查规范里的对照表 |
 | CI `import std;` 找不到模块 | 改用 `#include` 或加全依赖链 |
 | C++23 匿名绑定 `[,x]` | 改为 `[key, x]` + `(void)key` |

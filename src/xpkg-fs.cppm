@@ -20,8 +20,24 @@ inline constexpr bool kWindowsHost = true;
 inline constexpr bool kWindowsHost = false;
 #endif
 
-// Register C++ std::filesystem implementations of os.isdir and os.dirs.
-// Called after the Lua prelude to override the shell-based versions.
+// A failed action of the compatibility layer, noted for the host while a hook
+// runs (compat.lua's _LIBXPKG_CALL_FAILED); what the name returns is unchanged.
+void note_call_failure(lua::State* L, const char* call, const std::string& what, const std::string& why) {
+    lua::getglobal(L, "_LIBXPKG_CALL_FAILED");
+    if (lua::type(L, -1) != lua::TFUNCTION) {
+        lua::pop(L, 1);
+        return;
+    }
+    lua::pushstring(L, call);
+    lua::pushstring(L, what.c_str());
+    lua::pushstring(L, why.c_str());
+    if (lua::pcall(L, 3, 0, 0) != lua::OK) lua::pop(L, 1);
+}
+
+// The compatibility layer's os.* functions in C++ (std::filesystem), replacing
+// compat.lua's shell-based ones. Called after compat.lua runs. Their behaviour
+// is frozen (compat.lua's header); a failure of os.cp, os.mv / os.trymv and
+// os.mkdir is noted, and returns false as it always did.
 void register_os_funcs(lua::State* L) {
     lua::getglobal(L, "os");
     if (lua::type(L, -1) != lua::TTABLE) {
@@ -109,6 +125,7 @@ void register_os_funcs(lua::State* L) {
                  fs::copy_options::recursive |
                  fs::copy_options::copy_symlinks |
                  fs::copy_options::overwrite_existing, ec);
+        if (ec) note_call_failure(L, "os.cp", std::string(src) + " -> " + dst, ec.message());
         lua::pushboolean(L, ec ? 0 : 1);
         return 1;
     });
@@ -125,13 +142,18 @@ void register_os_funcs(lua::State* L) {
         if (fs::is_directory(dst, ec)) dst /= src.filename();
         fs::rename(src, dst, ec);
         if (!ec) { lua::pushboolean(L, 1); return 1; }
+        const auto renameError = ec.message();
         // Cross-device: copy + remove
         ec.clear();
         fs::copy(src, dst,
                  fs::copy_options::recursive |
                  fs::copy_options::copy_symlinks |
                  fs::copy_options::overwrite_existing, ec);
-        if (ec) { lua::pushboolean(L, 0); return 1; }
+        if (ec) {
+            note_call_failure(L, "os.mv", std::string(s) + " -> " + d, renameError);
+            lua::pushboolean(L, 0);
+            return 1;
+        }
         fs::remove_all(src, ec);
         lua::pushboolean(L, 1);
         return 1;
@@ -158,6 +180,7 @@ void register_os_funcs(lua::State* L) {
         if (!p) { lua::pushboolean(L, 0); return 1; }
         std::error_code ec;
         fs::create_directories(fs::path(p), ec);
+        if (ec) note_call_failure(L, "os.mkdir", p, ec.message());
         lua::pushboolean(L, ec ? 0 : 1);
         return 1;
     });

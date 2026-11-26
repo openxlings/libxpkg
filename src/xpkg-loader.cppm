@@ -3,6 +3,7 @@ module;
 export module mcpplibs.xpkg.loader;
 import mcpplibs.xpkg;
 import mcpplibs.xpkg.shell;
+import mcpplibs.xpkg.lua_stdlib;
 import mcpplibs.capi.lua;
 import std;
 
@@ -960,6 +961,86 @@ int build_output_print_(lua::State* L) {
     return 0;
 }
 
+// ---- The top level of a recipe of spec "3", where its package table is read ----
+//
+// The loader reads every recipe with stubs for the compatibility layer's
+// names (register_loader_sandbox), so a recipe's top level never fails here.
+// For a recipe of spec "3" that is not enough: its top level runs in the
+// environment it is installed with (spec3.lua), where those names do not exist
+// and a module function that is not pure may not be called. So it runs once
+// more, in that environment, with the modules as stubs that raise when called
+// -- path, json and base64 are the real ones -- and index libs read as they are
+// imported. What fails there is a load error of the recipe: the same answer
+// search, an index build and an install get.
+std::optional<std::string> check_spec3_top_level(const fs::path& pkg_path) {
+    lua::State* L = lua::L_newstate();
+    if (!L) return "failed to create lua state";
+    lua::L_openlibs(L);
+    std::optional<std::string> problem;
+    auto run = [&](std::string_view source, const char* what, int results) -> bool {
+        if (lua::L_loadstring(L, std::string(source).c_str()) != lua::OK
+                || lua::pcall(L, 0, results, 0) != lua::OK) {
+            problem = std::string(what) + ": " + (lua::tostring(L, -1) ? lua::tostring(L, -1) : "error");
+            return false;
+        }
+        return true;
+    };
+    lua::newtable(L);
+    lua::setglobal(L, "_LIBXPKG_MODULES");
+    struct Pure { const char* name; std::string_view source; };
+    const Pure pure[] = {
+        {"path", detail::path_lua}, {"json", detail::json_lua}, {"base64", detail::base64_lua},
+    };
+    for (const auto& m : pure) {
+        if (!run(m.source, m.name, 1)) break;
+        lua::getglobal(L, "_LIBXPKG_MODULES");
+        lua::insert(L, -2);
+        lua::setfield(L, -2, m.name);
+        lua::pop(L, 1);
+    }
+    if (!problem && run(detail::manifest_lua, "the interface manifest", 1)) {
+        lua::setglobal(L, "_LIBXPKG_MANIFEST");
+        run(R"__LUA__(
+            for _, m in ipairs(_LIBXPKG_MANIFEST.modules) do
+                if not _LIBXPKG_MODULES[m.name] then
+                    local stub = {}
+                    for _, row in ipairs(m.entries) do
+                        local qualified = m.name .. "." .. row[1]
+                        stub[row[1]] = function()
+                            error(qualified .. ' is called at the top level of a recipe of spec "3"; '
+                                .. "the top level holds the package table, imports and function "
+                                .. "definitions -- call it from a hook", 2)
+                        end
+                    end
+                    _LIBXPKG_MODULES[m.name] = stub
+                end
+            end
+        )__LUA__", "the module stubs", 0);
+    }
+    if (!problem) run(detail::spec3_lua, "the spec 3 environment", 0);
+    if (!problem) {
+        // Index libs are read from the recipe's index (pkgs/<letter>/<file>).
+        const auto index = pkg_path.parent_path().parent_path().parent_path();
+        std::error_code ec;
+        if (fs::is_directory(index / "libs", ec)) {
+            lua::pushstring(L, index.string().c_str());
+            lua::setglobal(L, "_PKGINDEX_DIR");
+        }
+        lua::getglobal(L, "_LIBXPKG_SPEC3_ENV");
+        if (lua::pcall(L, 0, 1, 0) != lua::OK) {
+            problem = lua::tostring(L, -1);
+        } else if (lua::L_loadfilex(L, pkg_path.string().c_str(), "t") != lua::OK) {
+            problem = lua::tostring(L, -1);
+        } else {
+            lua::pushvalue(L, -2);
+            lua::setupvalue(L, -2, 1);  // the chunk's _ENV
+            if (lua::pcall(L, 0, 0, 0) != lua::OK) problem = lua::tostring(L, -1);
+        }
+    }
+    lua::close(L);
+    return problem;
+}
+
 bool run_pkgindex_build(const fs::path& repo_dir, const BuildOutput& output) {
     auto build_script = repo_dir / "pkgindex-build.lua";
     if (!fs::exists(build_script)) return false;
@@ -1066,6 +1147,10 @@ load_package(const fs::path& pkg_path, const LoaderContext& context) {
     p.host_facts  = loader_detail::get_host_facts(L, pkg_idx, p.warnings);
 
     lua::close(L);
+    if (const auto spec = spec_number(p.spec); spec && *spec == 3) {
+        if (auto problem = loader_detail::check_spec3_top_level(pkg_path))
+            return std::unexpected("lua error: " + *problem);
+    }
     return p;
 }
 

@@ -8,10 +8,22 @@ module;
 #include <filesystem>
 #include <unordered_map>
 #include <expected>
+#include <optional>
 
 export module mcpplibs.xpkg;
 
 export namespace mcpplibs::xpkg {
+
+// The highest `spec` this library reads. "1" and "2" run with the
+// compatibility layer; "3" runs in the environment without it (design
+// 2026-11-27 §9.6). A recipe of a higher spec is one for a newer client: a
+// host refuses it and names the update.
+inline constexpr int kHighestSpec = 3;
+
+// The number a recipe's `spec` names ("2" -> 2), or nullopt when it names none:
+// empty, or not a whole number. A recipe that names none is read as before
+// any spec existed, with the compatibility layer.
+std::optional<int> spec_number(std::string_view spec);
 
 enum class PackageType   { Package, Script, Template, Config, Subos };
 enum class PackageStatus { Dev, Stable, Deprecated };
@@ -296,6 +308,16 @@ const ArchIdentity* find_arch_by_elf(std::uint16_t machine, int bits) {
 std::string normalize_arch(std::string_view raw) {
     if (const auto* arch = find_arch(raw)) return std::string(arch->name);
     return lower_(raw);
+}
+
+std::optional<int> spec_number(std::string_view spec) {
+    if (spec.empty() || spec.size() > 4) return std::nullopt;
+    int n = 0;
+    for (char c : spec) {
+        if (c < '0' || c > '9') return std::nullopt;
+        n = n * 10 + (c - '0');
+    }
+    return n;
 }
 
 bool arch_matches(std::string_view a, std::string_view b) {

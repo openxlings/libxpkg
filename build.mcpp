@@ -36,6 +36,8 @@ struct Module {
 // Order is the load order in xpkg-executor.cppm's load_stdlib.
 constexpr Module MODULES[] = {
     {"compat_lua",     "src/lua-stdlib/compat.lua"},
+    {"manifest_lua",   "src/lua-stdlib/manifest.lua"},
+    {"spec3_lua",      "src/lua-stdlib/spec3.lua"},
     {"log_lua",        "src/lua-stdlib/xim/libxpkg/log.lua"},
     {"pkginfo_lua",    "src/lua-stdlib/xim/libxpkg/pkginfo.lua"},
     {"system_lua",     "src/lua-stdlib/xim/libxpkg/system.lua"},

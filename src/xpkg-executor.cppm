@@ -24,6 +24,7 @@ import mcpplibs.xpkg;
 import mcpplibs.xpkg.lua_stdlib;
 import mcpplibs.xpkg.shell;
 import mcpplibs.xpkg.fs;
+import mcpplibs.xpkg.loader;
 import mcpplibs.capi.lua;
 import std;
 
@@ -382,7 +383,49 @@ bool load_stdlib(lua::State* L, std::string& err_out) {
     // Register C++-backed fs module (symlink, entries, etc.)
     register_fs_module(L);
 
+    // The interface manifest, and the environment of spec "3" built from it.
+    if (lua::L_loadstring(L, detail::manifest_lua.data()) != lua::OK
+            || lua::pcall(L, 0, 1, 0) != lua::OK) {
+        err_out = "failed to load the interface manifest: " + std::string(lua::tostring(L, -1));
+        lua::pop(L, 1);
+        return false;
+    }
+    lua::setglobal(L, "_LIBXPKG_MANIFEST");
+    if (lua::L_loadstring(L, detail::spec3_lua.data()) != lua::OK
+            || lua::pcall(L, 0, 0, 0) != lua::OK) {
+        err_out = "failed to load the spec 3 environment: " + std::string(lua::tostring(L, -1));
+        lua::pop(L, 1);
+        return false;
+    }
+
     return true;
+}
+
+// While the top level of a recipe of spec "3" runs: a call of a module
+// function that is not pure is an error (spec3.lua's
+// _LIBXPKG_TOPLEVEL_FORBIDDEN). The top level runs when the package table is
+// read too, where nothing is installed; it holds the package table, imports and
+// function definitions.
+void toplevel_call_hook(lua::State* L, lua::Debug* ar) {
+    if (ar->event != lua::HOOKCALL && ar->event != lua::HOOKTAILCALL) return;
+    if (!lua::getinfo(L, "f", ar)) return;
+    lua::getglobal(L, "_LIBXPKG_TOPLEVEL_FORBIDDEN");
+    if (lua::type(L, -1) != lua::TTABLE) {
+        lua::pop(L, 2);
+        return;
+    }
+    lua::pushvalue(L, -2);
+    lua::rawget(L, -2);
+    if (lua::type(L, -1) != lua::TSTRING) {
+        lua::pop(L, 3);
+        return;
+    }
+    lua::L_where(L, 1);
+    lua::pushvalue(L, -2);
+    lua::pushstring(L, " is called at the top level of a recipe of spec \"3\"; "
+                       "the top level holds the package table, imports and function definitions -- call it from a hook");
+    lua::concat(L, 3);
+    lua::error(L);
 }
 
 // Inject ExecutionContext into Lua as _RUNTIME global table
@@ -1185,6 +1228,20 @@ class PackageExecutor {
     // Heap-held like the two above: the Lua closures registered in the
     // constructor keep its address, and the executor may be moved.
     std::unique_ptr<HostPorts> ports_ = std::make_unique<HostPorts>();
+    // The registry reference of a spec "3" recipe's environment table, where
+    // its hooks are; 0 for a recipe that runs in the global environment.
+    int recipeEnv_ = 0;
+
+    // A value the recipe defined (a hook, xpkg_main), pushed.
+    void push_recipe_value_(std::string_view name) const {
+        if (recipeEnv_ != 0) {
+            lua::rawgeti(L_, lua::REGISTRYINDEX, recipeEnv_);
+            lua::getfield(L_, -1, std::string(name).c_str());
+            lua::remove(L_, -2);
+        } else {
+            lua::getglobal(L_, std::string(name).c_str());
+        }
+    }
 
     // The functions whose state is this executor's: the process layer (it
     // writes to the hook log) and the host's extractor.
@@ -1215,6 +1272,39 @@ public:
     // executor's hooks run elsewhere: the worker sets its own (HookWorker).
     void set_host_ports(HostPorts ports) { *ports_ = std::move(ports); }
 
+    // Run the recipe's file: in the global environment with the compatibility
+    // layer (spec "1", "2", none), or in an environment of its own (spec "3",
+    // spec3.lua) under the top-level rule. An error message, or nothing.
+    std::optional<std::string> load_recipe_(const fs::path& file, bool spec3) {
+        if (!spec3) {
+            if (lua::L_dofile(L_, file.string().c_str()) == lua::OK) return std::nullopt;
+            std::string err = lua::tostring(L_, -1);
+            lua::pop(L_, 1);
+            return err;
+        }
+        lua::getglobal(L_, "_LIBXPKG_SPEC3_ENV");
+        if (lua::pcall(L_, 0, 1, 0) != lua::OK || lua::type(L_, -1) != lua::TTABLE) {
+            std::string err = lua::type(L_, -1) == lua::TSTRING ? lua::tostring(L_, -1) : "no environment";
+            lua::pop(L_, 1);
+            return "the spec 3 environment: " + err;
+        }
+        recipeEnv_ = lua::L_ref(L_, lua::REGISTRYINDEX);
+        if (lua::L_loadfilex(L_, file.string().c_str(), "t") != lua::OK) {
+            std::string err = lua::tostring(L_, -1);
+            lua::pop(L_, 1);
+            return err;
+        }
+        lua::rawgeti(L_, lua::REGISTRYINDEX, recipeEnv_);
+        lua::setupvalue(L_, -2, 1);  // the chunk's _ENV
+        lua::sethook(L_, detail::toplevel_call_hook, lua::MASKCALL, 0);
+        const int status = lua::pcall(L_, 0, 0, 0);
+        lua::sethook(L_, nullptr, 0, 0);
+        if (status == lua::OK) return std::nullopt;
+        std::string err = lua::tostring(L_, -1) ? lua::tostring(L_, -1) : "error";
+        lua::pop(L_, 1);
+        return err;
+    }
+
     PackageExecutor(fs::path pkg, ExecutionBoundary boundary, HookResponse loaded);
 
     ~PackageExecutor() {
@@ -1233,7 +1323,8 @@ public:
           boundaryError_(std::move(o.boundaryError_)),
           hookOutput_(std::move(o.hookOutput_)),
           hookLog_(std::move(o.hookLog_)),
-          ports_(std::move(o.ports_)) {}
+          ports_(std::move(o.ports_)),
+          recipeEnv_(std::exchange(o.recipeEnv_, 0)) {}
 
     PackageExecutor& operator=(PackageExecutor&& o) noexcept {
         if (this != &o) {
@@ -1247,14 +1338,14 @@ public:
             hookOutput_ = std::move(o.hookOutput_);
             hookLog_ = std::move(o.hookLog_);
             ports_ = std::move(o.ports_);
+            recipeEnv_ = std::exchange(o.recipeEnv_, 0);
         }
         return *this;
     }
 
     bool has_hook(HookType hook) const {
         if (boundary_) return boundaryResponse_.hooks.at(static_cast<std::size_t>(hook));
-        auto name = detail::hook_name(hook);
-        lua::getglobal(L_, std::string(name).c_str());
+        push_recipe_value_(detail::hook_name(hook));
         bool found = (lua::type(L_, -1) == lua::TFUNCTION);
         lua::pop(L_, 1);
         return found;
@@ -1266,7 +1357,7 @@ public:
         detail::inject_context(L_, ctx);
 
         auto name = detail::hook_name(hook);
-        lua::getglobal(L_, std::string(name).c_str());
+        push_recipe_value_(name);
 
         if (lua::type(L_, -1) != lua::TFUNCTION) {
             lua::pop(L_, 1);
@@ -1514,7 +1605,7 @@ public:
         lua::newtable(L_);
         lua::setglobal(L_, "_INSTALL_REQUESTS");
 
-        lua::getglobal(L_, "xpkg_main");
+        push_recipe_value_("xpkg_main");
         if (lua::type(L_, -1) != lua::TFUNCTION) {
             lua::pop(L_, 1);
             return HookResult{ .success = false,
@@ -1590,6 +1681,17 @@ create_executor(const fs::path& pkg_path) {
     if (!fs::exists(pkg_path)) {
         return std::unexpected("package file not found: " + pkg_path.string());
     }
+    // The recipe's spec chooses its environment; it is read first, the way a
+    // host reads it (the loader runs none of the recipe's hooks).
+    auto declared = load_package(pkg_path);
+    if (!declared) return std::unexpected("failed to load package: " + declared.error());
+    const auto spec = spec_number(declared->spec);
+    if (spec && *spec > kHighestSpec) {
+        return std::unexpected(std::format(
+            "{}: spec \"{}\" is newer than this libxpkg reads (the highest is {})",
+            pkg_path.string(), declared->spec, kHighestSpec));
+    }
+    const bool spec3 = spec && *spec == 3;
 
     lua::State* L = lua::L_newstate();
     if (!L) return std::unexpected("failed to create lua state");
@@ -1615,9 +1717,8 @@ create_executor(const fs::path& pkg_path) {
 
     // Before the recipe runs: its top level may already start a program.
     PackageExecutor executor(L, pkg_path);
-    if (lua::L_dofile(L, pkg_path.string().c_str()) != lua::OK) {
-        err = lua::tostring(L, -1);
-        return std::unexpected("failed to load package: " + err);
+    if (auto failed = executor.load_recipe_(pkg_path, spec3)) {
+        return std::unexpected("failed to load package: " + *failed);
     }
     return executor;
 }

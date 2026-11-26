@@ -1088,7 +1088,7 @@ std::expected<IndexDeclarations, std::string> cached_declarations(const fs::path
     const auto file = root / "index-compat.json";
     bool ok = false;
     std::string text = slurp(file, ok);
-    if (!ok) text = "\x01absent";
+    if (!ok) text = "\x01(absent)";   // no file at all: never equal to a file's text
     std::scoped_lock lock(mutex);
     if (auto it = cache.find(root); it != cache.end() && it->second.first == text) {
         // A template the cache named may have gone since.

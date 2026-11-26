@@ -32,6 +32,9 @@ struct ResolvedResource {
     int revision = 0;
     // That entry's `floor`: the oldest installed revision still usable.
     int floor = 0;
+    // Components the host drops from each member's path when it lands the
+    // download (spec "3"): the entry's `strip`, else its platform's, else 0.
+    int strip = 0;
 };
 
 std::expected<ResolvedResource, std::string> resolve_resource(
@@ -165,6 +168,9 @@ std::expected<ResolvedResource, std::string> resolve_resource(
     result.version = resolved_version;
     result.revision = resource->revision;
     result.floor = resource->floor;
+    if (resource->strip >= 0) result.strip = resource->strip;
+    else if (auto it = matrix.platform_strip.find(context.platform); it != matrix.platform_strip.end())
+        result.strip = it->second;
     if (arch_resource != nullptr) {
         result.url = arch_resource->url;
         result.sha256 = arch_resource->sha256;

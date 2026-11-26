@@ -39,6 +39,10 @@ build_index_impl(const fs::path& repo_dir, const std::string& defaultNamespace,
     if (!fs::is_directory(pkgs_dir))
         return std::unexpected("pkgs/ directory not found in: " + repo_dir.string());
 
+    auto declarations = cached_declarations(repo_dir);
+    if (!declarations) return std::unexpected(declarations.error());
+    const bool templated = !declarations->recipe_template.empty();
+    if (templated) restore_pkgs(repo_dir);
     if (boundaries) {
         if (!boundaries->metadata) return std::unexpected("metadata execution boundary is empty");
         std::error_code ec;
@@ -46,7 +50,7 @@ build_index_impl(const fs::path& repo_dir, const std::string& defaultNamespace,
         const auto status = fs::symlink_status(script, ec);
         const bool missing = status.type() == fs::file_type::not_found
             && (!ec || ec == std::errc::no_such_file_or_directory);
-        if (!missing) {
+        if (!missing && !templated) {
             if (ec) return std::unexpected(script.string() + ": " + ec.message());
             if (!boundaries->index_build)
                 return std::unexpected("index build script requires an execution boundary: " + script.string());
@@ -59,7 +63,7 @@ build_index_impl(const fs::path& repo_dir, const std::string& defaultNamespace,
                 return std::unexpected("index build boundary failed");
             }
         }
-    } else {
+    } else if (!templated) {
         run_pkgindex_build(repo_dir, buildOutput);
     }
 

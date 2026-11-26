@@ -99,6 +99,11 @@ struct PlatformResource {
     // "2026.10.16.1"`): a client resolving a package with no version named
     // passes over the versions it cannot use. Empty when the entry states none.
     std::string min_client;
+    // How the host lands the download in the install directory (`strip = n`,
+    // spec "3"): the first n components of every member's path are dropped.
+    // -1 when the entry states none (the platform's, else 0, applies; see
+    // PlatformMatrix::platform_strip and resolve_resource).
+    int strip = -1;
 };
 
 // What this package exposes to consumers/xlings at install/runtime.
@@ -162,6 +167,8 @@ struct PlatformMatrix {
     std::unordered_map<std::string, ExportsBlock> exports;
     // platform inheritance, e.g. "ubuntu" -> "linux"
     std::unordered_map<std::string, std::string> inherits;
+    // platform -> `strip` stated for all of its versions (an entry's own wins).
+    std::unordered_map<std::string, int> platform_strip;
     // Declared outside struct body → outlined symbol in module object.
     // Prevents test/consumer TUs from inlining the body and then generating
     // unsatisfied calls to std internal inline helpers (e.g. ~_Vector_impl).

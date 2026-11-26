@@ -1275,9 +1275,16 @@ public:
     // Run the recipe's file: in the global environment with the compatibility
     // layer (spec "1", "2", none), or in an environment of its own (spec "3",
     // spec3.lua) under the top-level rule. An error message, or nothing.
+    // The index's template (index-compat.json's recipes.template) runs after
+    // the file, in the same environment, as if written at its end.
     std::optional<std::string> load_recipe_(const fs::path& file, bool spec3) {
+        auto declared = recipe_index_declarations(file);
+        if (!declared) return declared.error();
+        const fs::path recipe_template = declared->recipe_template;
         if (!spec3) {
-            if (lua::L_dofile(L_, file.string().c_str()) == lua::OK) return std::nullopt;
+            if (lua::L_dofile(L_, file.string().c_str()) == lua::OK
+                    && (recipe_template.empty() || lua::L_dofile(L_, recipe_template.string().c_str()) == lua::OK))
+                return std::nullopt;
             std::string err = lua::tostring(L_, -1);
             lua::pop(L_, 1);
             return err;
@@ -1297,7 +1304,15 @@ public:
         lua::rawgeti(L_, lua::REGISTRYINDEX, recipeEnv_);
         lua::setupvalue(L_, -2, 1);  // the chunk's _ENV
         lua::sethook(L_, detail::toplevel_call_hook, lua::MASKCALL, 0);
-        const int status = lua::pcall(L_, 0, 0, 0);
+        int status = lua::pcall(L_, 0, 0, 0);
+        if (status == lua::OK && !recipe_template.empty()) {
+            status = lua::L_loadfilex(L_, recipe_template.string().c_str(), "t");
+            if (status == lua::OK) {
+                lua::rawgeti(L_, lua::REGISTRYINDEX, recipeEnv_);
+                lua::setupvalue(L_, -2, 1);
+                status = lua::pcall(L_, 0, 0, 0);
+            }
+        }
         lua::sethook(L_, nullptr, 0, 0);
         if (status == lua::OK) return std::nullopt;
         std::string err = lua::tostring(L_, -1) ? lua::tostring(L_, -1) : "error";

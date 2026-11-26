@@ -84,3 +84,77 @@ package = {
     EXPECT_EQ(resolved->url, "https://ex/a-riscv64.tar.gz");
     fs::remove_all(recipe.parent_path());
 }
+
+// ---- What an entry says about architecture (the host's plan-time question) ----
+
+namespace {
+
+Package package_with(std::vector<std::string> archs, PlatformResource entry,
+                     std::string source = {}) {
+    Package p;
+    p.name = "probe";
+    p.archs = std::move(archs);
+    p.xpm.source = std::move(source);
+    p.xpm.entries["linux"]["1.0.0"] = std::move(entry);
+    p.xpm.entries["linux"]["latest"] = PlatformResource{.ref = "1.0.0"};
+    return p;
+}
+
+} // namespace
+
+TEST(ArchEvidenceTest, TheEntryShapeDecidesNotThePackageUnion) {
+    // A per-arch checksum table enumerates; the package's union is not read.
+    auto strong = package_with({"x86_64", "aarch64"},
+                               PlatformResource{.url = "https://ex/a.tgz",
+                                                .sha256_by_arch = {{"amd64", "aa"}}});
+    const auto* entry = find_entry(strong.xpm, "linux", "latest");
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(classify_arch_evidence(strong, entry), ArchEvidence::Strong);
+    EXPECT_EQ(entry_architectures(*entry), std::set<std::string>{"x86_64"});
+
+    auto open = package_with({}, PlatformResource{.url = "https://ex/a-${arch}.tgz"});
+    EXPECT_EQ(classify_arch_evidence(open, find_entry(open.xpm, "linux", "1.0.0")),
+              ArchEvidence::Open);
+
+    auto weak = package_with({"x86_64", "aarch64"},
+                             PlatformResource{.url = "https://ex/a.tgz", .sha256 = "aa"});
+    EXPECT_EQ(classify_arch_evidence(weak, find_entry(weak.xpm, "linux", "1.0.0")),
+              ArchEvidence::Weak);
+
+    auto none = package_with({}, PlatformResource{.url = "https://ex/a.tgz", .sha256 = "aa"});
+    EXPECT_EQ(classify_arch_evidence(none, find_entry(none.xpm, "linux", "1.0.0")),
+              ArchEvidence::None);
+    // No entry for this platform: only the package's claim is left.
+    EXPECT_EQ(classify_arch_evidence(weak, find_entry(weak.xpm, "macosx", "1.0.0")),
+              ArchEvidence::Weak);
+}
+
+TEST(ArchEvidenceTest, AnAliasThatDoesNotEndIsNoEntry) {
+    PlatformMatrix m;
+    m.entries["linux"]["a"] = PlatformResource{.ref = "b"};
+    m.entries["linux"]["b"] = PlatformResource{.ref = "a"};
+    EXPECT_EQ(find_entry(m, "linux", "a"), nullptr);
+}
+
+// "States no download source" is exactly the entries for which the resolver
+// finds no source: the two answers come from the same fields.
+TEST(ArchEvidenceTest, NoDownloadSourceAgreesWithTheResolver) {
+    struct Case { std::string what; PlatformResource entry; std::string source; bool none; };
+    const std::vector<Case> cases = {
+        {"empty entry", PlatformResource{}, "", true},
+        {"empty entry, matrix source", PlatformResource{}, "xlings-res", false},
+        {"url", PlatformResource{.url = "https://ex/a.tgz"}, "", false},
+        {"res", PlatformResource{.is_res = true}, "", false},
+        {"per-arch url", PlatformResource{.archs = {{"x86_64", {.url = "https://ex/a.tgz"}}}}, "", false},
+    };
+    for (const auto& c : cases) {
+        auto p = package_with({}, c.entry, c.source);
+        const auto* entry = find_entry(p.xpm, "linux", "1.0.0");
+        EXPECT_EQ(declares_no_download_source(p.xpm, entry, "linux"), c.none) << c.what;
+        auto resolved = resolve_resource(p.xpm, {.name = "probe", .version = "1.0.0",
+                                                 .platform = "linux", .arch = "x86_64"});
+        EXPECT_EQ(!resolved.has_value(), c.none) << c.what;
+    }
+    auto p = package_with({}, PlatformResource{});
+    EXPECT_FALSE(declares_no_download_source(p.xpm, nullptr, "linux")) << "no entry is not 'no source'";
+}

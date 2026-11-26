@@ -38,6 +38,50 @@ std::expected<ResolvedResource, std::string> resolve_resource(
     const PlatformMatrix& matrix,
     const ResourceContext& context);
 
+// ---- What a version entry says about architecture ----
+//
+// The question a host asks before it downloads anything: does this entry name
+// the architectures it ships? `package.archs` cannot answer it -- it is the
+// union over every platform, so it both under- and over-states what one
+// platform's entry carries (design 2026-11-27 §2.2, §5.3). The entry's own
+// shape can:
+//
+//   Strong  the entry enumerates its architectures: a per-arch map, per-arch
+//           checksums, or per-arch upstream aliases. A missing arch is a real
+//           answer.
+//   Open    the entry substitutes ${arch} into a URL, or is an XLINGS_RES
+//           resource: arch-parametric, the set is not bounded here.
+//   Weak    a single artifact, and `package.archs` is the only clue.
+//   None    no claim at all.
+//
+// Defined here, beside the resolver that reads the same fields, so a host and
+// the format's checker cannot disagree about which shape an entry has.
+enum class ArchEvidence { None, Weak, Open, Strong };
+
+// The `xpm[platform][version]` entry with `ref` aliases followed, or null
+// when that platform or version has none (or an alias does not end).
+const PlatformResource* find_entry(const PlatformMatrix& matrix,
+                                   std::string_view platform,
+                                   std::string_view version);
+
+// The canonical architectures an entry enumerates; empty when it names none.
+std::set<std::string> entry_architectures(const PlatformResource& entry);
+
+// The entry's URL (or a mirror) substitutes ${arch} or ${arch_alias}.
+bool is_arch_templated(const PlatformResource& entry);
+
+ArchEvidence classify_arch_evidence(const Package& package,
+                                    const PlatformResource* entry);
+
+// The entry exists and states no download source at all for this platform:
+// a package whose payload is made by its hooks (a host link, a stamp). The
+// same condition under which resolve_resource ends on SourceKind::None, field
+// for field. No entry is a different answer ("not described here") and is
+// false.
+bool declares_no_download_source(const PlatformMatrix& matrix,
+                                 const PlatformResource* entry,
+                                 std::string_view platform);
+
 } // namespace mcpplibs::xpkg
 
 namespace mcpplibs::xpkg {
@@ -187,6 +231,68 @@ std::expected<ResolvedResource, std::string> resolve_resource(
             "resource has neither url nor source for " + context.platform
             + "@" + resolved_version);
     return result;
+}
+
+const PlatformResource* find_entry(const PlatformMatrix& matrix,
+                                   std::string_view platform,
+                                   std::string_view version) {
+    const auto entries = matrix.entries.find(std::string(platform));
+    if (entries == matrix.entries.end()) return nullptr;
+    std::string key(version);
+    // `latest -> 1.2.3 -> ...`, bounded: a cyclic alias is "no entry".
+    for (int hop = 0; hop < 8; ++hop) {
+        const auto found = entries->second.find(key);
+        if (found == entries->second.end()) return nullptr;
+        if (found->second.ref.empty()) return &found->second;
+        key = found->second.ref;
+    }
+    return nullptr;
+}
+
+std::set<std::string> entry_architectures(const PlatformResource& entry) {
+    std::set<std::string> archs;
+    for (const auto& [arch, _] : entry.archs) archs.insert(normalize_arch(arch));
+    for (const auto& [arch, _] : entry.sha256_by_arch) archs.insert(normalize_arch(arch));
+    for (const auto& [arch, _] : entry.arch_alias) archs.insert(normalize_arch(arch));
+    return archs;
+}
+
+bool is_arch_templated(const PlatformResource& entry) {
+    const auto templated = [](std::string_view url) {
+        return url.find("${arch}") != std::string_view::npos
+            || url.find("${arch_alias}") != std::string_view::npos;
+    };
+    if (templated(entry.url)) return true;
+    for (const auto& [_, url] : entry.mirrors)
+        if (templated(url)) return true;
+    return false;
+}
+
+ArchEvidence classify_arch_evidence(const Package& package,
+                                    const PlatformResource* entry) {
+    if (entry != nullptr) {
+        if (!entry_architectures(*entry).empty()) return ArchEvidence::Strong;
+        // `res = true` is XLINGS_RES with per-arch checksums; without them
+        // populated the resource is still arch-parametric.
+        if (entry->is_res || is_arch_templated(*entry)) return ArchEvidence::Open;
+    }
+    return package.archs.empty() ? ArchEvidence::None : ArchEvidence::Weak;
+}
+
+bool declares_no_download_source(const PlatformMatrix& matrix,
+                                 const PlatformResource* entry,
+                                 std::string_view platform) {
+    if (entry == nullptr) return false;
+    // resolve_resource's order: an XLINGS_RES entry, an entry url, a per-arch
+    // url, then the platform's source, then the matrix's.
+    if (entry->is_res) return false;
+    if (!entry->url.empty()) return false;
+    for (const auto& [_, resource] : entry->archs)
+        if (!resource.url.empty()) return false;
+    if (auto it = matrix.platform_sources.find(std::string(platform));
+            it != matrix.platform_sources.end())
+        return it->second.empty();
+    return matrix.source.empty();
 }
 
 } // namespace mcpplibs::xpkg

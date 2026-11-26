@@ -117,10 +117,24 @@ struct ExecutionContext {
 
 inline constexpr std::size_t kMaxHookOutputBytes = 16 * 1024;
 
+// One thing a recipe said to the person installing it: a log.warn or a
+// log.error of the hook, its text as formatted, without the output's prefix.
+struct HookNotice {
+    std::string level;  // "warn" | "error"
+    std::string text;
+};
+// A hook keeps at most this many, each at most this long; what is over is
+// counted in one last notice, and the hook's output still has all of it.
+inline constexpr std::size_t kMaxHookNotices = 100;
+inline constexpr std::size_t kMaxHookNoticeBytes = 2048;
+
 struct HookResult {
     bool success = false;
     std::string output, error;
     std::string version;  // non-empty when installed() returns a version string
+    // What the recipe said to the user during this hook, in order (design
+    // 2026-11-27 §9.2). The output stream is the log; this is the channel.
+    std::vector<HookNotice> notices;
 };
 
 struct XvmOp {
@@ -189,7 +203,8 @@ struct InstallRequest {
 
 enum class HookType { Installed, Build, Install, Config, Uninstall };
 
-inline constexpr int kHookBoundaryProtocol = 1;
+// 2: HookResult carries notices.
+inline constexpr int kHookBoundaryProtocol = 2;
 enum class HookAction { Load, RunHook, RunScript, Elfpatch, SetLogLevel };
 std::string_view hook_action_name(HookAction action);
 std::optional<HookAction> hook_action_from_string(std::string_view name);
@@ -1126,6 +1141,47 @@ int hooked_os_execute(lua::State* L) {
     return 3;
 }
 
+// _LIBXPKG_NOTICES: the list log.warn / log.error append to while a hook runs.
+void begin_notices(lua::State* L) {
+    lua::newtable(L);
+    lua::setglobal(L, "_LIBXPKG_NOTICES");
+}
+
+std::vector<mcpplibs::xpkg::HookNotice> collect_notices(lua::State* L) {
+    std::vector<mcpplibs::xpkg::HookNotice> notices;
+    lua::getglobal(L, "_LIBXPKG_NOTICES");
+    if (lua::type(L, -1) == lua::TTABLE) {
+        const auto count = static_cast<std::size_t>(lua::rawlen(L, -1));
+        for (std::size_t i = 1; i <= count && notices.size() < mcpplibs::xpkg::kMaxHookNotices; ++i) {
+            lua::rawgeti(L, -1, static_cast<lua::Integer>(i));
+            if (lua::type(L, -1) == lua::TTABLE) {
+                mcpplibs::xpkg::HookNotice notice;
+                lua::getfield(L, -1, "level");
+                if (lua::type(L, -1) == lua::TSTRING) notice.level = lua::tostring(L, -1);
+                lua::pop(L, 1);
+                lua::getfield(L, -1, "text");
+                if (lua::type(L, -1) == lua::TSTRING) notice.text = lua::tostring(L, -1);
+                lua::pop(L, 1);
+                if (notice.text.size() > mcpplibs::xpkg::kMaxHookNoticeBytes) {
+                    notice.text.resize(mcpplibs::xpkg::kMaxHookNoticeBytes);
+                    notice.text += " [...]";
+                }
+                notices.push_back(std::move(notice));
+            }
+            lua::pop(L, 1);
+        }
+        if (count > mcpplibs::xpkg::kMaxHookNotices) {
+            notices.back() = {.level = "warn",
+                              .text = std::to_string(count - mcpplibs::xpkg::kMaxHookNotices + 1)
+                                      + " more lines; the hook's output has them"};
+        }
+    }
+    lua::pop(L, 1);
+    lua::pushnil(L);
+    lua::setglobal(L, "_LIBXPKG_NOTICES");
+    return notices;
+}
+
 // One warning through the log module. Called with capture already installed,
 // so it lands in HookResult::output and not on the terminal.
 void warn_through_log_module(lua::State* L, const std::string& message) {
@@ -1372,6 +1428,8 @@ public:
                 L_, "hook output log unavailable (" + logProblem +
                         "); output of child processes is discarded");
         }
+        // After the host's own warning above: notices are what the recipe says.
+        detail::begin_notices(L_);
         HookResult result;
         if (lua::pcall(L_, 0, 1, 0) == lua::OK) {
             int t = lua::type(L_, -1);
@@ -1399,6 +1457,7 @@ public:
         if (!result.success && result.error.empty()) {
             result.error = std::string(name) + " hook failed";
         }
+        result.notices = detail::collect_notices(L_);
         result.output = capture.finish();
 
         return result;
@@ -1577,6 +1636,7 @@ public:
             lua::pushstring(L_, arg.c_str());
         }
 
+        detail::begin_notices(L_);
         HookResult result;
         if (lua::pcall(L_, nargs, 0, 0) == lua::OK) {
             result.success = true;
@@ -1585,6 +1645,7 @@ public:
             result.error = lua::tostring(L_, -1);
             lua::pop(L_, 1);
         }
+        result.notices = detail::collect_notices(L_);
         return result;
     }
 

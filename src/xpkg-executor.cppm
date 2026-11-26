@@ -623,11 +623,37 @@ void register_fs_module(lua::State* L) {
     lua::pop(L, 1);           // pop modules
 }
 
+// _LIBXPKG_ARCHS: the architecture identity table (arch_identities()) for the
+// Lua side, keyed by every canonical name and alias: { machine = e_machine,
+// bits = 32|64, name = canonical }.
+void inject_arch_identities(lua::State* L) {
+    lua::newtable(L);
+    for (const auto& arch : arch_identities()) {
+        auto push_identity = [&] {
+            lua::newtable(L);
+            lua::pushinteger(L, arch.elf_machine);
+            lua::setfield(L, -2, "machine");
+            lua::pushinteger(L, arch.elf_bits);
+            lua::setfield(L, -2, "bits");
+            lua::pushstring(L, std::string(arch.name).c_str());
+            lua::setfield(L, -2, "name");
+        };
+        push_identity();
+        lua::setfield(L, -2, std::string(arch.name).c_str());
+        for (const auto alias : arch.aliases) {
+            push_identity();
+            lua::setfield(L, -2, std::string(alias).c_str());
+        }
+    }
+    lua::setglobal(L, "_LIBXPKG_ARCHS");
+}
+
 // Load all xim.libxpkg.* modules into _LIBXPKG_MODULES table, then run prelude
 bool load_stdlib(lua::State* L, std::string& err_out) {
     // Create empty _LIBXPKG_MODULES table
     lua::newtable(L);
     lua::setglobal(L, "_LIBXPKG_MODULES");
+    inject_arch_identities(L);
 
     // Each module script returns a table; store it into _LIBXPKG_MODULES[name]
     struct ModEntry { const char* name; std::string_view src; };

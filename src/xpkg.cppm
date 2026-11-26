@@ -1,4 +1,7 @@
 module;
+#include <array>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -13,12 +16,32 @@ export namespace mcpplibs::xpkg {
 enum class PackageType   { Package, Script, Template, Config, Subos };
 enum class PackageStatus { Dev, Stable, Deprecated };
 
-// Canonicalize a CPU-arch token to xlings' internal spelling.
-// Accepts common aliases so recipes can use upstream names verbatim:
-//   amd64 / x64 / x86-64 / x86_64  -> "x86_64"
-//   arm64 / armv8  / aarch64       -> "aarch64"
-//   x86   / i386   / i686          -> "x86"
-// Unknown tokens are returned lower-cased unchanged. Case-insensitive.
+// One CPU architecture as the xpkg format names it: the name recipes and hosts
+// agree on, the names upstreams use for it, and how an ELF header says it.
+//
+// There is one table of these (arch_identities()). The loader reads it to
+// canonicalize names and to know which keys of a version entry are per-arch
+// resources; elfpatch reads it to tell a file built for this machine from one
+// built for another; a host reads it to check that a payload is its machine's
+// (design 2026-11-27 §5.1). An architecture added here is known to all of them
+// at once. Properties that only one program needs (a standard loader path, a
+// boot file name) stay in that program, keyed by `name`.
+struct ArchIdentity {
+    std::string_view name;                      // canonical, e.g. "x86_64"
+    std::span<const std::string_view> aliases;  // other spellings, lower case
+    std::uint16_t elf_machine;                  // e_machine
+    int elf_bits;                               // the ELF class: 32 or 64
+};
+
+std::span<const ArchIdentity> arch_identities();
+// The identity a canonical name or an alias names (case-insensitive), or null.
+const ArchIdentity* find_arch(std::string_view name);
+// The identity an ELF header's e_machine and class describe, or null.
+const ArchIdentity* find_arch_by_elf(std::uint16_t machine, int bits);
+
+// Canonicalize a CPU-arch token to its name in the identity table, so recipes
+// can use upstream names verbatim (amd64, arm64, i686, loong64, ...). A token
+// the table does not know is returned lower-cased. Case-insensitive.
 std::string normalize_arch(std::string_view raw);
 
 // True when two arch tokens denote the same canonical arch (e.g. "arm64"
@@ -224,15 +247,55 @@ std::string PackageIdentity::canonical_name() const {
     return namespaceName + ":" + name;
 }
 
-std::string normalize_arch(std::string_view raw) {
+namespace {
+
+constexpr std::string_view kX86_64Aliases[]  = {"amd64", "x64", "x86-64"};
+constexpr std::string_view kAarch64Aliases[] = {"arm64", "armv8"};
+constexpr std::string_view kX86Aliases[]     = {"i386", "i686"};
+constexpr std::string_view kArmAliases[]     = {"armv7", "armv7l", "armhf"};
+constexpr std::string_view kLoongAliases[]   = {"loong64"};
+
+// e_machine values from the ELF specification (EM_*).
+constexpr std::array<ArchIdentity, 6> kArchIdentities{{
+    {"x86_64",      kX86_64Aliases,  62,  64},
+    {"aarch64",     kAarch64Aliases, 183, 64},
+    {"x86",         kX86Aliases,     3,   32},
+    {"arm",         kArmAliases,     40,  32},
+    {"riscv64",     {},              243, 64},
+    {"loongarch64", kLoongAliases,   258, 64},
+}};
+
+std::string lower_(std::string_view raw) {
     std::string s;
     s.reserve(raw.size());
     for (char c : raw)
         s += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-    if (s == "amd64" || s == "x64" || s == "x86-64" || s == "x86_64") return "x86_64";
-    if (s == "arm64" || s == "armv8" || s == "aarch64")               return "aarch64";
-    if (s == "x86"   || s == "i386" || s == "i686")                   return "x86";
     return s;
+}
+
+} // namespace
+
+std::span<const ArchIdentity> arch_identities() { return kArchIdentities; }
+
+const ArchIdentity* find_arch(std::string_view name) {
+    const auto s = lower_(name);
+    for (const auto& arch : kArchIdentities) {
+        if (arch.name == s) return &arch;
+        for (const auto alias : arch.aliases)
+            if (alias == s) return &arch;
+    }
+    return nullptr;
+}
+
+const ArchIdentity* find_arch_by_elf(std::uint16_t machine, int bits) {
+    for (const auto& arch : kArchIdentities)
+        if (arch.elf_machine == machine && arch.elf_bits == bits) return &arch;
+    return nullptr;
+}
+
+std::string normalize_arch(std::string_view raw) {
+    if (const auto* arch = find_arch(raw)) return std::string(arch->name);
+    return lower_(raw);
 }
 
 bool arch_matches(std::string_view a, std::string_view b) {

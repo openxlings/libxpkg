@@ -174,12 +174,6 @@ local function _is_elf(filepath)
     return _read_magic(filepath, 4) == "\x7fELF"
 end
 
--- e_machine values the ABI filter names by architecture (see _target_abi).
-local _EM_X86_64  = 62      -- 0x3e
-local _EM_AARCH64 = 183     -- 0xb7
-local _EM_386     = 3
-local _EM_ARM     = 40
-
 -- What an ELF file asks of a loader, read from its own headers.
 --
 -- Returns nil whenever the headers cannot be read in full: too short, not ELF,
@@ -270,11 +264,12 @@ local function _target_abi(loader)
         local facts = _elf_facts(loader)
         if facts then return { class = facts.class, machine = facts.machine } end
     end
-    local arch = (os.arch and os.arch()) or ""
-    if arch:find("aarch64") or arch:find("arm64") then return { class = 2, machine = _EM_AARCH64 } end
-    if arch:find("x86_64") or arch == "x64" then return { class = 2, machine = _EM_X86_64 } end
-    if arch:find("i386") or arch == "x86" then return { class = 1, machine = _EM_386 } end
-    if arch:find("arm") then return { class = 1, machine = _EM_ARM } end
+    -- No loader to read: the machine of this install, as the format's one table
+    -- of architectures (mcpplibs::xpkg::arch_identities, keyed by every name
+    -- and alias) describes it.
+    local arch = _RUNTIME and _RUNTIME.arch or ""
+    local id = _LIBXPKG_ARCHS and _LIBXPKG_ARCHS[string.lower(arch)]
+    if id then return { class = id.bits == 64 and 2 or 1, machine = id.machine } end
     return nil
 end
 

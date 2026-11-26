@@ -749,8 +749,7 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                                 if (lua::type(L, -2) == lua::TSTRING
                                         && lua::type(L, -1) == lua::TTABLE) {
                                     std::string canon = normalize_arch(lua::tostring(L, -2));
-                                    if (canon == "x86_64" || canon == "aarch64"
-                                            || canon == "x86") {
+                                    if (find_arch(canon) != nullptr) {
                                         int arch_idx = lua::gettop(L);
                                         ArchResource ar;
                                         ar.url = get_str(L, arch_idx, "url");

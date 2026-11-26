@@ -128,6 +128,18 @@ struct HookNotice {
 inline constexpr std::size_t kMaxHookNotices = 100;
 inline constexpr std::size_t kMaxHookNoticeBytes = 2048;
 
+// What the automatic ELF/Mach-O patch did (apply_elfpatch_auto), as facts and
+// an outcome, for the host to judge and show (design 2026-11-27 §9.3).
+struct ElfpatchResult {
+    std::string outcome;   // "done" | "skipped" | "failed"
+    std::string reason;    // why it was skipped or failed; empty when done
+    int scanned = 0, patched = 0, failed = 0;
+    // Files left alone, by why: built for another machine than the loader
+    // being written, nothing to resolve (static, a loader), named in `skip`.
+    int skipped_foreign = 0, skipped_static = 0, skipped_listed = 0;
+    std::string tool_missing;  // the tool files needed and that was not found
+};
+
 struct HookResult {
     bool success = false;
     std::string output, error;
@@ -135,6 +147,9 @@ struct HookResult {
     // What the recipe said to the user during this hook, in order (design
     // 2026-11-27 §9.2). The output stream is the log; this is the channel.
     std::vector<HookNotice> notices;
+    // Set by apply_elfpatch_auto only. `output` keeps its "<scanned> <patched>
+    // <failed>" text for hosts that read it.
+    std::optional<ElfpatchResult> elfpatch;
 };
 
 struct XvmOp {
@@ -203,7 +218,7 @@ struct InstallRequest {
 
 enum class HookType { Installed, Build, Install, Config, Uninstall };
 
-// 2: HookResult carries notices.
+// 2: HookResult carries notices and the elfpatch result.
 inline constexpr int kHookBoundaryProtocol = 2;
 enum class HookAction { Load, RunHook, RunScript, Elfpatch, SetLogLevel };
 std::string_view hook_action_name(HookAction action);
@@ -1509,15 +1524,16 @@ public:
         return run_hook(HookType::Installed, ctx);
     }
 
-    // Run elfpatch.apply_auto() if the install hook set elfpatch_auto flag.
-    // Returns {scanned, patched, failed} counts. Safe to call unconditionally.
+    // Run elfpatch.apply_auto() after the install hook: the payload's loader
+    // and search paths, as the recipe and its dependencies declare them.
+    // `elfpatch` holds what it did and its outcome; `output` is the
+    // "<scanned> <patched> <failed>" text. Safe to call unconditionally.
     HookResult apply_elfpatch_auto() {
         if (boundary_) return execute_external_(HookAction::Elfpatch, boundaryContext_);
         constexpr const char* script = R"__LUA__(
             local ep = _LIBXPKG_MODULES and _LIBXPKG_MODULES["elfpatch"]
-            if not ep then return "no-ep 0 0 0" end
-            local r = ep.apply_auto()
-            return tostring(r.scanned) .. " " .. tostring(r.patched) .. " " .. tostring(r.failed)
+            if not ep then return nil end
+            return ep.apply_auto()
         )__LUA__";
         HookResult result;
         if (lua::L_loadstring(L_, script) != lua::OK) {
@@ -1528,8 +1544,35 @@ public:
         }
         if (lua::pcall(L_, 0, 1, 0) == lua::OK) {
             result.success = true;
-            if (lua::type(L_, -1) == lua::TSTRING)
-                result.output = lua::tostring(L_, -1);
+            if (lua::type(L_, -1) == lua::TTABLE) {
+                ElfpatchResult r;
+                auto integer = [&](const char* key) {
+                    lua::getfield(L_, -1, key);
+                    const int v = lua::isinteger(L_, -1) ? static_cast<int>(lua::tointeger(L_, -1)) : 0;
+                    lua::pop(L_, 1);
+                    return v;
+                };
+                auto text = [&](const char* key) {
+                    lua::getfield(L_, -1, key);
+                    std::string v = lua::type(L_, -1) == lua::TSTRING ? lua::tostring(L_, -1) : "";
+                    lua::pop(L_, 1);
+                    return v;
+                };
+                r.outcome = text("outcome");
+                if (r.outcome.empty()) r.outcome = "done";
+                r.reason = text("reason");
+                r.scanned = integer("scanned");
+                r.patched = integer("patched");
+                r.failed = integer("failed");
+                r.skipped_foreign = integer("skipped_foreign");
+                r.skipped_static = integer("skipped_static");
+                r.skipped_listed = integer("skipped_listed");
+                r.tool_missing = text("tool_missing");
+                result.output = std::format("{} {} {}", r.scanned, r.patched, r.failed);
+                result.elfpatch = std::move(r);
+            } else {
+                result.output = "no-ep 0 0 0";
+            }
             lua::pop(L_, 1);
         } else {
             result.success = false;

@@ -35,6 +35,11 @@ struct MigrateOptions {
     // its names are rewritten and its imports added, and nothing else -- it
     // has no package table, no spec and no landing.
     bool lib = false;
+    // Functions of the index's libs that land the download the old way (find
+    // the extracted directory, move it into the install directory), named as
+    // a recipe calls them (`sysroot.adopt_payload`): a call of one as a
+    // statement of install() is that recipe's landing, replaced by `strip`.
+    std::vector<std::string> landing_calls;
 };
 
 Migration migrate_recipe(std::string_view text, MigrateOptions options = {});
@@ -271,7 +276,7 @@ struct Landing {
     bool whole = false;                              // nothing else is left in it
 };
 
-std::optional<Landing> landing_install(std::string_view code) {
+std::optional<Landing> landing_install(std::string_view code, const std::vector<std::string>& landing_calls) {
     const auto span = function_span(code, "install");
     if (!span) return std::nullopt;
     const auto body = statements(code, span->first, span->second);
@@ -279,9 +284,54 @@ std::optional<Landing> landing_install(std::string_view code) {
     Landing l { .function = *span };
     std::set<std::string> sources, dirs{"pkginfo.install_dir()"};
     bool removed = false, moved = false, other = false;
+    // `name` as a whole word of compact code.
+    const auto names = [](std::string_view c, const std::string& name) {
+        for (auto at = c.find(name); at != std::string_view::npos; at = c.find(name, at + 1)) {
+            const bool before = at == 0 || !name_char(c[at - 1]);
+            const bool after = at + name.size() >= c.size() || !name_char(c[at + name.size()]);
+            if (before && after) return true;
+        }
+        return false;
+    };
+    const auto names_source = [&](std::string_view c) {
+        return std::ranges::any_of(sources, [&](const std::string& v) { return names(c, v); });
+    };
+    const auto is_tryrm = [&](const std::string& c) {
+        return c.starts_with("os.tryrm(") && c.ends_with(")") && dirs.contains(c.substr(9, c.size() - 10));
+    };
+    const auto is_move = [&](const std::string& c) {
+        if (!c.starts_with("os.mv(") || !c.ends_with(")")) return false;
+        const auto inner = c.substr(6, c.size() - 7);
+        const auto comma = inner.rfind(',');
+        if (comma == std::string::npos || !dirs.contains(inner.substr(comma + 1))) return false;
+        const auto src = inner.substr(0, comma);
+        return sources.contains(src) || landing_source(src) || relative_extracted(src);
+    };
+    std::set<std::size_t> taken;   // statements removed as a guard's
     for (std::size_t k = 1; k + 1 < body.size(); ++k) {
+        if (taken.contains(k)) continue;
         const auto& st = body[k];
         const auto& c = st.code;
+        // A guard on the extracted directory -- `if os.isdir(src) then` the
+        // landing `end`, or `if not ... then raise(...) end` -- goes with it:
+        // under the host's landing the directory is never there to test.
+        if (c.starts_with("if") && c.ends_with("then") && names_source(c)) {
+            int depth = 1;
+            std::size_t j = k + 1;
+            bool inner_ok = true;
+            for (; j + 1 < body.size(); ++j) {
+                const auto& ic = body[j].code;
+                if (ic == "end") { if (--depth == 0) break; continue; }
+                if (ic.ends_with("then") || ic.ends_with("do")) { ++depth; inner_ok = false; continue; }
+                if (is_tryrm(ic)) { removed = true; continue; }
+                if (is_move(ic)) { moved = true; continue; }
+                if (ic.starts_with("raise(") || ic.starts_with("error(")) continue;
+                inner_ok = false;
+            }
+            if (depth != 0 || !inner_ok) return std::nullopt;
+            for (std::size_t m = k; m <= j; ++m) { taken.insert(m); l.remove.emplace_back(body[m].from, body[m].to); }
+            continue;
+        }
         if (c.starts_with("local") && c.find('=') != std::string::npos && c.find(',') > c.find('=')) {
             const auto eq = c.find('=');
             const auto var = c.substr(5, eq - 5);
@@ -291,28 +341,28 @@ std::optional<Landing> landing_install(std::string_view code) {
             other = true;
             continue;
         }
-        if (c.starts_with("os.tryrm(") && c.ends_with(")") && dirs.contains(c.substr(9, c.size() - 10))) {
+        if (is_tryrm(c)) {
             removed = true;
             l.remove.emplace_back(st.from, st.to);
             continue;
         }
         if (c.starts_with("os.mv(") && c.ends_with(")")) {
-            const auto inner = c.substr(6, c.size() - 7);
-            const auto comma = inner.rfind(',');
-            if (comma != std::string::npos && dirs.contains(inner.substr(comma + 1))) {
-                const auto src = inner.substr(0, comma);
-                if (sources.contains(src) || landing_source(src) || relative_extracted(src)) {
-                    moved = true;
-                    l.remove.emplace_back(st.from, st.to);
-                    continue;
-                }
-            }
-            return std::nullopt;
+            if (!is_move(c)) return std::nullopt;
+            moved = true;
+            l.remove.emplace_back(st.from, st.to);
+            continue;
+        }
+        // A lib function the index names as a landing: the whole of it.
+        if (std::ranges::any_of(landing_calls, [&](const std::string& f) {
+                return c.starts_with(f + "(") && c.ends_with(")"); })) {
+            removed = moved = true;
+            l.remove.emplace_back(st.from, st.to);
+            continue;
         }
         if (c == "returntrue") continue;
         // Anything else that looks for the download or the extracted
         // directory is a landing this does not know.
-        if (c.find("install_file()") != std::string::npos) return std::nullopt;
+        if (c.find("install_file()") != std::string::npos || names_source(c)) return std::nullopt;
         other = true;
     }
     if (!removed || !moved) return std::nullopt;
@@ -427,7 +477,7 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
     };
 
     // 1. The landing install().
-    std::optional<Landing> landing = options.lib ? std::nullopt : landing_install(code);
+    std::optional<Landing> landing = options.lib ? std::nullopt : landing_install(code, options.landing_calls);
     std::vector<std::pair<std::size_t, std::size_t>> gone;   // removed spans
     if (landing) {
         const auto tables = platform_tables(code);

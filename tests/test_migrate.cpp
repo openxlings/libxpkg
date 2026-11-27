@@ -59,6 +59,76 @@ end
     EXPECT_TRUE(has(m.text, "import(\"xim.libxpkg.path\")"));
 }
 
+// A guard on the extracted directory goes with the landing: under the host's
+// landing the directory is never there to test.
+TEST(MigrateTest, AGuardOnTheExtractedDirectoryGoesWithTheLanding) {
+    const auto m = migrate_recipe(recipe(R"LUA(
+function install()
+    local dir = pkginfo.install_dir()
+    local payload = pkginfo.install_file():replace(".tar.gz", "")
+    if os.isdir(payload) then
+        os.tryrm(dir)
+        os.mv(payload, dir)
+    end
+    return os.isfile(path.join(dir, "bin", "ps"))
+end
+)LUA"));
+    EXPECT_TRUE(m.spec3);
+    EXPECT_TRUE(m.landing_removed);
+    EXPECT_FALSE(has(m.text, "payload")) << m.text;
+    EXPECT_FALSE(has(m.text, "\n    end\n")) << m.text;
+    EXPECT_TRUE(has(m.text, "return fs.is_file(path.join(dir, \"bin\", \"ps\"))")) << m.text;
+
+    const auto raised = migrate_recipe(recipe(R"LUA(
+function install()
+    local dir = pkginfo.install_dir()
+    os.tryrm(dir)
+    local extracted = pkginfo.install_file():replace(".tar.xz", "")
+    if not os.isdir(extracted) then
+        raise("the payload was not found at " .. extracted)
+    end
+    os.mv(extracted, dir)
+    io.writefile(path.join(dir, "stamp"), "x")
+    return true
+end
+)LUA"));
+    EXPECT_TRUE(raised.spec3);
+    EXPECT_FALSE(has(raised.text, "extracted")) << raised.text;
+    EXPECT_TRUE(has(raised.text, "fs.write(path.join(dir, \"stamp\"), \"x\")")) << raised.text;
+}
+
+// A landing variable used for anything else is not a landing the tool knows.
+TEST(MigrateTest, ALandingVariableUsedElsewhereIsForAPerson) {
+    const auto m = migrate_recipe(recipe(R"LUA(
+function install()
+    local dir = pkginfo.install_dir()
+    local payload = pkginfo.install_file():replace(".tar.gz", "")
+    os.tryrm(dir)
+    os.mv(payload, dir)
+    log.info("landed " .. payload)
+    return true
+end
+)LUA"));
+    EXPECT_FALSE(m.landing_removed);
+}
+
+// A lib function the index names as a landing is one.
+TEST(MigrateTest, AnIndexLandingCallIsALanding) {
+    const auto text = recipe(R"LUA(
+import("xim.pkgindex.sysroot")
+function install()
+    sysroot.adopt_payload()
+    return true
+end
+)LUA");
+    EXPECT_FALSE(migrate_recipe(text).landing_removed);
+    const auto m = migrate_recipe(text, { .landing_calls = { "sysroot.adopt_payload" } });
+    EXPECT_TRUE(m.landing_removed);
+    EXPECT_TRUE(m.spec3);
+    EXPECT_FALSE(has(m.text, "adopt_payload")) << m.text;
+    EXPECT_TRUE(has(m.text, "strip = 1")) << m.text;
+}
+
 TEST(MigrateTest, ALandingBesideOtherStatementsLeavesThem) {
     const auto m = migrate_recipe(recipe(R"LUA(
 function install()

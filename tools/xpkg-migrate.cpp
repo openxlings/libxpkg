@@ -1,14 +1,16 @@
 // xpkg-migrate: rewrite recipes of spec "1" or "2" into spec "3" (design
 // 2026-11-27 §9.6). Built with `mcpp build --features tools`.
 //
-//   xpkg-migrate [--write] [--summary] <recipe.lua | index dir> ...
+//   xpkg-migrate [--write] [--summary] [--landing-call <lib.fn>]... <recipe.lua | index dir> ...
 //
 // An index directory brings its libs/ along; a file in a libs/ directory is a
 // lib (its names and imports rewritten, nothing else).
 //
 // Without --write it changes nothing and prints, per recipe, what it would
 // rewrite and what is left for a person; with --write it rewrites the files.
-// --summary prints only the counts.
+// --summary prints only the counts. --landing-call names a function of the
+// index's libs that lands the download the old way (`sysroot.adopt_payload`):
+// install()'s call of it is its landing, replaced by `strip`.
 import std;
 import mcpplibs.xpkg;
 import mcpplibs.xpkg.migrate;
@@ -19,12 +21,15 @@ using namespace mcpplibs::xpkg;
 int main(int argc, char** argv) {
     bool write = false, summary = false;
     std::vector<fs::path> recipes;
+    std::vector<std::string> landing_calls;
     for (int i = 1; i < argc; ++i) {
         const std::string_view a = argv[i];
         if (a == "--write") { write = true; continue; }
         if (a == "--summary") { summary = true; continue; }
+        if (a == "--landing-call" && i + 1 < argc) { landing_calls.emplace_back(argv[++i]); continue; }
         if (a == "-h" || a == "--help") {
-            std::println("usage: xpkg-migrate [--write] [--summary] <recipe.lua | index dir> ...");
+            std::println("usage: xpkg-migrate [--write] [--summary] [--landing-call <lib.fn>]... "
+                         "<recipe.lua | index dir> ...");
             return 0;
         }
         const fs::path p(a);
@@ -51,7 +56,7 @@ int main(int argc, char** argv) {
         if (declared_spec(text) == "3") { ++already; continue; }
         // A file of an index's libs/ is a lib: names and imports only.
         const bool lib = r.parent_path().filename() == "libs";
-        const auto m = migrate_recipe(text, { .lib = lib });
+        const auto m = migrate_recipe(text, { .lib = lib, .landing_calls = landing_calls });
         if (m.landing_removed) ++landed;
         if (m.spec3) ++full;
         else if (m.text != text) ++partly;

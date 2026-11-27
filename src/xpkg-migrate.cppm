@@ -30,7 +30,14 @@ struct Migration {
     std::vector<MigrationNote> left;          // for a person
 };
 
-Migration migrate_recipe(std::string_view text);
+struct MigrateOptions {
+    // An index lib (libs/<name>.lua): imported by recipes of every spec, so
+    // its names are rewritten and its imports added, and nothing else -- it
+    // has no package table, no spec and no landing.
+    bool lib = false;
+};
+
+Migration migrate_recipe(std::string_view text, MigrateOptions options = {});
 
 } // export namespace mcpplibs::xpkg
 
@@ -400,7 +407,7 @@ std::set<std::string> imported(std::string_view text) {
 
 namespace mcpplibs::xpkg {
 
-Migration migrate_recipe(std::string_view source) {
+Migration migrate_recipe(std::string_view source, MigrateOptions options) {
     using namespace migrate_detail;
     Migration m;
     std::string text(source);
@@ -415,7 +422,7 @@ Migration migrate_recipe(std::string_view source) {
     };
 
     // 1. The landing install().
-    std::optional<Landing> landing = landing_install(code);
+    std::optional<Landing> landing = options.lib ? std::nullopt : landing_install(code);
     std::vector<std::pair<std::size_t, std::size_t>> gone;   // removed spans
     if (landing) {
         const auto tables = platform_tables(code);
@@ -519,7 +526,7 @@ Migration migrate_recipe(std::string_view source) {
     }
     // An install() that still lands the download itself: in spec 3 the host
     // has placed it before install() runs, so this code would undo that.
-    if (!landing) {
+    if (!landing && !options.lib) {
         if (const auto span = function_span(code, "install")) {
             const std::array<std::string_view, 3> landing_marks{"install_file()", "os.tryrm(pkginfo.install_dir())", "os.mv("};
             for (const auto mark : landing_marks) {
@@ -590,7 +597,7 @@ Migration migrate_recipe(std::string_view source) {
         return a.line == b.line && a.name == b.name;
     });
     m.left.erase(dup.begin(), dup.end());
-    if (m.left.empty()) {
+    if (m.left.empty() && !options.lib) {
         const auto rcode = recipe_code(text);
         const auto declared = declared_spec(text);
         bool done = false;

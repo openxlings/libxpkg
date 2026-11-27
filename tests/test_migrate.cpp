@@ -139,3 +139,20 @@ TEST(MigrateTest, ACallAtTheTopLevelIsForAPerson) {
     ASSERT_FALSE(m.left.empty());
     EXPECT_EQ(m.left.front().line, 1);
 }
+
+TEST(MigrateTest, ALibGetsItsNamesAndImportsAndNoSpec) {
+    const auto m = migrate_recipe(R"LUA(local M = {}
+function M.recipe_text(name)
+    return string.format('package = { spec = "1", name = %q }', name)
+end
+function M.stamp(dir)
+    io.writefile(path.join(dir, "stamp"), "x")
+end
+return M
+)LUA", { .lib = true });
+    EXPECT_FALSE(m.spec3);
+    EXPECT_TRUE(has(m.text, "spec = \"1\""));   // the text it makes is not its own spec
+    EXPECT_TRUE(has(m.text, "fs.write(path.join(dir, \"stamp\"), \"x\")"));
+    EXPECT_TRUE(has(m.text, "import(\"xim.libxpkg.fs\")"));
+    EXPECT_TRUE(m.left.empty());
+}

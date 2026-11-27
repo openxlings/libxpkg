@@ -3,6 +3,9 @@
 //
 //   xpkg-migrate [--write] [--summary] <recipe.lua | index dir> ...
 //
+// An index directory brings its libs/ along; a file in a libs/ directory is a
+// lib (its names and imports rewritten, nothing else).
+//
 // Without --write it changes nothing and prints, per recipe, what it would
 // rewrite and what is left for a person; with --write it rewrites the files.
 // --summary prints only the counts.
@@ -29,6 +32,9 @@ int main(int argc, char** argv) {
             const auto pkgs = fs::is_directory(p / "pkgs") ? p / "pkgs" : p;
             for (const auto& e : fs::recursive_directory_iterator(pkgs))
                 if (e.is_regular_file() && e.path().extension() == ".lua") recipes.push_back(e.path());
+            if (pkgs != p && fs::is_directory(p / "libs"))
+                for (const auto& e : fs::directory_iterator(p / "libs"))
+                    if (e.is_regular_file() && e.path().extension() == ".lua") recipes.push_back(e.path());
         } else {
             recipes.push_back(p);
         }
@@ -43,7 +49,9 @@ int main(int argc, char** argv) {
         ss << in.rdbuf();
         const auto text = std::move(ss).str();
         if (declared_spec(text) == "3") { ++already; continue; }
-        const auto m = migrate_recipe(text);
+        // A file of an index's libs/ is a lib: names and imports only.
+        const bool lib = r.parent_path().filename() == "libs";
+        const auto m = migrate_recipe(text, { .lib = lib });
         if (m.landing_removed) ++landed;
         if (m.spec3) ++full;
         else if (m.text != text) ++partly;

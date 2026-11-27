@@ -5,3 +5,6 @@
 *.mpp linguist-language=cpp
 *.mpp linguist-detectable=true
 *.mpp linguist-documentation=false
+# The specification is one text, byte for byte, in libxpkg and in xlings:
+# LF everywhere, as the C++ literal that embeds it is.
+docs/spec/xpkg.md text eol=lf

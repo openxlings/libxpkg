@@ -15,11 +15,13 @@ local _COMPLETION_DST = {
     pwsh = function(name) return "usr/share/powershell/completions/" .. name .. ".ps1" end,
 }
 
-local function _completion(name, entry, completion)
+-- The operations a completion declaration adds, all checked before any is
+-- kept: a refused declaration leaves nothing of the add behind.
+local function _completion_ops(name, entry, completion)
     if type(completion) ~= "table" then
         error(string.format("xvm.add(%q): completion is a table of shell = file", name), 3)
     end
-    local shells = {}
+    local shells, ops = {}, {}
     for shell in pairs(completion) do table.insert(shells, shell) end
     table.sort(shells)
     for _, shell in ipairs(shells) do
@@ -33,7 +35,7 @@ local function _completion(name, entry, completion)
             error(string.format("xvm.add(%q): completion.%s is a file of the payload, relative to its root",
                 name, shell), 3)
         end
-        table.insert(_XVM_OPS, {
+        table.insert(ops, {
             op = "add",
             name = name .. ".completion." .. shell,
             version = entry.version,
@@ -45,6 +47,7 @@ local function _completion(name, entry, completion)
             dst = _COMPLETION_DST[shell](name),
         })
     end
+    return ops
 end
 
 --- Register one entry with the version manager.
@@ -98,8 +101,9 @@ function M.add(name, opt)
     }
     local log = _get_log()
     if log then log.debug("xvm add %s version=%s", name, entry.version) end
+    local completion = opt.completion ~= nil and _completion_ops(name, entry, opt.completion) or {}
     table.insert(_XVM_OPS, entry)
-    if opt.completion ~= nil then _completion(name, entry, opt.completion) end
+    for _, op in ipairs(completion) do table.insert(_XVM_OPS, op) end
 end
 
 

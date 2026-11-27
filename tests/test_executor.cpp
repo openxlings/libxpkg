@@ -2816,6 +2816,11 @@ TEST(ExecutorTest, XvmAdd_CompletionForAnUnknownShellOrAnAbsoluteFileFails) {
         EXPECT_FALSE(hook.success) << body;
         EXPECT_NE(hook.error.find("completion"), std::string::npos) << hook.error;
     }
+    // Refused under pcall, the declaration leaves nothing of itself: not the
+    // program's entry, not a shell checked before the refused one.
+    auto ops = ops_from_config(dir,
+        "    assert(not pcall(xvm.add, \"t\", { bindir = \"bin\", completion = { bash = \"t.bash\", zsh = \"/t\" } }))");
+    EXPECT_TRUE(ops.empty()) << ops.size();
     fs::remove_all(dir);
 }
 

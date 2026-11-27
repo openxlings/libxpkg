@@ -3890,19 +3890,21 @@ TEST(ExecutionBoundaryTest, TheTopLevelIsReadForTheTarget) {
     write_text(recipe, R"LUA(package = { spec = "2", name = "facts", xpm = { linux = { ["1.0.0"] = {} } } }
 import("xim.libxpkg.pkginfo")
 local read_for = pkginfo.platform() .. "/" .. pkginfo.arch() .. "/" .. os.host()
+-- xmake's names, as the loader's read defines them (one recipe, one answer).
+    .. "/" .. os.arch() .. "/" .. tostring(is_arch("arm64")) .. "/" .. tostring(is_plat("macosx", "linux"))
 function installed() return read_for end
 )LUA");
     const ReadTarget target{"linux", "arm64"};
     auto ctx = make_context(temp, "linux");
     auto local = create_executor(recipe, target);
     ASSERT_TRUE(local) << local.error();
-    EXPECT_EQ(local->run_hook(HookType::Installed, ctx).version, "linux/aarch64/linux");
+    EXPECT_EQ(local->run_hook(HookType::Installed, ctx).version, "linux/aarch64/linux/arm64/true/true");
 
     HookWorker worker;
     auto remote = create_executor(recipe, [&](const HookInvocation& request) { return worker.dispatch(request); },
                                   target);
     ASSERT_TRUE(remote) << remote.error();
-    EXPECT_EQ(remote->run_hook(HookType::Installed, ctx).version, "linux/aarch64/linux");
+    EXPECT_EQ(remote->run_hook(HookType::Installed, ctx).version, "linux/aarch64/linux/arm64/true/true");
 
     // Told nothing, the top level is outside any install.
     auto untold = create_executor(recipe);

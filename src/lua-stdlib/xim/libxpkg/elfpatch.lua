@@ -859,9 +859,11 @@ function M.closure_lib_paths(opt)
     end
 
     -- Self libdirs: prefer self_exports.libdirs (already absolute, declared
-    -- by the package itself); fall back to {lib64, lib} convention.
-    local self_libdirs = _RUNTIME and _RUNTIME.self_exports and _RUNTIME.self_exports.libdirs
-    if self_libdirs and #self_libdirs > 0 then
+    -- by the package itself; `libdirs = {}` declares none); fall back to
+    -- {lib64, lib} convention.
+    local self_exports = _RUNTIME and _RUNTIME.self_exports
+    local self_libdirs = self_exports and self_exports.libdirs
+    if self_libdirs and (#self_libdirs > 0 or self_exports.libdirs_declared) then
         for _, d in ipairs(self_libdirs) do _push(d) end
     else
         local install_dir = _RUNTIME and _RUNTIME.install_dir
@@ -904,8 +906,10 @@ function M.closure_lib_paths(opt)
         local rec      = resolved[dep_spec]
         if declared and declared.libdirs and #declared.libdirs > 0 then
             for _, d in ipairs(declared.libdirs) do _push(d) end
-        elseif rec and rec.libdirs and #rec.libdirs > 0 then
-            for _, d in ipairs(rec.libdirs) do _push(d) end
+        elseif rec then
+            -- The resolver's answer, none included (a dep that declared
+            -- `libdirs = {}` exports no directory).
+            for _, d in ipairs(rec.libdirs or {}) do _push(d) end
         elseif _LIBXPKG_MODULES and _LIBXPKG_MODULES.pkginfo then
             -- Only a client that predates resolved_deps reaches this. Kept so
             -- an older xlings keeps working, and warned so the degraded path

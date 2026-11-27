@@ -152,6 +152,12 @@ end
 os.host = function()
     return _RUNTIME and _RUNTIME.platform or "linux"
 end
+-- The install's architecture, as the loader gives it to a recipe's top level:
+-- one recipe read twice (the loader, the executor) gives one answer.
+os.arch = function()
+    local arch = _RUNTIME and _RUNTIME.arch
+    return (arch and arch ~= "") and arch or "unknown"
+end
 os.trymv = function(src, dst)
     -- If dst is an existing directory, move src INTO it (unix mv semantics)
     if os.isdir(dst) then
@@ -317,6 +323,21 @@ end
 function is_host(name)
     local host = _RUNTIME and _RUNTIME.platform or os.host()
     return host == name
+end
+-- xmake's is_arch and is_plat, as the loader defines them for the top level.
+function is_arch(...)
+    local arch = os.arch()
+    for i = 1, select("#", ...) do
+        if select(i, ...) == arch then return true end
+    end
+    return false
+end
+function is_plat(...)
+    local host = os.host()
+    for i = 1, select("#", ...) do
+        if select(i, ...) == host then return true end
+    end
+    return false
 end
 format = string.format
 raise = function(msg) error(msg or "raise called", 2) end

@@ -1187,7 +1187,7 @@ std::optional<std::string> check_spec3_top_level(const fs::path& pkg_path, const
         // Index libs are read from the recipe's index (pkgs/<letter>/<file>),
         // three levels up the absolute path (a relative one has no parent there).
         std::error_code ec;
-        const auto absolute = fs::absolute(pkg_path, ec);
+        const auto absolute = fs::absolute(pkg_path, ec).lexically_normal();
         const auto index = (ec ? pkg_path : absolute).parent_path().parent_path().parent_path();
         ec.clear();
         if (fs::is_directory(index / "libs", ec)) {

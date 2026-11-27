@@ -41,6 +41,7 @@ export namespace mcpplibs::xpkg {
 struct DepExport {
     std::string loader;                       // absolute path or empty
     std::vector<std::string> libdirs;         // absolute paths (already joined)
+    bool libdirs_declared { false };          // `libdirs` written; `{}` is none
     std::string abi;                          // e.g. "linux-x86_64-glibc"
 };
 
@@ -486,6 +487,8 @@ void inject_context(lua::State* L, const mcpplibs::xpkg::ExecutionContext& ctx) 
         set_string_field(L, "loader", e.loader);
         set_string_field(L, "abi",    e.abi);
         push_string_array(e.libdirs, "libdirs");
+        lua::pushboolean(L, e.libdirs_declared);
+        lua::setfield(L, -2, "libdirs_declared");
         lua::setfield(L, -2, dep_spec.c_str());
     }
     lua::setfield(L, -2, "deps_exports");
@@ -512,6 +515,8 @@ void inject_context(lua::State* L, const mcpplibs::xpkg::ExecutionContext& ctx) 
     set_string_field(L, "loader", ctx.self_exports.loader);
     set_string_field(L, "abi",    ctx.self_exports.abi);
     push_string_array(ctx.self_exports.libdirs, "libdirs");
+    lua::pushboolean(L, ctx.self_exports.libdirs_declared);
+    lua::setfield(L, -2, "libdirs_declared");
     lua::setfield(L, -2, "self_exports");
 
     // args as array table
@@ -1756,7 +1761,7 @@ create_executor(const fs::path& pkg_path, const ReadTarget& target = {}) {
     // A recipe in no index with libs reads the host's (target.pkgindex_dir).
     {
         std::error_code abs_ec;
-        auto absolute = fs::absolute(pkg_path, abs_ec);
+        auto absolute = fs::absolute(pkg_path, abs_ec).lexically_normal();
         auto pkgindex = (abs_ec ? pkg_path : absolute).parent_path().parent_path().parent_path();
         std::error_code ec;
         if (!fs::is_directory(pkgindex / "libs", ec)) {

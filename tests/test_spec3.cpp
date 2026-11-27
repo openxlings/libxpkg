@@ -110,8 +110,12 @@ function install() return probelib.word() == "lib" end
     const auto here = fs::current_path();
     fs::current_path(index.root);
     auto result = install(fs::path("pkgs") / "p" / "probe.lua", index.context());
+    // Through `..` too: the index is three levels up the normal path.
+    fs::current_path(index.root / "pkgs" / "p");
+    auto dotted = install(fs::path("..") / "p" / "probe.lua", index.context());
     fs::current_path(here);
     EXPECT_TRUE(result.success) << result.error;
+    EXPECT_TRUE(dotted.success) << dotted.error;
 }
 
 TEST(Spec3EnvTest, TheSameTextWithSpec2HasTheCompatibilityLayer) {

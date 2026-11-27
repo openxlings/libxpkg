@@ -66,22 +66,48 @@ TEST(CompatFrozenTest, OsExecOfAFailingCommandReturnsItsStatusAndIsRecorded) {
 }
 
 // #743: an index lib that is not there is a stand-in so the recipe can still
-// be read; a hook that calls it did not do what it says, and the host is told
-// which call, of which lib, and why (design 2026-11-27 §20.1).
-TEST(CompatFrozenTest, ACallIntoAMissingIndexLibIsAFailedCall) {
+// be read; a hook that calls it raises, naming the call, the lib and why --
+// what the stand-in would answer must not reach the next action (design
+// 2026-11-27 §20.1). A recipe that handles it (pcall) goes on.
+TEST(CompatFrozenTest, ACallIntoAMissingIndexLibFailsTheHook) {
     Recipe r(R"LUA(
     import("xim.pkgindex.probe")
-    local v = probe.f()
-    probe.g.h(1)
     assert(type(probe.f) == "table")   -- a probe of the function's type still reads as absent
+    local ok, err = pcall(probe.g.h, 1)
+    assert(not ok and tostring(err):find("probe.g.h", 1, true), tostring(err))
+    local v = probe.f()
+    error("not reached: " .. tostring(v))
     )LUA");
     auto result = r.install();
-    ASSERT_TRUE(result.success) << result.error;
-    ASSERT_EQ(result.call_failures.size(), 2u);
-    EXPECT_EQ(result.call_failures[0].call, "import(\"xim.pkgindex.probe\")");
-    EXPECT_EQ(result.call_failures[0].what, "probe.f");
-    EXPECT_NE(result.call_failures[0].why.find("no index"), std::string::npos) << result.call_failures[0].why;
-    EXPECT_EQ(result.call_failures[1].what, "probe.g.h");
+    ASSERT_FALSE(result.success);
+    EXPECT_NE(result.error.find("probe.f: import(\"xim.pkgindex.probe\") did not load: "), std::string::npos)
+        << result.error;
+    EXPECT_NE(result.error.find("no index"), std::string::npos) << result.error;
+    EXPECT_EQ(result.error.find("not reached"), std::string::npos) << result.error;
+    EXPECT_TRUE(result.call_failures.empty());
+}
+
+// Reading the recipe is not a hook: a stand-in called at the top level answers
+// with another stand-in, as it always did, so a search or an index build reads it.
+TEST(CompatFrozenTest, AMissingIndexLibIsInertWhileTheRecipeIsRead) {
+    const auto dir = fs::temp_directory_path() / ("xpkg-compat-read-" + std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count()));
+    fs::create_directories(dir);
+    const auto file = dir / "read.lua";
+    std::ofstream(file, std::ios::binary)
+        << "package = { spec = \"2\", name = \"read\", xpm = { linux = { [\"1.0.0\"] = {} } } }\n"
+        << "import(\"xim.pkgindex.probe\")\n"
+        << "local made = probe.recipe_text(\"x\")\n"
+        << "function installed() return tostring(made) == \"\" and \"1.0.0\" or \"\" end\n";
+    auto exec = create_executor(file);
+    ASSERT_TRUE(exec) << exec.error();
+    ExecutionContext ctx;
+    ctx.platform = kWindows ? "windows" : "linux";
+    const auto result = exec->run_hook(HookType::Installed, ctx);
+    EXPECT_TRUE(result.success) << result.error;
+    EXPECT_EQ(result.version, "1.0.0");
+    std::error_code ec;
+    fs::remove_all(dir, ec);
 }
 
 // E16: os.mv of a directory that is not there returns false; the hook reports

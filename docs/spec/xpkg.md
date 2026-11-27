@@ -53,7 +53,11 @@ libxpkg reads what that libxpkg reads.
 A recipe defines the global `package` at its top level. Its top level is
 evaluated whenever the recipe is read (search, an index build, an install), so
 it only computes: a recipe of spec `"3"` may call only `pure` names there
-(§6.2); the host's work happens in hooks.
+(§6.2); the host's work happens in hooks. Each read is for a platform and an
+architecture -- the loader's for the target it reads, the hook runtime's for
+the install -- and a recipe of spec 1 or 2 that computes from them at its top
+level (`pkginfo.platform()`, `pkginfo.arch()`, `os.host()`) is told the same
+at every read.
 
 ### 3.1 Fields
 
@@ -459,9 +463,10 @@ a recipe written against it keeps working. Two things differ since libxpkg
    rule for an empty payload uses it.
 3. `import("xim.pkgindex.<lib>")` of a lib the index does not have, or one
    that cannot be loaded, still answers with a stand-in, so the recipe can be
-   read; a call to it in a hook is a failed call of the hook (the lib, the
-   member, why), not a silent success. A host keeps a payload's recipe with
-   the libs it imports (§8.1), so its hooks find the libs they ran with.
+   read; a call to it in a hook raises (the member, the lib, why): the hook
+   fails unless the recipe handles it, and what the stand-in would answer
+   never reaches the next action. A host keeps a payload's recipe with the
+   libs it imports (§8.1), so its hooks find the libs they ran with.
 
 A recipe written for every client probes a capability newer than the oldest
 it supports: a new function of a module an old client has, by its presence

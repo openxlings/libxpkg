@@ -117,6 +117,16 @@ struct ExecutionContext {
     fs::path hook_log;
 };
 
+// What a recipe is read for: its top level is told the platform and the
+// architecture the way the loader tells it (pkginfo.platform(),
+// pkginfo.arch()), so a recipe computes the same at both reads; each hook then
+// gets its whole ExecutionContext. A host gives the install's. Empty: the top
+// level is told nothing, and pkginfo raises there as outside any install.
+struct ReadTarget {
+    std::string platform;
+    std::string arch;
+};
+
 inline constexpr std::size_t kMaxHookOutputBytes = 16 * 1024;
 
 // One thing a recipe said to the person installing it: a log.warn or a
@@ -1692,7 +1702,7 @@ public:
 
 // Factory
 std::expected<PackageExecutor, std::string>
-create_executor(const fs::path& pkg_path) {
+create_executor(const fs::path& pkg_path, const ReadTarget& target = {}) {
     if (!fs::exists(pkg_path)) {
         return std::unexpected("package file not found: " + pkg_path.string());
     }
@@ -1726,6 +1736,15 @@ create_executor(const fs::path& pkg_path) {
         return std::unexpected(err);
     }
 
+    // What the recipe is read for, as the loader states it; each hook replaces
+    // _RUNTIME with its whole context.
+    if (!target.platform.empty() || !target.arch.empty()) {
+        lua::newtable(L);
+        detail::set_string_field(L, "platform", target.platform);
+        detail::set_string_field(L, "arch", target.arch);
+        lua::setglobal(L, "_RUNTIME");
+    }
+
     // Derive pkgindex root from pkg_path for top-level import("xim.pkgindex.*").
     // Package files live at <pkgindex>/pkgs/<letter>/<name>.lua — 3 levels up.
     {
@@ -1749,7 +1768,7 @@ create_executor(const fs::path& pkg_path) {
 // The external boundary runs even the package's top-level Lua in the worker.
 // An empty or failing boundary is an error; it never falls back to local Lua.
 std::expected<PackageExecutor, std::string>
-create_executor(const fs::path& pkg_path, ExecutionBoundary boundary);
+create_executor(const fs::path& pkg_path, ExecutionBoundary boundary, const ReadTarget& target = {});
 
 // Use only INSIDE the consumer's isolated worker. One instance is kept for
 // one package, so recipe globals and cumulative effects survive hook calls.

@@ -79,15 +79,19 @@ function import(mod_path)
             why = "this recipe is read from no index with libs/"
         end
         -- A stand-in, so that reading the recipe (a search, an index build)
-        -- still works; but a hook that calls it did not do what it says: each
-        -- call is a failed call of the hook (the host fails the hook with it,
-        -- naming the lib), never a silent success (design 2026-11-27 §20.1).
+        -- still works. A hook that calls it raises: the call did not do what
+        -- it says, and what it would answer (an empty path, a stand-in table)
+        -- must not reach the next action (design 2026-11-27 §20.1). The hook
+        -- fails, naming the lib, the member and why, unless the recipe
+        -- handles it (pcall).
         local short = mod_path:match("[^.]+$") or mod_path
         local function make_lib_proxy(member)
             return setmetatable({}, {
                 __index = function(_, k) return make_lib_proxy(member .. "." .. tostring(k)) end,
                 __call = function()
-                    _LIBXPKG_CALL_FAILED("import(\"" .. mod_path .. "\")", member, why)
+                    if type(_LIBXPKG_CALL_FAILURES) == "table" then   -- a hook is running
+                        error(string.format('%s: import("%s") did not load: %s', member, mod_path, why), 2)
+                    end
                     return make_lib_proxy(member)
                 end,
                 __tostring = function() return '' end,

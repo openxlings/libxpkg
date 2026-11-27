@@ -46,10 +46,15 @@ HookResult PackageExecutor::execute_external_(HookAction action, const Execution
 }
 
 std::expected<PackageExecutor, std::string>
-create_executor(const fs::path& pkg_path, ExecutionBoundary boundary) {
+create_executor(const fs::path& pkg_path, ExecutionBoundary boundary, const ReadTarget& target) {
     if (!boundary) return std::unexpected("hook execution boundary is empty");
     try {
-        auto loaded = boundary({.action = HookAction::Load, .package = pkg_path});
+        // Load carries what the recipe is read for (the context's platform
+        // and arch); the worker states it to the top level.
+        ExecutionContext read;
+        read.platform = target.platform;
+        read.arch = target.arch;
+        auto loaded = boundary({.action = HookAction::Load, .package = pkg_path, .context = std::move(read)});
         if (!loaded) return std::unexpected("hook boundary: " + loaded.error());
         if (!loaded->result.success)
             return std::unexpected("hook boundary load failed: " + loaded->result.error);
@@ -64,7 +69,8 @@ create_executor(const fs::path& pkg_path, ExecutionBoundary boundary) {
 std::expected<HookResponse, std::string> HookWorker::dispatch(const HookInvocation& invocation) {
     if (invocation.action == HookAction::Load) {
         if (executor_) return std::unexpected("hook worker already has a package; start a new worker");
-        auto loaded = create_executor(invocation.package);
+        auto loaded = create_executor(invocation.package,
+                                      ReadTarget{invocation.context.platform, invocation.context.arch});
         if (!loaded) return std::unexpected(loaded.error());
         package_ = invocation.package;
         executor_.emplace(std::move(*loaded));

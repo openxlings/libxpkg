@@ -92,11 +92,43 @@ std::vector<std::size_t> top_commas(std::string_view code, std::size_t open, std
     return out;
 }
 
-// The call at `at` is a statement: the first thing on its line.
-bool is_statement(std::string_view code, std::size_t at) {
-    std::size_t i = at;
-    while (i > 0 && (code[i - 1] == ' ' || code[i - 1] == '\t')) --i;
-    return i == 0 || code[i - 1] == '\n' || code[i - 1] == ';';
+// The call at `at` begins a statement: what comes before it ends one (the
+// start of the text, `;`, a closing bracket, a string, a name, or a keyword
+// that opens a block: `then`, `do`, `else`, `repeat`, `end`), not one that
+// asks for a value (an operator, `=`, `,`, an opening bracket, `return`, a
+// condition's keyword). `code` is `text` blanked; a string or comment between
+// the last code and the call is read from `text`.
+bool is_statement(std::string_view text, std::string_view code, std::size_t at) {
+    std::size_t p = at;
+    while (p > 0 && (code[p - 1] == ' ' || code[p - 1] == '\t' || code[p - 1] == '\n' || code[p - 1] == '\r')) --p;
+    for (std::size_t k = p; k < at; ++k) {
+        if (text[k] == '-' && k + 1 < at && text[k + 1] == '-') {
+            // A comment: a long one to its closing bracket, else to its line's end.
+            std::size_t b = k + 2, level = 0;
+            if (b < at && text[b] == '[') {
+                std::size_t e = b + 1;
+                while (e < at && text[e] == '=') { ++level; ++e; }
+                if (e < at && text[e] == '[') {
+                    const auto close = text.find("]" + std::string(level, '=') + "]", e + 1);
+                    k = close == std::string_view::npos ? at : close + level + 1;
+                    continue;
+                }
+            }
+            while (k < at && text[k] != '\n') ++k;
+            continue;
+        }
+        if (text[k] == '"' || text[k] == '\'' || text[k] == '[') return true;   // a string ends the expression
+    }
+    if (p == 0) return true;
+    const char c = code[p - 1];
+    if (c == ';' || c == ')' || c == ']' || c == '}') return true;
+    if (!name_char(c)) return false;
+    std::size_t w = p;
+    while (w > 0 && name_char(code[w - 1])) --w;
+    const auto word = code.substr(w, p - w);
+    for (const std::string_view value : {"and", "or", "not", "return", "if", "elseif", "while", "until", "in", "local"})
+        if (word == value) return false;
+    return true;
 }
 
 // Each use of `name` in the code: a whole dotted name, not a field of something else.
@@ -307,6 +339,16 @@ std::optional<Landing> landing_install(std::string_view code, const std::vector<
         const auto src = inner.substr(0, comma);
         return sources.contains(src) || landing_source(src) || relative_extracted(src);
     };
+    // A test of the extracted directory alone: `[not] os.isdir(src)`,
+    // `fs.is_dir(src)` or `os.exists(src)`, in compact code.
+    const auto directory_test = [&](std::string_view cond) {
+        if (cond.starts_with("not")) cond.remove_prefix(3);
+        for (const std::string_view f : {"os.isdir(", "fs.is_dir(", "os.exists("}) {
+            if (cond.starts_with(f) && cond.ends_with(")"))
+                return sources.contains(std::string(cond.substr(f.size(), cond.size() - f.size() - 1)));
+        }
+        return false;
+    };
     std::set<std::size_t> taken;   // statements removed as a guard's
     for (std::size_t k = 1; k + 1 < body.size(); ++k) {
         if (taken.contains(k)) continue;
@@ -316,6 +358,9 @@ std::optional<Landing> landing_install(std::string_view code, const std::vector<
         // landing `end`, or `if not ... then raise(...) end` -- goes with it:
         // under the host's landing the directory is never there to test.
         if (c.starts_with("if") && c.ends_with("then") && names_source(c)) {
+            // A condition that also tests a version or a platform decides more
+            // than where the directory is: for a person.
+            if (!directory_test(std::string_view(c).substr(2, c.size() - 6))) return std::nullopt;
             int depth = 1;
             std::size_t j = k + 1;
             bool inner_ok = true;
@@ -338,6 +383,10 @@ std::optional<Landing> landing_install(std::string_view code, const std::vector<
             const auto value = std::string_view(c).substr(eq + 1);
             if (value == "pkginfo.install_dir()") { dirs.insert(var); continue; }
             if (landing_source(value)) { sources.insert(var); l.remove.emplace_back(st.from, st.to); continue; }
+            // A value read from the download or the extracted directory: a
+            // use of it this does not rewrite (the landing would take the
+            // variable away), for a person.
+            if (value.find("install_file()") != std::string_view::npos || names_source(value)) return std::nullopt;
             other = true;
             continue;
         }
@@ -352,9 +401,12 @@ std::optional<Landing> landing_install(std::string_view code, const std::vector<
             l.remove.emplace_back(st.from, st.to);
             continue;
         }
-        // A lib function the index names as a landing: the whole of it.
-        if (std::ranges::any_of(landing_calls, [&](const std::string& f) {
-                return c.starts_with(f + "(") && c.ends_with(")"); })) {
+        // A lib function the index names as a landing: the whole of it, when
+        // it is called alone -- arguments could name another source or
+        // destination than the host's landing, which is for a person to read.
+        if (std::ranges::any_of(landing_calls, [&](const std::string& f) { return c.starts_with(f + "("); })) {
+            if (!std::ranges::any_of(landing_calls, [&](const std::string& f) { return c == f + "()"; }))
+                return std::nullopt;
             removed = moved = true;
             l.remove.emplace_back(st.from, st.to);
             continue;
@@ -524,7 +576,7 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
     for (const auto at : uses(code, "os.trymv")) {
         if (in_landing(at)) continue;
         const auto open = call_paren(at, "os.trymv");
-        if (open == std::string::npos || !is_statement(code, at)) { note(at, "os.trymv", "pcall(fs.move, src, dst)"); continue; }
+        if (open == std::string::npos || !is_statement(text, code, at)) { note(at, "os.trymv", "pcall(fs.move, src, dst)"); continue; }
         edits.push_back({ at, open + 1, "pcall(fs.move, " });
         need.insert("fs");
         ++m.rewritten;
@@ -537,13 +589,13 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
         edits.push_back({ at, open + 1, "system.run(" });
         // As a statement its output was dropped, and `x.out` alone is no Lua
         // statement: system.run(x), like os.execute's.
-        if (!is_statement(code, at)) edits.push_back({ close + 1, close + 1, ".out" });
+        if (!is_statement(text, code, at)) edits.push_back({ close + 1, close + 1, ".out" });
         need.insert("system");
         ++m.rewritten;
     }
     for (const auto at : uses(code, "os.execute")) {
         if (in_landing(at)) continue;
-        if (!is_statement(code, at) || call_paren(at, "os.execute") == std::string::npos) {
+        if (!is_statement(text, code, at) || call_paren(at, "os.execute") == std::string::npos) {
             note(at, "os.execute", "system.run(cmd) where its result is used");
             continue;
         }

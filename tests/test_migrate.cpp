@@ -129,6 +129,70 @@ end
     EXPECT_TRUE(has(m.text, "strip = 1")) << m.text;
 }
 
+// What reads the landing's variable, or a guard that tests more than the
+// directory, or a landing call given arguments, is for a person: removing the
+// landing would change what the hook does.
+TEST(MigrateTest, AUseOfTheLandingTheToolCannotRewriteIsForAPerson) {
+    const auto local_use = migrate_recipe(recipe(R"LUA(
+function install()
+    local dir = pkginfo.install_dir()
+    local src = pkginfo.install_file():replace(".tar.gz", "")
+    local present = os.isdir(src)
+    os.tryrm(dir)
+    os.mv(src, dir)
+    return present
+end
+)LUA"));
+    EXPECT_FALSE(local_use.landing_removed) << local_use.text;
+    EXPECT_TRUE(has(local_use.text, "src")) << local_use.text;
+
+    const auto compound = migrate_recipe(recipe(R"LUA(
+function install()
+    local dir = pkginfo.install_dir()
+    local src = pkginfo.install_file():replace(".tar.gz", "")
+    if os.isdir(src) and pkginfo.version() == "1.0" then
+        os.tryrm(dir)
+        os.mv(src, dir)
+    end
+    return true
+end
+)LUA"));
+    EXPECT_FALSE(compound.landing_removed) << compound.text;
+
+    const auto text = recipe(R"LUA(
+import("xim.pkgindex.sysroot")
+function install()
+    sysroot.adopt_payload(nil, pkginfo.install_dir() .. "/sub")
+    return true
+end
+)LUA");
+    const auto argued = migrate_recipe(text, { .landing_calls = { "sysroot.adopt_payload" } });
+    EXPECT_FALSE(argued.landing_removed) << argued.text;
+    EXPECT_TRUE(has(argued.text, "adopt_payload(")) << argued.text;
+}
+
+// os.iorun's output is kept where a value is asked for -- after `=` on the
+// line before, as an argument -- and dropped where a statement begins, after
+// `then` or a string included; the result is Lua either way.
+TEST(MigrateTest, OsIorunIsAValueWhereOneIsAskedFor) {
+    const auto m = migrate_recipe(recipe(R"LUA(
+function config()
+    local out =
+        os.iorun("uname -r")
+    print(tostring(out),
+        os.iorun("id"))
+    if os.isfile("/etc/ld.so.conf") then os.iorun("ldconfig") end
+    local s = "x"
+    os.iorun("sync")
+    return true
+end
+)LUA"));
+    EXPECT_TRUE(has(m.text, "system.run(\"uname -r\").out")) << m.text;
+    EXPECT_TRUE(has(m.text, "system.run(\"id\").out")) << m.text;
+    EXPECT_TRUE(has(m.text, "then system.run(\"ldconfig\") end")) << m.text;
+    EXPECT_TRUE(has(m.text, "    system.run(\"sync\")\n")) << m.text;
+}
+
 TEST(MigrateTest, ALandingBesideOtherStatementsLeavesThem) {
     const auto m = migrate_recipe(recipe(R"LUA(
 function install()

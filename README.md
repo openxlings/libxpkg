@@ -2,20 +2,25 @@
 
 > xpkg 包描述规范的 C++23 参考实现 — `import mcpplibs.xpkg;`
 
-[![CI](https://github.com/Sunrisepeak/libxpkg/actions/workflows/ci.yml/badge.svg)](https://github.com/Sunrisepeak/libxpkg/actions/workflows/ci.yml)
+[![CI](https://github.com/openxlings/libxpkg/actions/workflows/ci.yml/badge.svg)](https://github.com/openxlings/libxpkg/actions/workflows/ci.yml)
 
-**libxpkg** 是 [xpkg 规范](https://github.com/d2learn/xim-pkgindex/blob/main/docs/V1/xpackage-spec.md) 的 C++23 标准库实现，让任何 C++ 工具都能读取、索引和执行 xpkg 格式的包定义，而无需依赖 xlings 本身。
+**libxpkg** 是 xpkg 格式的 C++23 参考实现，让任何 C++ 工具都能读取、索引、检查和执行 xpkg 的 recipe，而无需依赖 xlings 本身。
+
+格式的规范只有一份：[`docs/spec/xpkg.md`](docs/spec/xpkg.md)（在这里修改；xlings 的 `docs/specs/xpkg.md` 是它逐字的拷贝，站点发布那一份）。
+规范的可执行部分是一致性用例 [`tests/conformance/`](tests/conformance/README.md)。
 
 ## 模块
 
-libxpkg 由四个独立的 C++23 子模块组成，按依赖层级排列。可通过聚合 target `xpkg` 一次引入全部模块（`add_deps("xpkg")`），也可按需引用单个子模块：
-
-| 模块 | 头文件 | 依赖 | 功能 |
-|------|--------|------|------|
-| `mcpplibs.xpkg` | `xpkg.cppm` | 无外部依赖 | 数据模型：`Package`、`PackageIndex` 等核心类型 |
-| `mcpplibs.xpkg.loader` | `xpkg-loader.cppm` | model + lua | 解析 `.lua` 包定义文件，构建包索引 |
-| `mcpplibs.xpkg.index` | `xpkg-index.cppm` | model | 搜索、别名解析、索引合并 |
-| `mcpplibs.xpkg.executor` | `xpkg-executor.cppm` | model + lua | 执行包 Lua 钩子（install/config/uninstall） |
+| 模块 | 源文件 | 功能 |
+|------|--------|------|
+| `mcpplibs.xpkg` | `xpkg.cppm` | 数据模型：`Package`、`PackageIndex`；架构身份表 |
+| `mcpplibs.xpkg.loader` | `xpkg-loader.cppm` | 读取 recipe，构建索引；索引的声明（`index-compat.json` 的模板） |
+| `mcpplibs.xpkg.index` | `xpkg-index.cppm` | 搜索、别名解析、索引合并 |
+| `mcpplibs.xpkg.compat` | `xpkg-compat.cppm` | 资源解析（`resolve_resource`）；条目怎样说明架构 |
+| `mcpplibs.xpkg.executor` | `xpkg-executor.cppm` | 运行 hook：`spec` 为 1、2 的环境（冻结的兼容层）与 `spec = "3"` 的环境 |
+| `mcpplibs.xpkg.shell` | `xpkg-shell.cppm` | 按参数列表或经 shell 运行命令 |
+| `mcpplibs.xpkg.check` | `xpkg-check.cppm` | 格式的检查器（`check_recipe`、`check_index`）；接口清单的数据（`interface_manifest`） |
+| `mcpplibs.xpkg.conformance` | `xpkg-conformance.cppm` | 一致性用例：宿主经自己的安装跑同一组用例 |
 
 ## 快速开始
 
@@ -67,22 +72,18 @@ exec->run_hook(HookType::Uninstall, ctx);
 ```
 libxpkg/
 ├── src/
-│   ├── xpkg.cppm              # mcpplibs.xpkg — 数据模型
-│   ├── xpkg-loader.cppm       # mcpplibs.xpkg.loader
-│   ├── xpkg-index.cppm        # mcpplibs.xpkg.index
-│   ├── xpkg-executor.cppm     # mcpplibs.xpkg.executor
-│   ├── xpkg-lua-stdlib.cppm   # Lua 标准库封装（自动生成）
-│   └── lua-stdlib/            # 嵌入式 Lua 脚本
+│   ├── xpkg*.cppm             # 上表的模块
+│   └── lua-stdlib/            # 嵌入的 Lua：模块、接口清单（manifest.lua）、
+│                              # spec 3 的环境（spec3.lua）、兼容层（compat.lua）
+├── docs/spec/xpkg.md          # 格式的规范
 ├── tests/
-│   ├── fixtures/pkgindex/     # 独立测试包索引（无外部依赖）
-│   ├── test_model.cpp
-│   ├── test_loader.cppm
-│   ├── test_index.cpp
-│   └── test_executor.cpp
+│   ├── conformance/           # 一致性用例（嵌入库中，宿主可取用）
+│   ├── fixtures/              # 测试用的包索引
+│   └── test_*.cpp
 ├── examples/
 │   ├── basic.cpp              # 最小示例
 │   └── lifecycle.cpp          # 完整生命周期演示
-├── build.mcpp                 # 构建期由 lua-stdlib/ 生成嵌入式 Lua stdlib
+├── build.mcpp                 # 构建期把 lua-stdlib/ 与一致性用例嵌入为字符串
 ├── .agents/
 │   ├── docs/                  # 开发问题排查报告
 │   ├── plans/                 # 设计与实现方案
@@ -121,11 +122,8 @@ mcpp test -- --gtest_filter=-ExecutorTest.ApplyElfpatchAuto_*
 
 ## CI/CD
 
-GitHub Actions 在 Linux 上构建并测试,工具链由 mcpp 沙箱提供:
-
-| 平台 | 构建 | 状态 |
-|------|------|------|
-| Linux (ubuntu-latest) | mcpp(沙箱内 GCC) | [![CI](https://github.com/openxlings/libxpkg/actions/workflows/ci.yml/badge.svg)](https://github.com/openxlings/libxpkg/actions/workflows/ci.yml) |
+GitHub Actions 在 Linux、macOS、Windows 上构建并测试,工具链由 mcpp 沙箱提供
+(Linux 上全部测试;macOS 与 Windows 上 shell、模块接口与一致性用例)。
 
 ## 作为依赖引入
 
@@ -133,13 +131,14 @@ GitHub Actions 在 Linux 上构建并测试,工具链由 mcpp 沙箱提供:
 
 ```toml
 [dependencies]
-"mcpplibs.xpkg" = "0.0.48"
+"mcpplibs.xpkg" = "0.0.68"
 ```
 
 ## 相关链接
 
-- [xpkg 规范文档](https://github.com/d2learn/xim-pkgindex/blob/main/docs/V1/xpackage-spec.md)
-- [xim-pkgindex — 官方包索引仓库](https://github.com/d2learn/xim-pkgindex)
-- [xlings — xpkg 的参考实现](https://github.com/d2learn/xlings)
+- [xpkg 规范](docs/spec/xpkg.md)（站点上的拷贝：xlings `docs/specs/xpkg.md`）
+- [hook 接口参考](https://github.com/openxlings/xlings/blob/main/docs/generated/xpkg-hook-api.md)（由接口清单生成）
+- [xim-pkgindex — 官方包索引仓库](https://github.com/openxlings/xim-pkgindex)
+- [xlings — 使用 libxpkg 的包管理器](https://github.com/openxlings/xlings)
 - [mcpp-style-ref — 现代 C++ 编码风格参考](https://github.com/mcpp-community/mcpp-style-ref)
 - [mcpplibs/lua — C API Lua 绑定](https://github.com/mcpplibs/lua)

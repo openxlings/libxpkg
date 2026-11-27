@@ -458,16 +458,23 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
     }
     // os.trymv(a, b) -> pcall(fs.move, a, b); os.iorun(x) -> system.exec(x, { capture = true });
     // os.execute(x) as a statement -> system.exec(x); is_host("p") -> pkginfo.platform() == "p".
+    // The call's own parenthesis, right after the name; npos when the name is
+    // used as a value (pcall(os.iorun, cmd), type(os.iorun)).
+    const auto call_paren = [&](std::size_t at, std::string_view name) {
+        const auto p = code.find_first_not_of(" \t", at + name.size());
+        return p != std::string::npos && code[p] == '(' ? p : std::string::npos;
+    };
     for (const auto at : uses(code, "os.trymv")) {
-        const auto open = code.find('(', at);
-        if (open == std::string::npos || in_landing(at)) continue;
-        if (!is_statement(code, at)) { note(at, "os.trymv", "pcall(fs.move, src, dst)"); continue; }
+        if (in_landing(at)) continue;
+        const auto open = call_paren(at, "os.trymv");
+        if (open == std::string::npos || !is_statement(code, at)) { note(at, "os.trymv", "pcall(fs.move, src, dst)"); continue; }
         edits.push_back({ at, open + 1, "pcall(fs.move, " });
         need.insert("fs");
         ++m.rewritten;
     }
     for (const auto at : uses(code, "os.iorun")) {
-        const auto open = code.find('(', at);
+        if (in_landing(at)) continue;
+        const auto open = call_paren(at, "os.iorun");
         const auto close = open == std::string::npos ? open : closing(code, open);
         if (close == std::string::npos || !top_commas(code, open, close).empty()) { note(at, "os.iorun", "system.exec(cmd, { capture = true })"); continue; }
         edits.push_back({ at, open + 1, "system.exec(" });
@@ -476,7 +483,11 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
         ++m.rewritten;
     }
     for (const auto at : uses(code, "os.execute")) {
-        if (!is_statement(code, at)) { note(at, "os.execute", "system.run(cmd) where its result is used"); continue; }
+        if (in_landing(at)) continue;
+        if (!is_statement(code, at) || call_paren(at, "os.execute") == std::string::npos) {
+            note(at, "os.execute", "system.run(cmd) where its result is used");
+            continue;
+        }
         edits.push_back({ at, at + std::string_view("os.execute").size(), "system.exec" });
         need.insert("system");
         ++m.rewritten;
@@ -484,7 +495,10 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
     if (!defines(code, "is_host")) {
         for (const auto at : uses(code, "is_host")) {
             const auto open = code.find_first_not_of(" ", at + 7);
-            if (open == std::string::npos || code[open] != '(') continue;
+            if (open == std::string::npos || code[open] != '(') {
+                note(at, "is_host", "pkginfo.platform() == \"<platform>\"");
+                continue;
+            }
             const auto close = closing(code, open);
             if (close == std::string::npos || !top_commas(code, open, close).empty()) { note(at, "is_host", "pkginfo.platform() == \"<platform>\", one per platform"); continue; }
             const auto arg = trim(std::string_view(text).substr(open + 1, close - open - 1));

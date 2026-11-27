@@ -156,3 +156,17 @@ return M
     EXPECT_TRUE(has(m.text, "import(\"xim.libxpkg.fs\")"));
     EXPECT_TRUE(m.left.empty());
 }
+
+TEST(MigrateTest, ANameUsedAsAValueIsForAPerson) {
+    const auto m = migrate_recipe(recipe(R"LUA(
+function config()
+    local ok, out = pcall(os.iorun, "uname -m")
+    if type(os.iorun) == "function" then out = os.iorun("uname -m") end
+    return true
+end
+)LUA"));
+    EXPECT_FALSE(m.spec3);
+    EXPECT_TRUE(has(m.text, "pcall(os.iorun, \"uname -m\")")) << m.text;
+    EXPECT_TRUE(has(m.text, "out = system.exec(\"uname -m\", { capture = true })")) << m.text;
+    EXPECT_EQ(std::ranges::count_if(m.left, [](const MigrationNote& n) { return n.name == "os.iorun"; }), 2);
+}

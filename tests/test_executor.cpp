@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include "support/min_elf.hpp"
 import std;
 import mcpplibs.xpkg;
 import mcpplibs.xpkg.executor;
@@ -736,64 +737,6 @@ TEST(ExecutorTest, ApplyElfpatchAuto_ForcesRpathOnExecutablesOnly) {
     fs::remove_all(temp_dir);
 }
 
-// A minimal but well-formed little-endian ELF64: header, program headers, an
-// optional PT_INTERP string and a PT_DYNAMIC table holding `needed` DT_NEEDED
-// entries. Enough for a reader of the headers to reach a verdict; a stand-in
-// that is only the ELF magic reads as UNKNOWN and is patched as before.
-static void write_min_elf64(const fs::path& p, std::uint16_t machine, bool interp,
-                     int needed) {
-    std::string bytes(64, '\0');
-    auto put = [&](std::size_t at, std::uint64_t v, int width) {
-        if (bytes.size() < at + width) bytes.resize(at + width, '\0');
-        for (int i = 0; i < width; ++i)
-            bytes[at + i] = static_cast<char>((v >> (8 * i)) & 0xff);
-    };
-    const std::string interp_path = "/lib64/ld-linux-x86-64.so.2";
-    const int phnum = interp ? 2 : 1;
-    const std::size_t phoff = 64;
-    const std::size_t interp_off = phoff + 56 * phnum;
-    const std::size_t dyn_off = interp_off + (interp ? interp_path.size() + 1 : 0);
-    const std::size_t dyn_size = 16 * (needed + 1);
-
-    bytes[0] = 0x7f; bytes[1] = 'E'; bytes[2] = 'L'; bytes[3] = 'F';
-    bytes[4] = 2;    // ELFCLASS64
-    bytes[5] = 1;    // little endian
-    bytes[6] = 1;    // EV_CURRENT
-    put(16, 3, 2);             // e_type = ET_DYN
-    put(18, machine, 2);       // e_machine
-    put(20, 1, 4);             // e_version
-    put(32, phoff, 8);         // e_phoff
-    put(52, 64, 2);            // e_ehsize
-    put(54, 56, 2);            // e_phentsize
-    put(56, phnum, 2);         // e_phnum
-
-    std::size_t ph = phoff;
-    if (interp) {
-        put(ph + 0, 3, 4);                          // PT_INTERP
-        put(ph + 8, interp_off, 8);                 // p_offset
-        put(ph + 32, interp_path.size() + 1, 8);    // p_filesz
-        ph += 56;
-    }
-    put(ph + 0, 2, 4);                              // PT_DYNAMIC
-    put(ph + 8, dyn_off, 8);
-    put(ph + 32, dyn_size, 8);
-
-    if (interp) {
-        bytes.resize(interp_off);
-        bytes += interp_path;
-        bytes.push_back('\0');
-    }
-    bytes.resize(dyn_off + dyn_size, '\0');
-    for (int i = 0; i < needed; ++i) put(dyn_off + 16 * i, 1, 8);  // DT_NEEDED
-
-    fs::create_directories(p.parent_path());
-    std::ofstream f(p, std::ios::binary);
-    f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-    f.close();
-    fs::permissions(p,
-                    fs::perms::owner_read | fs::perms::owner_write | fs::perms::owner_exec,
-                    fs::perm_options::replace);
-}
 
 // libxpkg#43. Three kinds of file are never handed to patchelf, whatever the
 // scan finds: one with neither PT_INTERP nor DT_NEEDED (static-pie; writing an
@@ -2819,6 +2762,68 @@ TEST(ExecutorTest, XvmFiles_DerivesADistinctTargetPerDeclaration) {
     fs::remove_all(dir);
 }
 
+// A program's shell completion (design 2026-11-27 §20.2): files of the
+// payload, placed where each shell looks, bound to the program's release so
+// they follow `use` and go with it.
+TEST(ExecutorTest, XvmAdd_CompletionBecomesFilesBoundToTheRelease) {
+    auto dir = fs::temp_directory_path() / "libxpkg_completion";
+    fs::remove_all(dir);
+    auto ops = ops_from_config(dir,
+        "    xvm.add(\"mcpp\", { bindir = \"bin\", completion = {\n"
+        "        bash = \"share/c/mcpp.bash\", zsh = \"share/c/_mcpp\",\n"
+        "        fish = \"share/c/mcpp.fish\", pwsh = \"share/c/mcpp.ps1\" } })\n"
+        "    xvm.add(\"gcc\", { binding = \"xim-gnu-gcc@1.0.0\", completion = { bash = \"g.bash\" } })");
+    ASSERT_EQ(ops.size(), 7u);
+    EXPECT_EQ(ops[0].name, "mcpp");
+    const std::vector<std::pair<std::string, std::string>> want = {
+        {"share/c/mcpp.bash", "usr/share/bash-completion/completions/mcpp"},
+        {"share/c/mcpp.fish", "usr/share/fish/vendor_completions.d/mcpp.fish"},
+        {"share/c/mcpp.ps1", "usr/share/powershell/completions/mcpp.ps1"},
+        {"share/c/_mcpp", "usr/share/zsh/site-functions/_mcpp"},
+    };
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        const auto& op = ops[1 + i];
+        EXPECT_EQ(op.type, "files");
+        EXPECT_EQ(op.src, want[i].first);
+        EXPECT_EQ(op.dst, want[i].second);
+        EXPECT_EQ(op.binding, "mcpp@" + ops[0].version);
+        EXPECT_EQ(op.version, ops[0].version);
+        EXPECT_EQ(op.bindir, dir.string()) << "src is relative to the payload root";
+        EXPECT_TRUE(op.name.starts_with("mcpp.completion.")) << op.name;
+    }
+    // A program bound to a release: its completion is that release's.
+    EXPECT_EQ(ops[6].binding, "xim-gnu-gcc@1.0.0");
+    EXPECT_EQ(ops[6].dst, "usr/share/bash-completion/completions/gcc");
+    fs::remove_all(dir);
+}
+
+TEST(ExecutorTest, XvmAdd_CompletionForAnUnknownShellOrAnAbsoluteFileFails) {
+    auto dir = fs::temp_directory_path() / "libxpkg_completion_bad";
+    for (const char* body : {
+             "    xvm.add(\"t\", { completion = { tcsh = \"t.csh\" } })",
+             "    xvm.add(\"t\", { completion = { bash = \"/etc/bash_completion.d/t\" } })",
+             "    xvm.add(\"t\", { completion = { bash = \"../t\" } })",
+         }) {
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        auto pkg = dir / "bad.lua";
+        std::ofstream(pkg) << "package = { spec = \"1\", name = \"bad\", xpm = { linux = { [\"1.0.0\"] = {} } } }\n"
+                              "import(\"xim.libxpkg.xvm\")\nfunction config()\n" << body << "\n    return true\nend\n";
+        auto exec = create_executor(pkg.string());
+        ASSERT_TRUE(exec.has_value());
+        auto ctx = make_context(dir, "linux");
+        auto hook = exec->run_hook(HookType::Config, ctx);
+        EXPECT_FALSE(hook.success) << body;
+        EXPECT_NE(hook.error.find("completion"), std::string::npos) << hook.error;
+    }
+    // Refused under pcall, the declaration leaves nothing of itself: not the
+    // program's entry, not a shell checked before the refused one.
+    auto ops = ops_from_config(dir,
+        "    assert(not pcall(xvm.add, \"t\", { bindir = \"bin\", completion = { bash = \"t.bash\", zsh = \"/t\" } }))");
+    EXPECT_TRUE(ops.empty()) << ops.size();
+    fs::remove_all(dir);
+}
+
 TEST(ExecutorTest, XvmAdd_OmittingTheNewFieldsLeavesThemEmpty) {
     auto dir = fs::temp_directory_path() / "libxpkg_no_new_fields";
     fs::remove_all(dir);
@@ -3879,6 +3884,73 @@ TEST(ExecutionBoundaryTest, WorkerRefusesMissingLoadPackageChangesAndUnknownActi
                                  .log_level = "info'); os.execute('unsafe') --"}));
     EXPECT_FALSE(hook_action_from_string("unknown"));
     EXPECT_EQ(hook_action_from_string("run_hook"), HookAction::RunHook);
+}
+
+// A recipe's top level is read for the install's platform and architecture,
+// in the host's process and in a worker alike: it computes what the loader's
+// read of it computes (design 2026-11-27 §19.6, the P10 finding).
+TEST(ExecutionBoundaryTest, TheTopLevelIsReadForTheTarget) {
+    const auto temp = make_temp_dir("libxpkg-read-target-");
+    const auto recipe = temp / "facts.lua";
+    write_text(recipe, R"LUA(package = { spec = "2", name = "facts", xpm = { linux = { ["1.0.0"] = {} } } }
+import("xim.libxpkg.pkginfo")
+local read_for = pkginfo.platform() .. "/" .. pkginfo.arch() .. "/" .. os.host()
+-- xmake's names, as the loader's read defines them (one recipe, one answer).
+    .. "/" .. os.arch() .. "/" .. tostring(is_arch("arm64")) .. "/" .. tostring(is_plat("macosx", "linux"))
+function installed() return read_for end
+)LUA");
+    const ReadTarget target{"linux", "arm64"};
+    auto ctx = make_context(temp, "linux");
+    auto local = create_executor(recipe, target);
+    ASSERT_TRUE(local) << local.error();
+    EXPECT_EQ(local->run_hook(HookType::Installed, ctx).version, "linux/aarch64/linux/arm64/true/true");
+
+    HookWorker worker;
+    auto remote = create_executor(recipe, [&](const HookInvocation& request) { return worker.dispatch(request); },
+                                  target);
+    ASSERT_TRUE(remote) << remote.error();
+    EXPECT_EQ(remote->run_hook(HookType::Installed, ctx).version, "linux/aarch64/linux/arm64/true/true");
+
+    // Told nothing, the top level is outside any install.
+    auto untold = create_executor(recipe);
+    ASSERT_FALSE(untold);
+    EXPECT_NE(untold.error().find("no install here"), std::string::npos) << untold.error();
+    fs::remove_all(temp);
+}
+
+// A recipe in no index with libs of its own (a script, a recipe given by
+// path) imports the libs of the index the host names, at its top level as in
+// its hooks; a recipe's own index comes first.
+TEST(ExecutionBoundaryTest, ARecipeOutsideAnIndexReadsTheHostsIndexLibs) {
+    const auto temp = make_temp_dir("libxpkg-read-index-");
+    for (const auto& dir : {temp / "index" / "libs", temp / "own" / "libs", temp / "own" / "pkgs" / "f"})
+        fs::create_directories(dir);
+    write_text(temp / "index" / "libs" / "probelib.lua", "return { word = function() return 'host' end }\n");
+    write_text(temp / "own" / "libs" / "probelib.lua", "return { word = function() return 'own' end }\n");
+    const auto body = std::string(R"LUA(package = { spec = "2", name = "facts", xpm = { linux = { ["1.0.0"] = {} } } }
+import("xim.pkgindex.probelib")
+local word = probelib.word()
+function installed() return word end
+)LUA");
+    write_text(temp / "loose.lua", body);
+    write_text(temp / "own" / "pkgs" / "f" / "facts.lua", body);
+    const ReadTarget target{"linux", "x86_64", (temp / "index").string()};
+    auto ctx = make_context(temp, "linux");
+
+    auto loose = create_executor(temp / "loose.lua", target);
+    ASSERT_TRUE(loose) << loose.error();
+    EXPECT_EQ(loose->run_hook(HookType::Installed, ctx).version, "host");
+
+    HookWorker worker;
+    auto remote = create_executor(temp / "loose.lua",
+                                  [&](const HookInvocation& request) { return worker.dispatch(request); }, target);
+    ASSERT_TRUE(remote) << remote.error();
+    EXPECT_EQ(remote->run_hook(HookType::Installed, ctx).version, "host");
+
+    auto own = create_executor(temp / "own" / "pkgs" / "f" / "facts.lua", target);
+    ASSERT_TRUE(own) << own.error();
+    EXPECT_EQ(own->run_hook(HookType::Installed, ctx).version, "own");
+    fs::remove_all(temp);
 }
 
 TEST(ExecutionBoundaryTest, MovingADeferredExecutorRetainsTheWorkerAndHookLogContext) {

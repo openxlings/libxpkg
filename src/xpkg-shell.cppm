@@ -76,18 +76,44 @@ struct Streams {
     NativeFile file = kNoFile;
 };
 
-// How a command ended, in Lua 5.4's os.execute vocabulary.
+// How a command ended, in Lua 5.4's os.execute vocabulary, plus one case of
+// its own: a command this layer will not start as written (Refused).
 struct Status {
-    enum class Kind { Exit, Signal, Failed };
+    enum class Kind { Exit, Signal, Failed, Refused };
     Kind kind = Kind::Failed;
     int code = 0;          // exit status, signal number, or the OS error
-    std::string message;   // Failed only
+    std::string message;   // Failed and Refused only
 };
 
 struct Run {
     Status status;
     std::string output;    // what the streams set to Capture wrote
 };
+
+// What to start. A program and its arguments (`argv`) are passed as they are,
+// with no shell between: no quoting, no word splitting, no expansion. The
+// program is found on PATH (the child's, so an `env` that sets PATH decides)
+// unless it is a path; on Windows also with each extension of PATHEXT, and
+// the current directory is not searched. A batch file is Refused there: cmd
+// parses a batch file's arguments again, and no quoting is safe for both
+// parsers. Without `argv`, `line` is one shell line (run() below).
+struct Command {
+    std::vector<std::string> argv;
+    std::string line;
+    std::filesystem::path cwd;  // empty: this process's
+    // Set in the child's environment on top of this process's (a name already
+    // there is replaced; on Windows names compare without case).
+    std::vector<std::pair<std::string, std::string>> env;
+};
+
+// Start a command and wait for it. stdin is inherited.
+Run spawn(const Command& command, const Streams& streams = {});
+
+// The command line Windows' C runtime (CommandLineToArgvW) splits back into
+// exactly `argv`: an argument with a space, a tab or a quote, or an empty one,
+// is quoted, and backslashes are doubled only before a quote. Plain text on
+// every platform; spawn() uses it on Windows.
+std::string windows_command_line(const std::vector<std::string>& argv);
 
 // Run `line` through the system shell and wait for it: `cmd /d /s /c "<line>"`
 // on Windows (the shell COMSPEC names, else cmd.exe), `/bin/sh -c <line>`
@@ -117,24 +143,166 @@ HANDLE open_null(SECURITY_ATTRIBUTES& sa) {
                          &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 }
 
+std::wstring widen(std::string_view text) {
+    if (text.empty()) return {};
+    const int size = ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                                           nullptr, 0);
+    std::wstring wide(static_cast<std::size_t>(size > 0 ? size : 0), L'\0');
+    if (size > 0)
+        ::MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()),
+                              wide.data(), size);
+    return wide;
+}
+
+std::wstring lower(std::wstring text) {
+    for (auto& c : text) c = static_cast<wchar_t>(std::towlower(c));
+    return text;
+}
+
+std::wstring variable(const wchar_t* name) {
+    const DWORD size = ::GetEnvironmentVariableW(name, nullptr, 0);
+    if (size == 0) return {};
+    std::wstring value(size, L'\0');
+    const DWORD got = ::GetEnvironmentVariableW(name, value.data(), size);
+    value.resize(got);
+    return value;
+}
+
+std::vector<std::wstring> split(const std::wstring& list, wchar_t separator) {
+    std::vector<std::wstring> parts;
+    std::size_t start = 0;
+    while (start <= list.size()) {
+        const auto end = list.find(separator, start);
+        auto part = list.substr(start, end == std::wstring::npos ? std::wstring::npos : end - start);
+        if (!part.empty()) parts.push_back(std::move(part));
+        if (end == std::wstring::npos) break;
+        start = end + 1;
+    }
+    return parts;
+}
+
+bool is_file(const std::wstring& path) {
+    const DWORD attributes = ::GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+// The program `name` names: itself when it is a path, else the first match on
+// PATH; with each PATHEXT extension when it has none. Empty when none exists.
+std::wstring find_program(const std::wstring& name, const std::wstring& path) {
+    std::wstring pathext = variable(L"PATHEXT");
+    if (pathext.empty()) pathext = L".COM;.EXE;.BAT;.CMD";
+    const auto extensions = split(pathext, L';');
+    const bool has_extension = std::filesystem::path(name).has_extension();
+    auto match = [&](const std::wstring& base) -> std::wstring {
+        if (is_file(base)) return base;
+        if (!has_extension)
+            for (const auto& ext : extensions)
+                if (is_file(base + ext)) return base + ext;
+        return {};
+    };
+    const bool is_path = name.find_first_of(L"\\/") != std::wstring::npos
+                      || (name.size() >= 2 && name[1] == L':');
+    if (is_path) return match(name);
+    for (const auto& dir : split(path, L';')) {
+        std::wstring base = dir;
+        if (base.back() != L'\\' && base.back() != L'/') base += L'\\';
+        if (auto found = match(base + name); !found.empty()) return found;
+    }
+    return {};
+}
+
+// This process's environment with `overrides` applied, as the sorted,
+// double-NUL-terminated block CreateProcessW takes.
+std::wstring environment_block(const std::vector<std::pair<std::string, std::string>>& overrides) {
+    std::vector<std::pair<std::wstring, std::wstring>> entries;
+    if (wchar_t* block = ::GetEnvironmentStringsW()) {
+        for (const wchar_t* p = block; *p; p += std::wcslen(p) + 1) {
+            std::wstring entry(p);
+            // "=C:=C:\dir" entries keep their leading '='.
+            const auto eq = entry.find(L'=', 1);
+            entries.emplace_back(entry.substr(0, eq),
+                                 eq == std::wstring::npos ? std::wstring{} : entry.substr(eq + 1));
+        }
+        ::FreeEnvironmentStringsW(block);
+    }
+    for (const auto& [name, value] : overrides) {
+        const auto wide = widen(name);
+        std::erase_if(entries, [&](const auto& e) { return lower(e.first) == lower(wide); });
+        entries.emplace_back(wide, widen(value));
+    }
+    std::ranges::sort(entries, [](const auto& a, const auto& b) { return lower(a.first) < lower(b.first); });
+    std::wstring out;
+    for (const auto& [name, value] : entries) {
+        out += name;
+        out += L'=';
+        out += value;
+        out += L'\0';
+    }
+    out += L'\0';
+    return out;
+}
+
 } // namespace
 
-Run run(std::string_view line, const Streams& streams) {
+Run spawn(const Command& command, const Streams& streams) {
     Run result;
     Status& status = result.status;
 
-    // `"<COMSPEC>" /d /s /c "<line>"`. /s: cmd removes the first and the last
-    // quote of what follows /c and nothing else, which is the wrapper added
-    // here, so the line reaches cmd's parser exactly as the caller wrote it.
-    // /d: no AutoRun command from the registry runs in front of it. The narrow
-    // API is what system() used; a host that runs with the UTF-8 code page
-    // (xlings' manifest) passes UTF-8 through it unchanged.
-    const char* env = std::getenv("COMSPEC");
-    const bool fromEnv = env && *env;
-    const std::string comspec = fromEnv ? env : "cmd.exe";
-    std::string commandLine = "\"" + comspec + "\" /d /s /c \"";
-    commandLine.append(line);
-    commandLine += "\"";
+    std::wstring application;
+    std::wstring commandLine;
+    std::string shown;  // what an error message calls the program
+    if (!command.argv.empty()) {
+        std::wstring path;
+        bool path_overridden = false;
+        for (const auto& [name, value] : command.env) {
+            if (lower(widen(name)) == L"path") { path = widen(value); path_overridden = true; }
+        }
+        if (!path_overridden) path = variable(L"PATH");
+        shown = command.argv.front();
+        application = find_program(widen(command.argv.front()), path);
+        if (application.empty()) {
+            status.kind = Status::Kind::Failed;
+            status.code = ERROR_FILE_NOT_FOUND;
+            status.message = "no program named " + shown + " on PATH";
+            return result;
+        }
+        const auto ext = lower(std::filesystem::path(application).extension().wstring());
+        if (ext == L".bat" || ext == L".cmd") {
+            status.kind = Status::Kind::Refused;
+            status.message = shown + " is a batch file, and cmd parses a batch file's arguments again: "
+                             "pass the command as one string instead of a list";
+            return result;
+        }
+        commandLine = widen(windows_command_line(command.argv));
+    } else {
+        // `"<COMSPEC>" /d /s /c "<line>"`. /s: cmd removes the first and the
+        // last quote of what follows /c and nothing else, which is the wrapper
+        // added here, so the line reaches cmd's parser exactly as the caller
+        // wrote it. /d: no AutoRun command from the registry runs in front of
+        // it. With COMSPEC unset, cmd.exe is found on the search path; a bare
+        // name as lpApplicationName would only be looked for in the current
+        // directory, so CreateProcess parses the command line instead.
+        const std::wstring comspec = variable(L"COMSPEC");
+        shown = comspec.empty() ? "cmd.exe" : "COMSPEC";
+        if (!comspec.empty()) application = comspec;
+        commandLine = L"\"" + (comspec.empty() ? std::wstring(L"cmd.exe") : comspec) + L"\" /d /s /c \"";
+        commandLine += widen(command.line);
+        commandLine += L"\"";
+    }
+
+    std::wstring cwd;
+    if (!command.cwd.empty()) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(command.cwd, ec)) {
+            status.kind = Status::Kind::Failed;
+            status.code = ERROR_DIRECTORY;
+            status.message = "the working directory " + command.cwd.string() + " is not a directory";
+            return result;
+        }
+        cwd = command.cwd.wstring();
+    }
+    std::wstring environment;
+    if (!command.env.empty()) environment = environment_block(command.env);
 
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
@@ -170,7 +338,7 @@ Run run(std::string_view line, const Streams& streams) {
         return nullDevice();
     };
 
-    STARTUPINFOA startup{};
+    STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     if (streams.out != Sink::Inherit || streams.err != Sink::Inherit) {
         startup.dwFlags = STARTF_USESTDHANDLES;
@@ -179,12 +347,11 @@ Run run(std::string_view line, const Streams& streams) {
         startup.hStdError = handleFor(streams.err, STD_ERROR_HANDLE);
     }
     PROCESS_INFORMATION process{};
-    // With COMSPEC unset, cmd.exe is found on the search path; a bare name as
-    // lpApplicationName would only be looked for in the current directory, so
-    // CreateProcess parses the command line instead.
-    const BOOL started = ::CreateProcessA(fromEnv ? comspec.c_str() : nullptr,
-                                          commandLine.data(),
-                                          nullptr, nullptr, TRUE, 0, nullptr, nullptr,
+    const BOOL started = ::CreateProcessW(application.empty() ? nullptr : application.c_str(),
+                                          commandLine.data(), nullptr, nullptr, TRUE,
+                                          environment.empty() ? 0 : CREATE_UNICODE_ENVIRONMENT,
+                                          environment.empty() ? nullptr : environment.data(),
+                                          cwd.empty() ? nullptr : cwd.c_str(),
                                           &startup, &process);
     // The child has its copy; with the parent's closed, the read below ends
     // when the child (and anything it started holding the handle) is done.
@@ -206,8 +373,7 @@ Run run(std::string_view line, const Streams& streams) {
         status.code = static_cast<int>(exitCode);
     } else {
         status.code = static_cast<int>(::GetLastError());
-        status.message = "cannot start " + comspec + " (error " +
-                         std::to_string(status.code) + ")";
+        status.message = "cannot start " + shown + " (error " + std::to_string(status.code) + ")";
     }
     if (readEnd != INVALID_HANDLE_VALUE) ::CloseHandle(readEnd);
     if (nul != INVALID_HANDLE_VALUE) ::CloseHandle(nul);
@@ -244,12 +410,92 @@ int make_pipe(int fds[2]) {
     return 0;
 }
 
+
+char** parent_environment() {
+#  if defined(__APPLE__)
+    return *_NSGetEnviron();
+#  else
+    return environ;
+#  endif
+}
+
+// The first executable regular file named `name` in the ':'-separated `path`
+// (an empty entry is the current directory, as for execvp), or `name` itself
+// when it holds a '/'. Empty when none exists.
+std::string find_program(const std::string& name, std::string_view path) {
+    if (name.find('/') != std::string::npos) return name;
+    std::size_t start = 0;
+    while (start <= path.size()) {
+        const auto end = path.find(':', start);
+        std::string dir(path.substr(start, end == std::string_view::npos ? std::string_view::npos : end - start));
+        std::string candidate = (dir.empty() ? std::string(".") : dir) + "/" + name;
+        std::error_code ec;
+        if (::access(candidate.c_str(), X_OK) == 0 && std::filesystem::is_regular_file(candidate, ec))
+            return candidate;
+        if (end == std::string_view::npos) break;
+        start = end + 1;
+    }
+    return {};
+}
+
 } // namespace
 
-Run run(std::string_view line, const Streams& streams) {
+Run spawn(const Command& command, const Streams& streams) {
     Run result;
     Status& status = result.status;
-    const std::string cmd(line);
+
+    std::vector<std::string> words;
+    std::string program;
+    if (!command.argv.empty()) {
+        std::string path;
+        bool path_overridden = false;
+        for (const auto& [name, value] : command.env)
+            if (name == "PATH") { path = value; path_overridden = true; }
+        if (!path_overridden) {
+            const char* p = std::getenv("PATH");
+            path = p ? p : "/usr/bin:/bin";
+        }
+        program = find_program(command.argv.front(), path);
+        if (program.empty()) {
+            status.kind = Status::Kind::Failed;
+            status.code = ENOENT;
+            status.message = "no program named " + command.argv.front() + " on PATH";
+            return result;
+        }
+        words = command.argv;
+    } else {
+        program = "/bin/sh";
+        words = { "sh", "-c", command.line };
+    }
+    std::vector<char*> argv;
+    for (auto& word : words) argv.push_back(word.data());
+    argv.push_back(nullptr);
+
+    std::vector<std::string> environment;
+    std::vector<char*> envp;
+    char** child_env = parent_environment();
+    if (!command.env.empty()) {
+        for (char** e = child_env; e && *e; ++e) {
+            const std::string_view entry(*e);
+            const auto name = entry.substr(0, entry.find('='));
+            const bool replaced = std::ranges::any_of(command.env, [&](const auto& kv) { return kv.first == name; });
+            if (!replaced) environment.emplace_back(entry);
+        }
+        for (const auto& [name, value] : command.env) environment.push_back(name + "=" + value);
+        for (auto& entry : environment) envp.push_back(entry.data());
+        envp.push_back(nullptr);
+        child_env = envp.data();
+    }
+
+    if (!command.cwd.empty()) {
+        std::error_code ec;
+        if (!std::filesystem::is_directory(command.cwd, ec)) {
+            status.kind = Status::Kind::Failed;
+            status.code = ENOTDIR;
+            status.message = "the working directory " + command.cwd.string() + " is not a directory";
+            return result;
+        }
+    }
 
     int fds[2] = { -1, -1 };
     const bool capture = streams.out == Sink::Capture || streams.err == Sink::Capture;
@@ -263,17 +509,10 @@ Run run(std::string_view line, const Streams& streams) {
     }
     if (error == 0) error = route(actions, streams.out, 1, streams.file, fds[1]);
     if (error == 0) error = route(actions, streams.err, 2, streams.file, fds[1]);
+    if (error == 0 && !command.cwd.empty())
+        error = ::posix_spawn_file_actions_addchdir_np(&actions, command.cwd.c_str());
     pid_t pid = 0;
-    if (error == 0) {
-        char* const argv[] = { const_cast<char*>("sh"), const_cast<char*>("-c"),
-                               const_cast<char*>(cmd.c_str()), nullptr };
-#  if defined(__APPLE__)
-        char** const envp = *_NSGetEnviron();
-#  else
-        char** const envp = environ;
-#  endif
-        error = ::posix_spawn(&pid, "/bin/sh", &actions, nullptr, argv, envp);
-    }
+    if (error == 0) error = ::posix_spawn(&pid, program.c_str(), &actions, nullptr, argv.data(), child_env);
     if (actionsMade) ::posix_spawn_file_actions_destroy(&actions);
     if (fds[1] >= 0) ::close(fds[1]);
 
@@ -320,6 +559,42 @@ Run run(std::string_view line, const Streams& streams) {
 
 #endif
 
+Run run(std::string_view line, const Streams& streams) {
+    return spawn(Command{ .line = std::string(line) }, streams);
+}
+
+std::string windows_command_line(const std::vector<std::string>& argv) {
+    std::string out;
+    for (const auto& arg : argv) {
+        if (!out.empty()) out += ' ';
+        if (!arg.empty() && arg.find_first_of(" \t\n\v\"") == std::string::npos) {
+            out += arg;
+            continue;
+        }
+        out += '"';
+        for (auto it = arg.begin();; ++it) {
+            std::size_t backslashes = 0;
+            while (it != arg.end() && *it == '\\') {
+                ++it;
+                ++backslashes;
+            }
+            if (it == arg.end()) {
+                out.append(backslashes * 2, '\\');
+                break;
+            }
+            if (*it == '"') {
+                out.append(backslashes * 2 + 1, '\\');
+                out += *it;
+            } else {
+                out.append(backslashes, '\\');
+                out += *it;
+            }
+        }
+        out += '"';
+    }
+    return out;
+}
+
 void push_status(lua::State* L, const Status& status) {
     switch (status.kind) {
         case Status::Kind::Exit:
@@ -333,6 +608,7 @@ void push_status(lua::State* L, const Status& status) {
             lua::pushstring(L, "signal");
             break;
         case Status::Kind::Failed:
+        case Status::Kind::Refused:
             // luaL_fileresult: fail, message, errno.
             lua::pushnil(L);
             lua::pushstring(L, status.message.c_str());

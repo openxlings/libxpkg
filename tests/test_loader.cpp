@@ -278,7 +278,25 @@ TEST(LoaderTest, LoadPackage_ExportsLoaderOnly) {
 
     EXPECT_EQ(rt.loader, "lib/ld-musl-x86_64.so.1");
     EXPECT_TRUE(rt.libdirs.empty());
+    EXPECT_FALSE(rt.libdirs_declared);
     EXPECT_TRUE(rt.abi.empty());
+}
+
+// `libdirs = {}` is a declaration, not an omission: the package exports no
+// library directory (a sysroot's target libraries), where an omitted one is
+// the {lib64, lib} convention.
+TEST(LoaderTest, LoadPackage_ExportsNoLibdirs) {
+    auto result = load_package(PKGINDEX / "pkgs/e/exportsnolibdirs.lua");
+    ASSERT_TRUE(result.has_value()) << result.error();
+
+    auto eit = result->xpm.exports.find("linux");
+    ASSERT_NE(eit, result->xpm.exports.end());
+    EXPECT_TRUE(eit->second.runtime.libdirs.empty());
+    EXPECT_TRUE(eit->second.runtime.libdirs_declared);
+    // A platform that inherits it inherits the declaration.
+    auto mit = result->xpm.exports.find("macosx");
+    ASSERT_NE(mit, result->xpm.exports.end());
+    EXPECT_TRUE(mit->second.runtime.libdirs_declared);
 }
 
 // Packages without an `exports` block must remain valid; the platform's
@@ -803,6 +821,32 @@ TEST(LoaderTest, InheritingPlatformKeepsItsOwnVersionsAndFollowsChains) {
     EXPECT_EQ(entries.at("ubuntu").at("1.0.0").sha256, "aa");
     // A cycle ends the chain; nothing is invented.
     EXPECT_FALSE(entries.contains("a") && !entries.at("a").empty());
+}
+
+// A version whose ref names itself is that version: here one whose hooks make
+// the payload (the form an index's bun recipe has), not a ref cycle.
+TEST(LoaderTest, ARefNamingItsOwnVersionIsTheEntryItself) {
+    const auto dir = fs::temp_directory_path() / "libxpkg-self-ref";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    const auto file = dir / "selfref.lua";
+    std::ofstream(file) << "package = {\n  spec = \"1\", name = \"selfref\", description = \"d\",\n"
+        "  xpm = { linux = { [\"latest\"] = { ref = \"1.3.11\" }, [\"1.3.11\"] = { ref = \"1.3.11\" },\n"
+        "                    [\"a\"] = { ref = \"b\" }, [\"b\"] = { ref = \"a\" } } },\n}\n";
+    auto result = load_package(file);
+    ASSERT_TRUE(result.has_value()) << result.error();
+    const auto& linux = result->xpm.entries.at("linux");
+    EXPECT_TRUE(linux.at("1.3.11").ref.empty());
+    EXPECT_EQ(linux.at("latest").ref, "1.3.11");
+    const auto* entry = find_entry(result->xpm, "linux", "latest");
+    ASSERT_NE(entry, nullptr);
+    EXPECT_TRUE(declares_no_download_source(result->xpm, entry, "linux"));
+    // A cycle of two is still one.
+    EXPECT_EQ(find_entry(result->xpm, "linux", "a"), nullptr);
+    auto cycle = resolve_resource(result->xpm, {.name = "selfref", .version = "a", .platform = "linux",
+                                                .arch = "x86_64"});
+    ASSERT_FALSE(cycle.has_value());
+    EXPECT_NE(cycle.error().find("cycle"), std::string::npos);
 }
 
 TEST(LoaderTest, AVersionNamesTheOldestClientThatCanUseIt) {

@@ -233,7 +233,7 @@ function M.encode(val, opts)
     return encode_value(val, indent, 0)
 end
 
--- File convenience functions (xmake compat: json.loadfile / json.savefile)
+-- File convenience functions: json.loadfile / json.savefile
 function M.loadfile(filepath)
     local f = io.open(filepath, "r")
     if not f then return nil end

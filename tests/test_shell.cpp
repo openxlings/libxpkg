@@ -150,3 +150,103 @@ TEST(ShellTest, OsIorunAndOsExecuteRunTheLineAsWritten) {
 
     fs::remove_all(temp);
 }
+
+// ---- A program and its arguments, no shell between (design 2026-11-27 §9.6) ----
+
+namespace {
+
+// Each argument the child received, one per line in brackets: through
+// `sh -c '...' sh <args>` on POSIX, where the arguments are positional
+// parameters and never parsed again. On Windows the quoting is checked
+// against the C runtime's own rules below instead.
+shell::Command echo_args(std::vector<std::string> args) {
+    shell::Command c;
+    c.argv = { "sh", "-c", "for a in \"$@\"; do printf '[%s]\\n' \"$a\"; done", "sh" };
+    for (auto& a : args) c.argv.push_back(std::move(a));
+    return c;
+}
+
+} // namespace
+
+TEST(SpawnTest, ArgumentsReachTheProgramAsTheyAre) {
+    if constexpr (kWindows) GTEST_SKIP() << "the quoting is checked by WindowsCommandLineQuotesAsTheRuntimeSplits";
+    const auto ran = shell::spawn(echo_args({ "a b", "quote\"d", "%PATH%", "x & y", "$HOME", "", "back\\slash\\" }),
+                                  { shell::Sink::Capture, shell::Sink::Null });
+    ASSERT_EQ(ran.status.kind, shell::Status::Kind::Exit) << ran.status.message;
+    EXPECT_EQ(ran.output, "[a b]\n[quote\"d]\n[%PATH%]\n[x & y]\n[$HOME]\n[]\n[back\\slash\\]\n");
+}
+
+TEST(SpawnTest, WindowsCommandLineQuotesAsTheRuntimeSplits) {
+    // Microsoft's documented examples of how the C runtime splits a line.
+    EXPECT_EQ(shell::windows_command_line({ "a b", "c" }), "\"a b\" c");
+    EXPECT_EQ(shell::windows_command_line({ "a\"b" }), "\"a\\\"b\"");
+    EXPECT_EQ(shell::windows_command_line({ "a\\b" }), "a\\b");
+    EXPECT_EQ(shell::windows_command_line({ "a b\\" }), "\"a b\\\\\"");
+    EXPECT_EQ(shell::windows_command_line({ "" }), "\"\"");
+    EXPECT_EQ(shell::windows_command_line({ "x & y", "%PATH%" }), "\"x & y\" %PATH%");
+    EXPECT_EQ(shell::windows_command_line({ "C:\\Program Files\\x\\" }), "\"C:\\Program Files\\x\\\\\"");
+}
+
+TEST(SpawnTest, TheWorkingDirectoryAndEnvironmentAreTheChilds) {
+    const fs::path temp = make_temp_dir("libxpkg-spawn-cwd-");
+    shell::Command c;
+    c.cwd = temp;
+    c.env = { { "XPKG_SPAWN_PROBE", "a b" } };
+    if constexpr (kWindows) c.argv = { "cmd.exe", "/d", "/c", "cd && echo %XPKG_SPAWN_PROBE%" };
+    else c.argv = { "sh", "-c", "pwd; printf '%s\\n' \"$XPKG_SPAWN_PROBE\"" };
+    const auto ran = shell::spawn(c, { shell::Sink::Capture, shell::Sink::Null });
+    ASSERT_EQ(ran.status.kind, shell::Status::Kind::Exit) << ran.status.message;
+    EXPECT_EQ(ran.status.code, 0);
+    std::istringstream lines(ran.output);
+    std::string dir, value;
+    std::getline(lines, dir);
+    std::getline(lines, value);
+    if (!dir.empty() && dir.back() == '\r') dir.pop_back();
+    if (!value.empty() && value.back() == '\r') value.pop_back();
+    EXPECT_EQ(fs::canonical(dir), fs::canonical(temp)) << ran.output;
+    EXPECT_EQ(value, "a b");
+    EXPECT_EQ(std::getenv("XPKG_SPAWN_PROBE"), nullptr) << "the parent's environment is unchanged";
+    fs::remove_all(temp);
+}
+
+TEST(SpawnTest, AMissingProgramOrDirectoryIsAFailureToStart) {
+    const auto missing = shell::spawn({ .argv = { "no-such-program-for-libxpkg" } }, { shell::Sink::Null, shell::Sink::Null });
+    EXPECT_EQ(missing.status.kind, shell::Status::Kind::Failed);
+    EXPECT_EQ(missing.status.message, "no program named no-such-program-for-libxpkg on PATH");
+    const fs::path temp = make_temp_dir("libxpkg-spawn-nocwd-");
+    const auto nocwd = shell::spawn({ .argv = { kWindows ? "cmd.exe" : "sh" }, .cwd = temp / "absent" },
+                                    { shell::Sink::Null, shell::Sink::Null });
+    EXPECT_EQ(nocwd.status.kind, shell::Status::Kind::Failed);
+    EXPECT_NE(nocwd.status.message.find("is not a directory"), std::string::npos) << nocwd.status.message;
+    fs::remove_all(temp);
+}
+
+// The child's PATH finds the program, so an `env` that sets PATH decides.
+TEST(SpawnTest, TheChildsPathFindsTheProgram) {
+    const fs::path temp = make_temp_dir("libxpkg-spawn-path-");
+    shell::Command c;
+    if constexpr (kWindows) {
+        fs::copy_file(fs::path(std::getenv("SystemRoot")) / "System32" / "cmd.exe", temp / "xpkg-probe.exe");
+        c.argv = { "xpkg-probe", "/d", "/c", "exit 7" };
+    } else {
+        write_text(temp / "xpkg-probe", "#!/bin/sh\nexit 7\n");
+        fs::permissions(temp / "xpkg-probe", fs::perms::owner_all, fs::perm_options::replace);
+        c.argv = { "xpkg-probe" };
+    }
+    c.env = { { "PATH", temp.string() } };
+    const auto ran = shell::spawn(c, { shell::Sink::Null, shell::Sink::Null });
+    ASSERT_EQ(ran.status.kind, shell::Status::Kind::Exit) << ran.status.message;
+    EXPECT_EQ(ran.status.code, 7);
+    fs::remove_all(temp);
+}
+
+// A batch file re-parses its arguments in cmd: a list is refused, with the way out.
+TEST(SpawnTest, ABatchFileTakesNoArgumentList) {
+    if constexpr (!kWindows) GTEST_SKIP() << "batch files are Windows'";
+    const fs::path temp = make_temp_dir("libxpkg-spawn-bat-");
+    const fs::path tool = make_tool(temp);  // tool.bat
+    const auto ran = shell::spawn({ .argv = { tool.string(), "x" } }, { shell::Sink::Null, shell::Sink::Null });
+    EXPECT_EQ(ran.status.kind, shell::Status::Kind::Refused);
+    EXPECT_NE(ran.status.message.find("pass the command as one string"), std::string::npos) << ran.status.message;
+    fs::remove_all(temp);
+}

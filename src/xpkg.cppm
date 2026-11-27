@@ -1,24 +1,71 @@
 module;
+#include <array>
+#include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 #include <filesystem>
 #include <unordered_map>
 #include <expected>
+#include <optional>
 
 export module mcpplibs.xpkg;
 
 export namespace mcpplibs::xpkg {
 
+// The highest `spec` this library reads. "1" and "2" run with the
+// compatibility layer; "3" runs in the environment without it (design
+// 2026-11-27 §9.6). A recipe of a higher spec is one for a newer client: a
+// host refuses it and names the update.
+inline constexpr int kHighestSpec = 3;
+
+// The number a recipe's `spec` names ("2" -> 2), or nullopt when it names none:
+// empty, or not a whole number. A recipe that names none is read as before
+// any spec existed, with the compatibility layer.
+std::optional<int> spec_number(std::string_view spec);
+
+// A recipe's text with comments and string literals blanked to spaces --
+// newlines kept, so a position still has its line: the code, for reading the
+// names a recipe uses without running it.
+std::string recipe_code(std::string_view text);
+
+// The `spec` a recipe's text declares (`spec = "3"`), read without running
+// it: the first `spec` key in its code assigned a string literal; nullopt
+// when there is none. A recipe's top level may have effects, so it runs once,
+// in the environment its spec chooses -- which therefore cannot be learned by
+// running it.
+std::optional<std::string> declared_spec(std::string_view text);
+
 enum class PackageType   { Package, Script, Template, Config, Subos };
 enum class PackageStatus { Dev, Stable, Deprecated };
 
-// Canonicalize a CPU-arch token to xlings' internal spelling.
-// Accepts common aliases so recipes can use upstream names verbatim:
-//   amd64 / x64 / x86-64 / x86_64  -> "x86_64"
-//   arm64 / armv8  / aarch64       -> "aarch64"
-//   x86   / i386   / i686          -> "x86"
-// Unknown tokens are returned lower-cased unchanged. Case-insensitive.
+// One CPU architecture as the xpkg format names it: the name recipes and hosts
+// agree on, the names upstreams use for it, and how an ELF header says it.
+//
+// There is one table of these (arch_identities()). The loader reads it to
+// canonicalize names and to know which keys of a version entry are per-arch
+// resources; elfpatch reads it to tell a file built for this machine from one
+// built for another; a host reads it to check that a payload is its machine's
+// (design 2026-11-27 §5.1). An architecture added here is known to all of them
+// at once. Properties that only one program needs (a standard loader path, a
+// boot file name) stay in that program, keyed by `name`.
+struct ArchIdentity {
+    std::string_view name;                      // canonical, e.g. "x86_64"
+    std::span<const std::string_view> aliases;  // other spellings, lower case
+    std::uint16_t elf_machine;                  // e_machine
+    int elf_bits;                               // the ELF class: 32 or 64
+};
+
+std::span<const ArchIdentity> arch_identities();
+// The identity a canonical name or an alias names (case-insensitive), or null.
+const ArchIdentity* find_arch(std::string_view name);
+// The identity an ELF header's e_machine and class describe, or null.
+const ArchIdentity* find_arch_by_elf(std::uint16_t machine, int bits);
+
+// Canonicalize a CPU-arch token to its name in the identity table, so recipes
+// can use upstream names verbatim (amd64, arm64, i686, loong64, ...). A token
+// the table does not know is returned lower-cased. Case-insensitive.
 std::string normalize_arch(std::string_view raw);
 
 // True when two arch tokens denote the same canonical arch (e.g. "arm64"
@@ -64,6 +111,11 @@ struct PlatformResource {
     // "2026.10.16.1"`): a client resolving a package with no version named
     // passes over the versions it cannot use. Empty when the entry states none.
     std::string min_client;
+    // How the host lands the download in the install directory (`strip = n`,
+    // spec "3"): the first n components of every member's path are dropped.
+    // -1 when the entry states none (the platform's, else 0, applies; see
+    // PlatformMatrix::platform_strip and resolve_resource).
+    int strip = -1;
 };
 
 // What this package exposes to consumers/xlings at install/runtime.
@@ -76,10 +128,15 @@ struct ExportsRuntime {
     // Dynamic linker (PT_INTERP) path, relative to install_dir.
     // Only libc-class providers (glibc, musl) declare this.
     std::string loader;
-    // Library search dirs (RPATH closure). Empty == fall back to the
-    // {lib64, lib} convention. Only declare if the package's layout
-    // diverges from convention.
+    // Library search dirs (RPATH closure). Undeclared == the {lib64, lib}
+    // convention. Only declare if the package's layout diverges from
+    // convention.
     std::vector<std::string> libdirs;
+    // `libdirs` was written, `{}` included: an empty list is then a package
+    // that exports no library directory -- target content (a sysroot, a
+    // bare-metal C library) that no host and no consumer loads -- not the
+    // convention.
+    bool libdirs_declared { false };
     // ABI tag, used to disambiguate when multiple deps provide loaders
     // (e.g. "linux-x86_64-glibc" vs "linux-x86_64-musl"). The consumer
     // can request a specific abi via `elfpatch.set({interp_from = ...})`.
@@ -127,6 +184,8 @@ struct PlatformMatrix {
     std::unordered_map<std::string, ExportsBlock> exports;
     // platform inheritance, e.g. "ubuntu" -> "linux"
     std::unordered_map<std::string, std::string> inherits;
+    // platform -> `strip` stated for all of its versions (an entry's own wins).
+    std::unordered_map<std::string, int> platform_strip;
     // Declared outside struct body → outlined symbol in module object.
     // Prevents test/consumer TUs from inlining the body and then generating
     // unsatisfied calls to std internal inline helpers (e.g. ~_Vector_impl).
@@ -224,15 +283,139 @@ std::string PackageIdentity::canonical_name() const {
     return namespaceName + ":" + name;
 }
 
-std::string normalize_arch(std::string_view raw) {
+namespace {
+
+constexpr std::string_view kX86_64Aliases[]  = {"amd64", "x64", "x86-64"};
+constexpr std::string_view kAarch64Aliases[] = {"arm64", "armv8"};
+constexpr std::string_view kX86Aliases[]     = {"i386", "i686"};
+constexpr std::string_view kArmAliases[]     = {"armv7", "armv7l", "armhf"};
+constexpr std::string_view kLoongAliases[]   = {"loong64"};
+
+// e_machine values from the ELF specification (EM_*).
+constexpr std::array<ArchIdentity, 6> kArchIdentities{{
+    {"x86_64",      kX86_64Aliases,  62,  64},
+    {"aarch64",     kAarch64Aliases, 183, 64},
+    {"x86",         kX86Aliases,     3,   32},
+    {"arm",         kArmAliases,     40,  32},
+    {"riscv64",     {},              243, 64},
+    {"loongarch64", kLoongAliases,   258, 64},
+}};
+
+std::string lower_(std::string_view raw) {
     std::string s;
     s.reserve(raw.size());
     for (char c : raw)
         s += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-    if (s == "amd64" || s == "x64" || s == "x86-64" || s == "x86_64") return "x86_64";
-    if (s == "arm64" || s == "armv8" || s == "aarch64")               return "aarch64";
-    if (s == "x86"   || s == "i386" || s == "i686")                   return "x86";
     return s;
+}
+
+} // namespace
+
+std::span<const ArchIdentity> arch_identities() { return kArchIdentities; }
+
+const ArchIdentity* find_arch(std::string_view name) {
+    const auto s = lower_(name);
+    for (const auto& arch : kArchIdentities) {
+        if (arch.name == s) return &arch;
+        for (const auto alias : arch.aliases)
+            if (alias == s) return &arch;
+    }
+    return nullptr;
+}
+
+const ArchIdentity* find_arch_by_elf(std::uint16_t machine, int bits) {
+    for (const auto& arch : kArchIdentities)
+        if (arch.elf_machine == machine && arch.elf_bits == bits) return &arch;
+    return nullptr;
+}
+
+std::string normalize_arch(std::string_view raw) {
+    if (const auto* arch = find_arch(raw)) return std::string(arch->name);
+    return lower_(raw);
+}
+
+std::string recipe_code(std::string_view text) {
+    std::string out(text);
+    std::size_t i = 0;
+    auto blank = [&](std::size_t from, std::size_t to) {
+        for (std::size_t k = from; k < to && k < out.size(); ++k)
+            if (out[k] != '\n') out[k] = ' ';
+    };
+    // A long bracket at `at`: [[ or [=*[; its level, or -1.
+    auto long_open = [&](std::size_t at) -> int {
+        if (at >= text.size() || text[at] != '[') return -1;
+        std::size_t k = at + 1;
+        int level = 0;
+        while (k < text.size() && text[k] == '=') { ++level; ++k; }
+        return (k < text.size() && text[k] == '[') ? level : -1;
+    };
+    auto long_close = [&](std::size_t from, int level) -> std::size_t {
+        const std::string closing = "]" + std::string(static_cast<std::size_t>(level), '=') + "]";
+        const auto end = text.find(closing, from);
+        return end == std::string_view::npos ? text.size() : end + closing.size();
+    };
+    while (i < text.size()) {
+        const char c = text[i];
+        if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') {
+            const int level = long_open(i + 2);
+            std::size_t end;
+            if (level >= 0) end = long_close(i + 2 + static_cast<std::size_t>(level) + 2, level);
+            else {
+                end = text.find('\n', i);
+                if (end == std::string_view::npos) end = text.size();
+            }
+            blank(i, end);
+            i = end;
+        } else if (c == '"' || c == '\'') {
+            std::size_t k = i + 1;
+            while (k < text.size() && text[k] != c && text[k] != '\n') {
+                if (text[k] == '\\') ++k;
+                ++k;
+            }
+            blank(i, k + 1);
+            i = k + 1;
+        } else if (const int level = long_open(i); level >= 0) {
+            const auto end = long_close(i + static_cast<std::size_t>(level) + 2, level);
+            blank(i, end);
+            i = end;
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> declared_spec(std::string_view text) {
+    const auto code = recipe_code(text);
+    const auto word = [](char ch) {
+        return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+    };
+    for (std::size_t at = code.find("spec"); at != std::string::npos; at = code.find("spec", at + 4)) {
+        if ((at > 0 && (word(code[at - 1]) || code[at - 1] == '.')) ||
+            (at + 4 < code.size() && word(code[at + 4])))
+            continue;
+        std::size_t k = at + 4;
+        while (k < code.size() && (code[k] == ' ' || code[k] == '\t')) ++k;
+        if (k >= code.size() || code[k] != '=' || (k + 1 < code.size() && code[k + 1] == '=')) continue;
+        ++k;
+        while (k < text.size() && (text[k] == ' ' || text[k] == '\t')) ++k;
+        if (k >= text.size() || (text[k] != '"' && text[k] != '\'')) continue;
+        const char quote = text[k];
+        const auto end = text.find(quote, k + 1);
+        if (end == std::string_view::npos) return std::nullopt;
+        return std::string(text.substr(k + 1, end - k - 1));
+    }
+    return std::nullopt;
+}
+
+std::optional<int> spec_number(std::string_view spec) {
+    if (spec.empty() || spec.size() > 4) return std::nullopt;
+    int n = 0;
+    for (char c : spec) {
+        if (c < '0' || c > '9') return std::nullopt;
+        n = n * 10 + (c - '0');
+    }
+    return n;
 }
 
 bool arch_matches(std::string_view a, std::string_view b) {

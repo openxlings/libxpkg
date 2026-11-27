@@ -8,10 +8,11 @@
 // the repository can be in.
 //
 // It has been in that state. `xvm.files` shipped in 0.0.47 as an edit to the
-// generated file alone; the .lua that is nominally its source never had it. An
-// earlier xmake before_build hook would have regenerated from that stale source
-// and silently deleted the feature from the shipped stdlib. Nothing checked,
-// because a build that reads neither copy cannot notice they disagree.
+// generated file alone; the .lua that is nominally its source never had it. A
+// build step that regenerated before every build would have regenerated from
+// that stale source and silently deleted the feature from the shipped stdlib.
+// Nothing checked, because a build that reads neither copy cannot notice they
+// disagree.
 //
 // Writes go to MCPP_OUT_DIR, never the package root: as a registry dependency
 // this package's root is shared between projects and may be read-only.
@@ -34,7 +35,9 @@ struct Module {
 
 // Order is the load order in xpkg-executor.cppm's load_stdlib.
 constexpr Module MODULES[] = {
-    {"prelude_lua",    "src/lua-stdlib/prelude.lua"},
+    {"compat_lua",     "src/lua-stdlib/compat.lua"},
+    {"manifest_lua",   "src/lua-stdlib/manifest.lua"},
+    {"spec3_lua",      "src/lua-stdlib/spec3.lua"},
     {"log_lua",        "src/lua-stdlib/xim/libxpkg/log.lua"},
     {"pkginfo_lua",    "src/lua-stdlib/xim/libxpkg/pkginfo.lua"},
     {"system_lua",     "src/lua-stdlib/xim/libxpkg/system.lua"},
@@ -45,6 +48,7 @@ constexpr Module MODULES[] = {
     {"elfpatch_lua",   "src/lua-stdlib/xim/libxpkg/elfpatch.lua"},
     {"json_lua",       "src/lua-stdlib/xim/libxpkg/json.lua"},
     {"base64_lua",     "src/lua-stdlib/xim/libxpkg/base64.lua"},
+    {"path_lua",       "src/lua-stdlib/xim/libxpkg/path.lua"},
 };
 
 [[noreturn]] void fail(std::string_view what, const fs::path& p) {
@@ -103,6 +107,21 @@ void embed(std::string& out, std::string_view var, const std::string& content) {
     out += std::format("inline const std::string_view {} = {}_storage;\n\n", var, var);
 }
 
+// A text kept byte for byte: chunks of raw literals with nothing added at the
+// seams (`embed` adds a newline at each, inert in Lua, not in a document).
+void embed_exact(std::string& out, std::string_view var, const std::string& content) {
+    out += std::format("inline const std::string {}_storage = []{{ std::string s;\n", var);
+    for (std::size_t pos = 0; pos < content.size();) {
+        auto end = std::min(content.size(), pos + MSVC_LIMIT);
+        // Never inside a UTF-8 sequence: each literal is valid text.
+        while (end < content.size() && end > pos && (static_cast<unsigned char>(content[end]) & 0xC0) == 0x80) --end;
+        out += std::format("    s += R\"__TEXT__({})__TEXT__\";\n", std::string_view{content}.substr(pos, end - pos));
+        pos = end;
+    }
+    out += "    return s; }();\n";
+    out += std::format("inline const std::string_view {} = {}_storage;\n\n", var, var);
+}
+
 } // namespace
 
 int main() {
@@ -124,6 +143,29 @@ int main() {
         // the toolchain changes, and a .lua edit would not reach the binary.
         mcpp::rerun_if_changed(m.path);
     }
+
+    // The conformance cases (tests/conformance/*.lua, design 2026-11-27 §9.9):
+    // embedded so a host runs the same cases through its own install without
+    // finding this package's directory.
+    std::vector<fs::path> cases;
+    for (const auto& e : fs::directory_iterator(root / "tests" / "conformance"))
+        if (e.is_regular_file() && e.path().extension() == ".lua") cases.push_back(e.path());
+    std::ranges::sort(cases);
+    std::string table = "inline const std::pair<std::string_view, std::string_view> conformance_cases_lua[] = {\n";
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const auto var = std::format("conformance_case_{}", i);
+        embed(text, var, slurp(cases[i]));
+        table += std::format("    {{\"{}\", {}}},\n", cases[i].stem().string(), var);
+        const auto rel = fs::path("tests") / "conformance" / cases[i].filename();
+        mcpp::rerun_if_changed(rel.generic_string().c_str());
+    }
+    text += table + "};\n";
+    mcpp::rerun_if_changed("tests/conformance");
+
+    // The specification itself, so a host can hold its copy (xlings'
+    // docs/specs/xpkg.md) to the text of the version it builds with.
+    embed_exact(text, "specification_md", slurp(root / "docs" / "spec" / "xpkg.md"));
+    mcpp::rerun_if_changed("docs/spec/xpkg.md");
     text += "} // namespace mcpplibs::xpkg::detail\n";
 
     {

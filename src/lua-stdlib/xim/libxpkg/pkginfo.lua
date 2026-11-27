@@ -7,6 +7,25 @@ end
 
 function M.name()         return _RUNTIME and _RUNTIME.pkg_name or nil end
 function M.version()      return _RUNTIME and _RUNTIME.version or nil end
+
+-- The platform and the architecture of this install: the host machine of the
+-- home (design 2026-11-27 §5.1), as xlings resolved it -- a fact of the
+-- install, not a probe of the machine the hook happens to run on. The
+-- architecture is the canonical name of the format's table (x86_64, aarch64,
+-- ...). Outside a hook there is no install to answer for: an error.
+function M.platform()
+    local p = _RUNTIME and _RUNTIME.platform
+    if not p or p == "" then error("pkginfo.platform: there is no install here (called outside a hook)", 2) end
+    return p
+end
+
+function M.arch()
+    local a = _RUNTIME and _RUNTIME.arch
+    if not a or a == "" then error("pkginfo.arch: there is no install here (called outside a hook)", 2) end
+    a = string.lower(a)
+    local id = _LIBXPKG_ARCHS and _LIBXPKG_ARCHS[a]
+    return id and id.name or a
+end
 function M.install_file() return _RUNTIME and _RUNTIME.install_file or nil end
 function M.deps_list()    return (_RUNTIME and _RUNTIME.deps_list) or {} end
 

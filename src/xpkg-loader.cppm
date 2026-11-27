@@ -3,6 +3,7 @@ module;
 export module mcpplibs.xpkg.loader;
 import mcpplibs.xpkg;
 import mcpplibs.xpkg.shell;
+import mcpplibs.xpkg.lua_stdlib;
 import mcpplibs.capi.lua;
 import std;
 
@@ -39,6 +40,32 @@ struct LoaderBoundaries {
     IndexBuildBoundary index_build;
 };
 
+// What an index says about itself in its index-compat.json that the loader
+// acts on (design 2026-11-27 §9.8).
+struct IndexDeclarations {
+    fs::path root;
+    // `"recipes": { "template": "template.lua" }`: a file of the index run
+    // after every recipe of pkgs/, in the recipe's environment, as if it were
+    // written at its end. The files on disk are not changed, and the index's
+    // pkgindex-build.lua (which appended it to each one) is not run. Empty
+    // when the index declares none.
+    fs::path recipe_template;
+};
+
+// The declarations of the index at `root`. No index-compat.json, or none of
+// these declarations in it, is an empty result; one that cannot be read, or a
+// template that is not a file of the index, is an error that names it.
+std::expected<IndexDeclarations, std::string> index_declarations(const fs::path& root);
+
+// The declarations of the index a recipe file is in (<root>/pkgs/<letter>/<file>.lua);
+// an empty result for a recipe that is in no index.
+std::expected<IndexDeclarations, std::string> recipe_index_declarations(const fs::path& recipe);
+
+// The text a recipe is: its file, followed by its index's template when the
+// index declares one. What a host keeps of a recipe for later (the copy it
+// removes the package with) is this text.
+std::expected<std::string, std::string> recipe_text(const fs::path& recipe);
+
 
 } // export namespace mcpplibs::xpkg
 
@@ -50,10 +77,10 @@ build_index_impl(const fs::path& repo_dir, const std::string& defaultNamespace,
                  const LoaderBoundaries* boundaries);
 
 
-// Register loader sandbox: no-op import() + defensive stubs for non-standard
-// globals. This gives the loader a self-contained pure Lua 5.4 environment
-// that does not depend on any xmake runtime. Stubs ensure legacy or
-// third-party packages can still be loaded without crashing.
+// Register loader sandbox: no-op import() + defensive stubs for the
+// compatibility layer's names (compat.lua), so that reading the `package`
+// table of a recipe of spec "1" or "2" runs none of its hooks and needs none
+// of the executor's modules.
 void register_loader_sandbox(
     lua::State* L,
     std::string_view platform,
@@ -63,8 +90,8 @@ void register_loader_sandbox(
     lua::pushstring(L, std::string(arch).c_str());
     lua::setglobal(L, "__xpkg_arch__");
     lua::L_dostring(L,
-        // no-op import: returns a deep proxy and sets it as a global
-        // (matches xmake behavior where import("platform") sets _G.platform)
+        // no-op import: returns a deep proxy and binds it to the global of the
+        // module's last name, as the executor's import does
         // The proxy returns '' for string operations and nested proxies for
         // chained access like platform.get_config_info().rundir
         "do "
@@ -204,6 +231,21 @@ int get_nonneg_int(lua::State* L, int idx, const char* key) {
         auto v = lua::tointeger(L, -1);
         if (v >= 0 && v <= std::numeric_limits<int>::max())
             r = static_cast<int>(v);
+    }
+    lua::pop(L, 1);
+    return r;
+}
+
+// `strip`: a whole number of path components, 0..64. -1 when absent; -2 when
+// present and not such a number (the caller words the warning).
+int get_strip(lua::State* L, int idx) {
+    lua::getfield(L, idx, "strip");
+    int r = -1;
+    if (lua::isinteger(L, -1)) {
+        const auto v = lua::tointeger(L, -1);
+        r = (v >= 0 && v <= 64) ? static_cast<int>(v) : -2;
+    } else if (lua::type(L, -1) != lua::TNIL) {
+        r = -2;
     }
     lua::pop(L, 1);
     return r;
@@ -483,14 +525,16 @@ void resolve_inheritance(PlatformMatrix& xpm) {
             inherit(xpm.exports);
             inherit(xpm.platform_sources);
             inherit(xpm.platform_source_mirrors);
+            inherit(xpm.platform_strip);
             auto next = xpm.inherits.find(parent);
             parent = next == xpm.inherits.end() ? std::string{} : next->second;
         }
     }
 }
 
-// Parse xpm platform matrix from the package table at idx
-PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
+// Parse xpm platform matrix from the package table at idx; what it drops is
+// added to `warnings`.
+PlatformMatrix parse_xpm(lua::State* L, int pkg_idx, std::vector<std::string>& warnings) {
     PlatformMatrix xpm;
     lua::getfield(L, pkg_idx, "xpm");
     if (lua::type(L, -1) != lua::TTABLE) {
@@ -523,6 +567,12 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
         if (!platform.empty() && platform != "source"
                 && lua::type(L, -1) == lua::TTABLE) {
             int plat_idx = lua::gettop(L);
+
+            if (const int strip = get_strip(L, plat_idx); strip >= 0) {
+                xpm.platform_strip[platform] = strip;
+            } else if (strip == -2) {
+                warnings.push_back("xpm." + platform + ".strip: not a whole number of path components (0 to 64), ignored");
+            }
 
             auto platform_source = get_str(L, plat_idx, "source");
             if (!platform_source.empty()) {
@@ -654,7 +704,8 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
             //   exports = {
             //       runtime = {
             //           loader  = "lib64/ld-linux-x86-64.so.2",  -- libc only
-            //           libdirs = { "lib64", "lib" },            -- non-default only
+            //           libdirs = { "lib64", "lib" },            -- non-default only;
+            //                                                    -- {} exports none
             //           abi     = "linux-x86_64-glibc",          -- multi-libc only
             //       },
             //   }
@@ -674,8 +725,10 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                     lua::pop(L, 1);
 
                     lua::getfield(L, rt_idx, "libdirs");
-                    if (lua::type(L, -1) == lua::TTABLE)
+                    if (lua::type(L, -1) == lua::TTABLE) {
                         block.runtime.libdirs = parse_string_array(lua::gettop(L));
+                        block.runtime.libdirs_declared = true;
+                    }
                     lua::pop(L, 1);
 
                     lua::getfield(L, rt_idx, "abi");
@@ -702,7 +755,8 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                 // version entry; `deps`/`inherits` likewise.
                 if (!version.empty() && version != "deps"
                         && version != "inherits" && version != "ref"
-                        && version != "exports" && version != "source") {
+                        && version != "exports" && version != "source"
+                        && version != "strip") {
                     PlatformResource res;
                     if (lua::type(L, -1) == lua::TTABLE) {
                         int res_idx = lua::gettop(L);
@@ -716,9 +770,21 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                         }
                         res.sha256 = get_str(L, res_idx, "sha256");
                         res.ref    = get_str(L, res_idx, "ref");
+                        // `["1.3.11"] = { ref = "1.3.11" }` names no other
+                        // version: the entry is itself, with what is beside
+                        // the ref (here nothing -- its hooks make the
+                        // payload). Read as an alias it was a ref cycle,
+                        // which clients before spec 3 skipped with a warn.
+                        if (res.ref == version) res.ref.clear();
                         res.revision = get_nonneg_int(L, res_idx, "revision");
                         res.floor = std::min(get_nonneg_int(L, res_idx, "floor"), res.revision);
                         res.min_client = get_str(L, res_idx, "min_client");
+                        res.strip = get_strip(L, res_idx);
+                        if (res.strip == -2) {
+                            res.strip = -1;
+                            warnings.push_back("xpm." + platform + "." + version
+                                + ".strip: not a whole number of path components (0 to 64), ignored");
+                        }
 
                         // ---- V2 multi-arch shapes ----
                         // Scheme C / res: `sha256` is a per-arch TABLE rather
@@ -749,8 +815,7 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx) {
                                 if (lua::type(L, -2) == lua::TSTRING
                                         && lua::type(L, -1) == lua::TTABLE) {
                                     std::string canon = normalize_arch(lua::tostring(L, -2));
-                                    if (canon == "x86_64" || canon == "aarch64"
-                                            || canon == "x86") {
+                                    if (find_arch(canon) != nullptr) {
                                         int arch_idx = lua::gettop(L);
                                         ArchResource ar;
                                         ar.url = get_str(L, arch_idx, "url");
@@ -961,9 +1026,217 @@ int build_output_print_(lua::State* L) {
     return 0;
 }
 
+// ---- An index's declarations (index-compat.json) ----
+
+std::string slurp(const fs::path& file, bool& ok) {
+    std::ifstream in(file, std::ios::binary);
+    ok = static_cast<bool>(in);
+    std::ostringstream ss;
+    if (ok) ss << in.rdbuf();
+    return std::move(ss).str();
+}
+
+// recipes.template of an index-compat.json's text, read with the json module
+// of the stdlib: the name, "" when absent, or an error.
+std::expected<std::string, std::string> template_name(const std::string& text) {
+    lua::State* L = lua::L_newstate();
+    if (!L) return std::unexpected("failed to create lua state");
+    lua::L_openlibs(L);
+    std::expected<std::string, std::string> result = std::string{};
+    if (lua::L_loadstring(L, std::string(detail::json_lua).c_str()) != lua::OK
+            || lua::pcall(L, 0, 1, 0) != lua::OK) {
+        result = std::unexpected(std::string("the json module: ") + lua::tostring(L, -1));
+    } else {
+        lua::getfield(L, -1, "decode");
+        lua::pushlstring(L, text.data(), text.size());
+        if (lua::pcall(L, 1, 1, 0) != lua::OK) {
+            result = std::unexpected(std::string("not JSON: ") + (lua::tostring(L, -1) ? lua::tostring(L, -1) : "?"));
+        } else if (lua::type(L, -1) == lua::TTABLE) {
+            lua::getfield(L, -1, "recipes");
+            if (lua::type(L, -1) == lua::TTABLE) {
+                lua::getfield(L, -1, "template");
+                if (lua::type(L, -1) == lua::TSTRING) result = std::string(lua::tostring(L, -1));
+                else if (lua::type(L, -1) != lua::TNIL) result = std::unexpected("recipes.template is not a string");
+            } else if (lua::type(L, -1) != lua::TNIL) {
+                result = std::unexpected("recipes is not an object");
+            }
+        }
+    }
+    lua::close(L);
+    return result;
+}
+
+std::expected<IndexDeclarations, std::string> read_declarations(const fs::path& root) {
+    IndexDeclarations d{ .root = root };
+    const auto file = root / "index-compat.json";
+    std::error_code ec;
+    if (!fs::exists(file, ec)) return d;
+    bool ok = false;
+    const auto text = slurp(file, ok);
+    if (!ok) return std::unexpected(file.string() + ": cannot be read");
+    auto name = template_name(text);
+    if (!name) return std::unexpected(file.string() + ": " + name.error());
+    if (name->empty()) return d;
+    const fs::path relative(*name);
+    // A file of the index, named from its root.
+    bool escapes = relative.is_absolute();
+    for (const auto& part : relative) if (part == "..") escapes = true;
+    if (escapes) return std::unexpected(file.string() + ": recipes.template names " + *name + ", which is not a file of the index");
+    if (!fs::is_regular_file(root / relative, ec))
+        return std::unexpected(file.string() + ": recipes.template names " + *name + ", which does not exist");
+    d.recipe_template = root / relative;
+    return d;
+}
+
+// Parsed once per content: an index build reads it for every recipe. The key
+// is the file's text, not its time -- two writes within one tick of the
+// clock have the same time.
+std::expected<IndexDeclarations, std::string> cached_declarations(const fs::path& root) {
+    static std::mutex mutex;
+    static std::map<fs::path, std::pair<std::string, std::expected<IndexDeclarations, std::string>>> cache;
+    const auto file = root / "index-compat.json";
+    bool ok = false;
+    std::string text = slurp(file, ok);
+    if (!ok) text = "\x01(absent)";   // no file at all: never equal to a file's text
+    std::scoped_lock lock(mutex);
+    if (auto it = cache.find(root); it != cache.end() && it->second.first == text) {
+        // A template the cache named may have gone since.
+        const auto& d = it->second.second;
+        std::error_code ec;
+        if (!d || d->recipe_template.empty() || fs::is_regular_file(d->recipe_template, ec)) return d;
+    }
+    auto read = read_declarations(root);
+    cache.insert_or_assign(root, std::pair{ std::move(text), read });
+    return read;
+}
+
+// The index a recipe file is in, or nothing: <root>/pkgs/<letter>/<file>.lua.
+std::optional<fs::path> index_of(const fs::path& recipe) {
+    const auto pkgs = recipe.parent_path().parent_path();
+    if (pkgs.filename() != "pkgs") return std::nullopt;
+    return pkgs.parent_path();
+}
+
+// The template to run after `recipe`, or an empty path.
+std::expected<fs::path, std::string> template_for(const fs::path& recipe) {
+    const auto root = index_of(recipe);
+    if (!root) return fs::path{};
+    auto d = cached_declarations(*root);
+    if (!d) return std::unexpected(d.error());
+    return d->recipe_template;
+}
+
+// ---- The top level of a recipe of spec "3", where its package table is read ----
+//
+// The loader reads every recipe with stubs for the compatibility layer's
+// names (register_loader_sandbox), so a recipe's top level never fails here.
+// For a recipe of spec "3" that is not enough: its top level runs in the
+// environment it is installed with (spec3.lua), where those names do not exist
+// and a module function that is not pure may not be called. So it runs once
+// more, in that environment, with the modules as stubs that raise when called
+// -- path, json and base64 are the real ones -- and index libs read as they are
+// imported. What fails there is a load error of the recipe: the same answer
+// search, an index build and an install get.
+std::optional<std::string> check_spec3_top_level(const fs::path& pkg_path, const fs::path& recipe_template) {
+    lua::State* L = lua::L_newstate();
+    if (!L) return "failed to create lua state";
+    lua::L_openlibs(L);
+    std::optional<std::string> problem;
+    auto run = [&](std::string_view source, const char* what, int results) -> bool {
+        if (lua::L_loadstring(L, std::string(source).c_str()) != lua::OK
+                || lua::pcall(L, 0, results, 0) != lua::OK) {
+            problem = std::string(what) + ": " + (lua::tostring(L, -1) ? lua::tostring(L, -1) : "error");
+            return false;
+        }
+        return true;
+    };
+    lua::newtable(L);
+    lua::setglobal(L, "_LIBXPKG_MODULES");
+    struct Pure { const char* name; std::string_view source; };
+    const Pure pure[] = {
+        {"path", detail::path_lua}, {"json", detail::json_lua}, {"base64", detail::base64_lua},
+    };
+    for (const auto& m : pure) {
+        if (!run(m.source, m.name, 1)) break;
+        lua::getglobal(L, "_LIBXPKG_MODULES");
+        lua::insert(L, -2);
+        lua::setfield(L, -2, m.name);
+        lua::pop(L, 1);
+    }
+    if (!problem && run(detail::manifest_lua, "the interface manifest", 1)) {
+        lua::setglobal(L, "_LIBXPKG_MANIFEST");
+        run(R"__LUA__(
+            for _, m in ipairs(_LIBXPKG_MANIFEST.modules) do
+                if not _LIBXPKG_MODULES[m.name] then
+                    local stub = {}
+                    for _, row in ipairs(m.entries) do
+                        local qualified = m.name .. "." .. row[1]
+                        stub[row[1]] = function()
+                            error(qualified .. ' is called at the top level of a recipe of spec "3"; '
+                                .. "the top level holds the package table, imports and function "
+                                .. "definitions -- call it from a hook", 2)
+                        end
+                    end
+                    _LIBXPKG_MODULES[m.name] = stub
+                end
+            end
+        )__LUA__", "the module stubs", 0);
+    }
+    if (!problem) run(detail::spec3_lua, "the spec 3 environment", 0);
+    if (!problem) {
+        // Index libs are read from the recipe's index (pkgs/<letter>/<file>),
+        // three levels up the absolute path (a relative one has no parent there).
+        std::error_code ec;
+        const auto absolute = fs::absolute(pkg_path, ec).lexically_normal();
+        const auto index = (ec ? pkg_path : absolute).parent_path().parent_path().parent_path();
+        ec.clear();
+        if (fs::is_directory(index / "libs", ec)) {
+            lua::pushstring(L, index.string().c_str());
+            lua::setglobal(L, "_PKGINDEX_DIR");
+        }
+        lua::getglobal(L, "_LIBXPKG_SPEC3_ENV");
+        if (lua::pcall(L, 0, 1, 0) != lua::OK) {
+            problem = lua::tostring(L, -1);
+        } else if (lua::L_loadfilex(L, pkg_path.string().c_str(), "t") != lua::OK) {
+            problem = lua::tostring(L, -1);
+        } else {
+            lua::pushvalue(L, -2);
+            lua::setupvalue(L, -2, 1);  // the chunk's _ENV
+            if (lua::pcall(L, 0, 0, 0) != lua::OK) {
+                problem = lua::tostring(L, -1);
+            } else if (!recipe_template.empty()) {
+                // The index's template, in the same environment (§9.8).
+                if (lua::L_loadfilex(L, recipe_template.string().c_str(), "t") != lua::OK) {
+                    problem = lua::tostring(L, -1);
+                } else {
+                    lua::pushvalue(L, -2);
+                    lua::setupvalue(L, -2, 1);
+                    if (lua::pcall(L, 0, 0, 0) != lua::OK) problem = lua::tostring(L, -1);
+                }
+            }
+        }
+    }
+    lua::close(L);
+    return problem;
+}
+
+// An index that declares its recipe template is read with it (template_for),
+// so its build script -- which appended the template to every file -- does
+// not run. Files an earlier build rewrote are restored, as before each build.
+void restore_pkgs(const fs::path& repo_dir) {
+    if (fs::exists(repo_dir / ".git")) {
+        shell::run("git -C \"" + repo_dir.string() + "\" checkout -- pkgs/",
+                   { shell::Sink::Inherit, shell::Sink::Null });
+    }
+}
+
 bool run_pkgindex_build(const fs::path& repo_dir, const BuildOutput& output) {
     auto build_script = repo_dir / "pkgindex-build.lua";
     if (!fs::exists(build_script)) return false;
+    if (auto d = cached_declarations(repo_dir); d && !d->recipe_template.empty()) {
+        restore_pkgs(repo_dir);
+        return false;
+    }
 
     // Reset pkgs dir via git to ensure clean state before the build script
     // modifies files. Use git -C to avoid changing working directory.
@@ -1025,11 +1298,17 @@ load_package(const fs::path& pkg_path, const LoaderContext& context) {
     if (!L) return std::unexpected("failed to create lua state");
     lua::L_openlibs(L);
 
-    // Register loader sandbox (pure Lua 5.4, no xmake dependency)
+    // Register loader sandbox: stubs for the compatibility layer's names
     loader_detail::register_loader_sandbox(
         L, context.platform, normalize_arch(context.arch));
 
-    if (lua::L_dofile(L, pkg_path.string().c_str()) != lua::OK) {
+    auto recipe_template = loader_detail::template_for(pkg_path);
+    if (!recipe_template) {
+        lua::close(L);
+        return std::unexpected(recipe_template.error());
+    }
+    if (lua::L_dofile(L, pkg_path.string().c_str()) != lua::OK
+            || (!recipe_template->empty() && lua::L_dofile(L, recipe_template->string().c_str()) != lua::OK)) {
         std::string err = lua::tostring(L, -1);
         lua::close(L);
         return std::unexpected("lua error: " + err);
@@ -1062,12 +1341,57 @@ load_package(const fs::path& pkg_path, const LoaderContext& context) {
     p.keywords    = loader_detail::get_str_array(L, pkg_idx, "keywords");
     p.archs       = loader_detail::get_str_array(L, pkg_idx, "archs");
     p.programs    = loader_detail::get_str_array(L, pkg_idx, "programs");
-    p.xpm         = loader_detail::parse_xpm(L, pkg_idx);
+    p.xpm         = loader_detail::parse_xpm(L, pkg_idx, p.warnings);
     p.extensions  = loader_detail::get_extensions(L, pkg_idx, p.warnings);
     p.host_facts  = loader_detail::get_host_facts(L, pkg_idx, p.warnings);
 
     lua::close(L);
+    // An executor reads spec from the text, before the recipe runs
+    // (declared_spec): a package table whose spec is not the string its text
+    // declares would be run in an environment its metadata does not name.
+    {
+        std::ifstream in(pkg_path, std::ios::binary);
+        std::ostringstream text;
+        text << in.rdbuf();
+        const auto declared = declared_spec(text.str()).value_or("");
+        if (declared != p.spec) {
+            return std::unexpected(std::format(
+                "{}: package.spec is \"{}\", and its text declares {}: spec is read from the text "
+                "before the recipe runs -- write it as a string in the package table (spec = \"{}\")",
+                pkg_path.string(), p.spec, declared.empty() ? std::string("none") : "\"" + declared + "\"",
+                p.spec));
+        }
+    }
+    if (const auto spec = spec_number(p.spec); spec && *spec == 3) {
+        if (auto problem = loader_detail::check_spec3_top_level(pkg_path, *recipe_template))
+            return std::unexpected("lua error: " + *problem);
+    }
     return p;
+}
+
+std::expected<IndexDeclarations, std::string> index_declarations(const fs::path& root) {
+    return loader_detail::cached_declarations(root);
+}
+
+std::expected<IndexDeclarations, std::string> recipe_index_declarations(const fs::path& recipe) {
+    const auto root = loader_detail::index_of(recipe);
+    if (!root) return IndexDeclarations{};
+    return loader_detail::cached_declarations(*root);
+}
+
+std::expected<std::string, std::string> recipe_text(const fs::path& recipe) {
+    bool ok = false;
+    auto text = loader_detail::slurp(recipe, ok);
+    if (!ok) return std::unexpected(recipe.string() + ": cannot be read");
+    auto recipe_template = loader_detail::template_for(recipe);
+    if (!recipe_template) return std::unexpected(recipe_template.error());
+    if (!recipe_template->empty()) {
+        auto tail = loader_detail::slurp(*recipe_template, ok);
+        if (!ok) return std::unexpected(recipe_template->string() + ": cannot be read");
+        if (!text.empty() && text.back() != '\n') text += '\n';
+        text += tail;
+    }
+    return text;
 }
 
 std::expected<Package, std::string>

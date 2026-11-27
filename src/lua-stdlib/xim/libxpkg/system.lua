@@ -12,19 +12,73 @@ local function _execute(cmd, tty)
     return os.execute(cmd)
 end
 
+-- A command is one of two things (design 2026-11-27 §9.6):
+--   { "tar", "-xf", archive, "-C", dir }  a program found on PATH and its
+--       arguments, each passed as it is: no shell, nothing to quote. The
+--       recommended form, the one system.admin_step takes.
+--   "make -j4 2>&1 | tee build.log"       one shell line (sh -c, cmd /c), for
+--       the pipes and redirects that need a shell.
+-- opt.cwd     the directory it runs in (this process's is not changed)
+-- opt.env     { NAME = "value" } set in its environment, on top of this one
+-- opt.tty     its output reaches the terminal, not the hook log
+-- opt.capture its stdout is returned (exec) instead of logged
+-- The executor's process layer runs it (_LIBXPKG_SPAWN): status, code,
+-- output, message.
+local function _spawn(cmd, opt, capture)
+    if _LIBXPKG_SPAWN then
+        return _LIBXPKG_SPAWN(cmd, { cwd = opt.cwd, env = opt.env, tty = opt.tty, capture = capture })
+    end
+    -- No process layer bound (a state made without an executor): a line only.
+    if type(cmd) ~= "string" or opt.cwd or opt.env or capture then
+        return "refused", 0, "", "this state has no process layer for a list, cwd, env or capture"
+    end
+    local ok, how, code = _execute(cmd, opt.tty)
+    if ok == true or ok == 0 then return "exit", 0, "" end
+    return how == "signal" and "signal" or "exit", code or 1, ""
+end
+
+local function _describe(cmd)
+    if type(cmd) ~= "table" then return tostring(cmd) end
+    local words = {}
+    for _, w in ipairs(cmd) do table.insert(words, tostring(w)) end
+    return table.concat(words, " ")
+end
+
+local function _ended(status, code, why)
+    if status == "exit" then return "exited with " .. tostring(code) end
+    if status == "signal" then return "was killed by signal " .. tostring(code) end
+    return why or "could not start"
+end
+
+-- An action: the command ran and succeeded, or this raises (at the caller's
+-- line) with the command and how it ended.
 -- opt.retry : extra attempts after the first failure
--- opt.tty   : true = the command's output is not redirected into the hook log
 function M.exec(cmd, opt)
     opt = opt or {}
-    local retries = opt.retry or 0
-    local attempts = retries + 1
+    local attempts = (opt.retry or 0) + 1
     for i = 1, attempts do
-        local ret = _execute(cmd, opt.tty)
-        if ret == 0 or ret == true then return end
+        local status, code, out, why = _spawn(cmd, opt, opt.capture == true)
+        if status == "refused" then error("system.exec: " .. tostring(why), 2) end
+        if status == "exit" and code == 0 then
+            if opt.capture then return out end
+            return
+        end
         if i == attempts then
-            error("exec failed after " .. attempts .. " attempt(s): " .. tostring(cmd))
+            error(string.format("system.exec: %s: %s%s", _describe(cmd), _ended(status, code, why),
+                attempts > 1 and string.format(" (%d attempts)", attempts) or ""), 2)
         end
     end
+end
+
+-- A query: what does this command do? { ok, code, out } -- out is its stdout,
+-- ok is a zero exit status. A command that fails, or cannot start (code 127,
+-- with `error`), is an answer, never an error; a malformed command is.
+function M.run(cmd, opt)
+    opt = opt or {}
+    local status, code, out, why = _spawn(cmd, opt, true)
+    if status == "refused" then error("system.run: " .. tostring(why), 2) end
+    if status == "failed" then return { ok = false, code = 127, out = "", error = why } end
+    return { ok = status == "exit" and code == 0, code = code, out = out or "" }
 end
 
 -- A step only an administrator may take (chown root a sandbox helper, a

@@ -174,12 +174,6 @@ local function _is_elf(filepath)
     return _read_magic(filepath, 4) == "\x7fELF"
 end
 
--- e_machine values the ABI filter names by architecture (see _target_abi).
-local _EM_X86_64  = 62      -- 0x3e
-local _EM_AARCH64 = 183     -- 0xb7
-local _EM_386     = 3
-local _EM_ARM     = 40
-
 -- What an ELF file asks of a loader, read from its own headers.
 --
 -- Returns nil whenever the headers cannot be read in full: too short, not ELF,
@@ -270,11 +264,12 @@ local function _target_abi(loader)
         local facts = _elf_facts(loader)
         if facts then return { class = facts.class, machine = facts.machine } end
     end
-    local arch = (os.arch and os.arch()) or ""
-    if arch:find("aarch64") or arch:find("arm64") then return { class = 2, machine = _EM_AARCH64 } end
-    if arch:find("x86_64") or arch == "x64" then return { class = 2, machine = _EM_X86_64 } end
-    if arch:find("i386") or arch == "x86" then return { class = 1, machine = _EM_386 } end
-    if arch:find("arm") then return { class = 1, machine = _EM_ARM } end
+    -- No loader to read: the machine of this install, as the format's one table
+    -- of architectures (mcpplibs::xpkg::arch_identities, keyed by every name
+    -- and alias) describes it.
+    local arch = _RUNTIME and _RUNTIME.arch or ""
+    local id = _LIBXPKG_ARCHS and _LIBXPKG_ARCHS[string.lower(arch)]
+    if id then return { class = id.bits == 64 and 2 or 1, machine = id.machine } end
     return nil
 end
 
@@ -293,10 +288,10 @@ local function _skip_reason(filepath, abi)
     if not facts then return nil end
     if abi and (facts.machine ~= abi.machine or facts.class ~= abi.class) then
         return string.format("built for another machine (e_machine %d, class %d)",
-            facts.machine, facts.class)
+            facts.machine, facts.class), "foreign"
     end
     if not facts.interp and facts.needed == 0 then
-        return "nothing to resolve (no PT_INTERP, no DT_NEEDED)"
+        return "nothing to resolve (no PT_INTERP, no DT_NEEDED)", "static"
     end
     return nil
 end
@@ -338,15 +333,25 @@ local function _is_listed(rel, list)
 end
 
 -- The one gate every patching loop asks before touching a file.
+-- Each file left alone is counted by why: these are facts handed back to the
+-- host (skipped_foreign, skipped_static, skipped_listed), which decides what
+-- they mean for the payload -- a file of another machine where the host runs
+-- it is the host's rule, not this module's (design 2026-11-27 §5.4, §9.3).
+local function _count_skip(result, kind)
+    result.skipped = result.skipped + 1
+    local field = "skipped_" .. kind
+    result[field] = (result[field] or 0) + 1
+end
+
 local function _should_skip(filepath, install_dir, abi, skip, result)
     if skip and _is_listed(_relative_to(install_dir, filepath), skip) then
-        result.skipped = result.skipped + 1
+        _count_skip(result, "listed")
         _info("skip " .. filepath .. ": listed in skip")
         return true
     end
-    local why = _skip_reason(filepath, abi)
+    local why, kind = _skip_reason(filepath, abi)
     if why then
-        result.skipped = result.skipped + 1
+        _count_skip(result, kind)
         _info("skip " .. filepath .. ": " .. why)
         return true
     end
@@ -607,73 +612,87 @@ end
 -- interp before rpath internally regardless of CLI order. The
 -- workaround is two separate invocations in reverse order.
 -- See docs/plans/2026-05-03-patchelf-order-bug-analysis.md.
-local function _patch_elf_executables(patch_tool, dirs, install_dir, loader, rpath, shrink, result, gate)
-    for _, dir in ipairs(dirs) do
-        local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
-        local targets = _collect_targets(full, { include_shared_libs = true })
-        for _, filepath in ipairs(targets) do
-            result.scanned = result.scanned + 1
-            if gate(filepath) then goto next_exe end
-            local ok = true
-            -- Computed BEFORE the rpath, because it now decides the tag as
-            -- well as the interpreter. It was already being computed for the
-            -- interpreter a few lines down, so this costs nothing when a
-            -- loader is set and one `--print-interpreter` per file when not.
-            local is_exe = _has_pt_interp(filepath, patch_tool)
-            if rpath and rpath ~= "" then
-                ok = _exec_ok(_shell_quote(patch_tool.program)
-                    .. " --set-rpath " .. _shell_quote(rpath)
-                    .. _rpath_flags(is_exe)
-                    .. " " .. _shell_quote(filepath))
-            end
-            if ok and loader and is_exe then
-                ok = _exec_ok(_shell_quote(patch_tool.program)
-                    .. " --set-interpreter " .. _shell_quote(loader)
-                    .. " " .. _shell_quote(filepath))
-            end
-            if ok then
-                result.patched = result.patched + 1
-                _apply_shrink(patch_tool, filepath, shrink, result)
-            else
-                result.failed = result.failed + 1
-            end
-            ::next_exe::
-        end
+local function _patch_one_executable(patch_tool, filepath, loader, rpath, shrink, result)
+    local ok = true
+    -- Computed BEFORE the rpath, because it decides the tag as well as the
+    -- interpreter: one `--print-interpreter` per file.
+    local is_exe = _has_pt_interp(filepath, patch_tool)
+    if rpath and rpath ~= "" then
+        ok = _exec_ok(_shell_quote(patch_tool.program)
+            .. " --set-rpath " .. _shell_quote(rpath)
+            .. _rpath_flags(is_exe)
+            .. " " .. _shell_quote(filepath))
+    end
+    if ok and loader and is_exe then
+        ok = _exec_ok(_shell_quote(patch_tool.program)
+            .. " --set-interpreter " .. _shell_quote(loader)
+            .. " " .. _shell_quote(filepath))
+    end
+    if ok then
+        result.patched = result.patched + 1
+        _apply_shrink(patch_tool, filepath, shrink, result)
+    else
+        result.failed = result.failed + 1
     end
 end
 
--- Patch directories as libraries (rpath only, no interpreter)
-local function _patch_elf_libraries(patch_tool, dirs, install_dir, rpath, shrink, result, gate)
-    for _, dir in ipairs(dirs) do
-        local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
-        local targets = _collect_targets(full, { include_shared_libs = true })
-        for _, filepath in ipairs(targets) do
-            result.scanned = result.scanned + 1
-            if gate(filepath) then goto next_lib end
-            local ok = true
-            if rpath and rpath ~= "" then
-                ok = _exec_ok(_shell_quote(patch_tool.program)
-                    .. " --set-rpath " .. _shell_quote(rpath)
-                    .. " " .. _shell_quote(filepath))
-            end
-            if ok then
-                result.patched = result.patched + 1
-                _apply_shrink(patch_tool, filepath, shrink, result)
-            else
-                result.failed = result.failed + 1
-            end
-            ::next_lib::
-        end
+-- A library: rpath only, no interpreter.
+local function _patch_one_library(patch_tool, filepath, rpath, shrink, result)
+    local ok = true
+    if rpath and rpath ~= "" then
+        ok = _exec_ok(_shell_quote(patch_tool.program)
+            .. " --set-rpath " .. _shell_quote(rpath)
+            .. " " .. _shell_quote(filepath))
+    end
+    if ok then
+        result.patched = result.patched + 1
+        _apply_shrink(patch_tool, filepath, shrink, result)
+    else
+        result.failed = result.failed + 1
     end
 end
 
+-- Fallback mode: classify each file via PT_INTERP presence so we don't attempt
+-- --set-interpreter on shared libraries (which legitimately have no INTERP
+-- segment, causing patchelf to exit 1 and log noise). Files with INTERP get
+-- loader + rpath; files without get rpath only. Same op order as above.
+local function _patch_one_classified(patch_tool, filepath, loader, rpath, shrink, result)
+    local any_ok = false
+    local has_interp = _has_pt_interp(filepath, patch_tool)
+    if rpath and rpath ~= "" then
+        if _exec_ok(_shell_quote(patch_tool.program)
+            .. " --set-rpath " .. _shell_quote(rpath)
+            .. _rpath_flags(has_interp)
+            .. " " .. _shell_quote(filepath)) then
+            any_ok = true
+        end
+    end
+    if loader and has_interp then
+        if _exec_ok(_shell_quote(patch_tool.program)
+            .. " --set-interpreter " .. _shell_quote(loader)
+            .. " " .. _shell_quote(filepath)) then
+            any_ok = true
+        end
+    elseif loader and not has_interp then
+        -- Shared library / static binary: skip interp set silently; still
+        -- consider it for rpath. Don't penalize the patched count if rpath
+        -- alone succeeded above.
+        any_ok = true
+    end
+    if any_ok then
+        result.patched = result.patched + 1
+        _apply_shrink(patch_tool, filepath, shrink, result)
+    else
+        result.failed = result.failed + 1
+    end
+end
+
+-- What a patch call would change is decided from the files alone; the tool is
+-- looked for only once there is something for it to do (design 2026-11-27
+-- §9.3, xlings#741 UP-L1). With nothing to patch a missing tool is no failure;
+-- with files to patch the result says which tool was missing
+-- (`tool_missing`), and it is the caller that decides what that means.
 local function _patch_elf(target, opts, result)
-    local patch_tool = _find_tool("patchelf")
-    if not patch_tool then
-        _warn("patchelf not found, skip patching")
-        return result
-    end
-
     local loader = _resolve_loader(opts.loader)
     local rpath = _normalize_rpath(opts.rpath)
     if opts.loader and not loader then
@@ -707,25 +726,30 @@ local function _patch_elf(target, opts, result)
         return _should_skip(filepath, install_dir, abi, skip, result)
     end
 
+    -- The plan: every file this call would hand to patchelf, in order.
+    local plan = {}
+    local function _consider(filepath, mode)
+        result.scanned = result.scanned + 1
+        if not gate(filepath) then table.insert(plan, { file = filepath, mode = mode }) end
+    end
     if bins or libs then
         -- Declarative mode: package already classified bin/lib dirs
         _info(string.format("declared: bins=%s libs=%s loader=%s",
             bins and table.concat(bins, ",") or "nil",
             libs and table.concat(libs, ",") or "nil",
             tostring(loader)))
-        _patch_elf_executables(patch_tool, bins or {}, install_dir, loader, rpath, opts.shrink, result, gate)
-        _patch_elf_libraries(patch_tool, libs or {}, install_dir, rpath, opts.shrink, result, gate)
+        for _, group in ipairs({ { "executable", bins or {} }, { "library", libs or {} } }) do
+            local mode, dirs = group[1], group[2]
+            for _, dir in ipairs(dirs) do
+                local full = path.is_absolute(dir) and dir or path.join(install_dir, dir)
+                for _, filepath in ipairs(_collect_targets(full, { include_shared_libs = true })) do
+                    _consider(filepath, mode)
+                end
+            end
+        end
     else
-        -- Fallback mode: classify each file via PT_INTERP presence so we
-        -- don't attempt --set-interpreter on shared libraries (which
-        -- legitimately have no INTERP segment, causing patchelf to exit 1
-        -- and log noise). Files with INTERP get loader + rpath; files
-        -- without get rpath only.
-        --
-        -- Op order: --set-rpath FIRST, then --set-interpreter. See
-        -- _patch_elf_executables comment for why (patchelf 0.18.0 small-
-        -- ELF corruption bug) and docs/plans/2026-05-03-patchelf-order-
-        -- bug-analysis.md for full analysis.
+        -- Fallback mode: each file is classified by its PT_INTERP when it is
+        -- patched (_patch_one_classified).
         _info("fallback scan mode, loader=" .. tostring(loader))
         -- `scan` narrows the walk to the listed paths under the install dir;
         -- without it the whole tree is walked, as before.
@@ -745,62 +769,53 @@ local function _patch_elf(target, opts, result)
         else
             targets = _collect_targets(target, opts)
         end
-        for _, filepath in ipairs(targets) do
-            result.scanned = result.scanned + 1
-            if gate(filepath) then goto next_file end
-            local any_ok = false
-            local has_interp = _has_pt_interp(filepath, patch_tool)
-
-            if rpath and rpath ~= "" then
-                if _exec_ok(_shell_quote(patch_tool.program)
-                    .. " --set-rpath " .. _shell_quote(rpath)
-                    .. _rpath_flags(has_interp)
-                    .. " " .. _shell_quote(filepath)) then
-                    any_ok = true
-                end
-            end
-            if loader and has_interp then
-                if _exec_ok(_shell_quote(patch_tool.program)
-                    .. " --set-interpreter " .. _shell_quote(loader)
-                    .. " " .. _shell_quote(filepath)) then
-                    any_ok = true
-                end
-            elseif loader and not has_interp then
-                -- Shared library / static binary: skip interp set silently;
-                -- still consider it for rpath. Don't penalize the patched
-                -- count if rpath alone succeeded above.
-                any_ok = true
-            end
-
-            if any_ok then
-                result.patched = result.patched + 1
-                _apply_shrink(patch_tool, filepath, opts.shrink, result)
-            else
-                result.failed = result.failed + 1
-            end
-            ::next_file::
-        end
+        for _, filepath in ipairs(targets) do _consider(filepath, "classified") end
     end
 
     if result.skipped > 0 then
         _info(string.format("left %d file(s) untouched", result.skipped))
     end
+    if #plan == 0 then return result end
+    if not ((loader and loader ~= "") or (rpath and rpath ~= "")) then
+        -- Nothing would be written into them: counted as before, and no tool
+        -- is needed for it.
+        result.patched = result.patched + #plan
+        return result
+    end
+    local patch_tool = _find_tool("patchelf")
+    if not patch_tool then
+        result.tool_missing = "patchelf"
+        _warn(string.format("patchelf not found; %d file(s) were to be patched", #plan))
+        return result
+    end
+    for _, item in ipairs(plan) do
+        if item.mode == "executable" then
+            _patch_one_executable(patch_tool, item.file, loader, rpath, opts.shrink, result)
+        elseif item.mode == "library" then
+            _patch_one_library(patch_tool, item.file, rpath, opts.shrink, result)
+        else
+            _patch_one_classified(patch_tool, item.file, loader, rpath, opts.shrink, result)
+        end
+    end
     return result
 end
 
 local function _patch_macho(target, opts, result)
-    local tool = _find_tool("install_name_tool")
-    if not tool then
-        _warn("install_name_tool not found, skip patching (try: xcode-select --install)")
-        return result
-    end
-
     local rpath_paths = _normalize_rpath_list(opts.rpath)
     if not rpath_paths or #rpath_paths == 0 then
         return result
     end
 
     local targets = _collect_targets(target, opts)
+    if #targets == 0 then return result end
+    local tool = _find_tool("install_name_tool")
+    if not tool then
+        result.scanned = result.scanned + #targets
+        result.tool_missing = "install_name_tool"
+        _warn(string.format("install_name_tool not found; %d file(s) were to be patched", #targets))
+        return result
+    end
+
     for _, filepath in ipairs(targets) do
         result.scanned = result.scanned + 1
         local ok = true
@@ -844,9 +859,11 @@ function M.closure_lib_paths(opt)
     end
 
     -- Self libdirs: prefer self_exports.libdirs (already absolute, declared
-    -- by the package itself); fall back to {lib64, lib} convention.
-    local self_libdirs = _RUNTIME and _RUNTIME.self_exports and _RUNTIME.self_exports.libdirs
-    if self_libdirs and #self_libdirs > 0 then
+    -- by the package itself; `libdirs = {}` declares none); fall back to
+    -- {lib64, lib} convention.
+    local self_exports = _RUNTIME and _RUNTIME.self_exports
+    local self_libdirs = self_exports and self_exports.libdirs
+    if self_libdirs and (#self_libdirs > 0 or self_exports.libdirs_declared) then
         for _, d in ipairs(self_libdirs) do _push(d) end
     else
         local install_dir = _RUNTIME and _RUNTIME.install_dir
@@ -889,8 +906,10 @@ function M.closure_lib_paths(opt)
         local rec      = resolved[dep_spec]
         if declared and declared.libdirs and #declared.libdirs > 0 then
             for _, d in ipairs(declared.libdirs) do _push(d) end
-        elseif rec and rec.libdirs and #rec.libdirs > 0 then
-            for _, d in ipairs(rec.libdirs) do _push(d) end
+        elseif rec then
+            -- The resolver's answer, none included (a dep that declared
+            -- `libdirs = {}` exports no directory).
+            for _, d in ipairs(rec.libdirs or {}) do _push(d) end
         elseif _LIBXPKG_MODULES and _LIBXPKG_MODULES.pkginfo then
             -- Only a client that predates resolved_deps reaches this. Kept so
             -- an older xlings keeps working, and warned so the degraded path
@@ -918,9 +937,14 @@ end
 -- Higher-level entry points (M._apply, M.set / M.skip predicate path) bail
 -- out earlier on Windows; this dispatch is the last-line guard so direct
 -- callers (M.patch_elf_loader_rpath, legacy auto) stay safe too.
-function M.patch_elf_loader_rpath(target, opts)
+local function _new_result()
+    return { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0,
+             skipped_foreign = 0, skipped_static = 0, skipped_listed = 0 }
+end
+
+local function _patch_loader_rpath(target, opts)
     opts = opts or {}
-    local result = { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+    local result = _new_result()
 
     if is_host("linux") then
         return _patch_elf(target, opts, result)
@@ -932,18 +956,36 @@ function M.patch_elf_loader_rpath(target, opts)
     return result
 end
 
+-- A recipe that asks for named files to be changed is told when they cannot
+-- be: the tool missing is an error of the call, not an empty result (design
+-- 2026-11-27 §9.3).
+local function _require_tool(fn, result)
+    if result.tool_missing then
+        local planned = result.scanned - result.skipped
+        error(string.format("elfpatch.%s: %s is needed to change %d file(s) and was not found",
+            fn, result.tool_missing, planned), 3)
+    end
+    return result
+end
+
+function M.patch_elf_loader_rpath(target, opts)
+    return _require_tool("patch_elf_loader_rpath", _patch_loader_rpath(target, opts))
+end
+
 function M.set_interpreter(target, interpreter, opts)
     opts = opts or {}
     local result = { scanned = 0, patched = 0, failed = 0 }
     if not is_host("linux") then return result end
 
+    local targets = _collect_targets(target, opts)
+    if #targets == 0 then return result end
     local patch_tool = _find_tool("patchelf")
     if not patch_tool then
-        _warn("patchelf not found")
-        return result
+        result.scanned = #targets
+        error(string.format("elfpatch.set_interpreter: patchelf is needed to change %d file(s) and was not found",
+            #targets), 2)
     end
 
-    local targets = _collect_targets(target, opts)
     for _, filepath in ipairs(targets) do
         result.scanned = result.scanned + 1
         _info("set-interpreter: " .. filepath .. " -> " .. interpreter)
@@ -965,15 +1007,16 @@ function M.set_rpath(target, rpath, opts)
     local result = { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
 
     if is_host("linux") then
-        local patch_tool = _find_tool("patchelf")
-        if not patch_tool then
-            _warn("patchelf not found")
-            return result
-        end
         local rpath_str = _normalize_rpath(rpath)
         if not rpath_str or rpath_str == "" then return result end
 
         local targets = _collect_targets(target, opts)
+        if #targets == 0 then return result end
+        local patch_tool = _find_tool("patchelf")
+        if not patch_tool then
+            error(string.format("elfpatch.set_rpath: patchelf is needed to change %d file(s) and was not found",
+                #targets), 2)
+        end
         for _, filepath in ipairs(targets) do
             result.scanned = result.scanned + 1
             _info("set-rpath: " .. filepath)
@@ -987,7 +1030,7 @@ function M.set_rpath(target, rpath, opts)
             end
         end
     elseif is_host("macosx") then
-        return _patch_macho(target, { rpath = rpath }, result)
+        return _require_tool("set_rpath", _patch_macho(target, { rpath = rpath }, result))
     end
 
     return result
@@ -1086,9 +1129,31 @@ end
 --   4. exactly one runtime-dep with exports.loader → use it
 --   5. ≥ 2 such deps → require interp_from in user_opts (fail-fast)
 --   6. otherwise → no patch
+-- A result that did nothing, and why (design 2026-11-27 §9.3: skipped is an
+-- outcome with a reason, handed to the host).
+local function _skipped(why)
+    local r = _new_result()
+    r.outcome = "skipped"
+    r.reason = why
+    return r
+end
+
+-- The outcome of a patch that ran: failed when files were to be patched and
+-- the tool was missing, done otherwise (a file patchelf could not change is
+-- counted in `failed`, as before).
+local function _with_outcome(r)
+    if r.tool_missing then
+        r.outcome = "failed"
+        r.reason = string.format("%s is needed to patch %d file(s) and was not found",
+            r.tool_missing, r.scanned - r.skipped)
+    else
+        r.outcome = "done"
+    end
+    return r
+end
+
 function M._apply()
-    local empty = { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
-    if not _RUNTIME then return empty end
+    if not _RUNTIME then return _skipped("no install context") end
 
     -- Cross-platform support matrix:
     --   linux   → ELF + patchelf:        full INTERP + RPATH (predicate path)
@@ -1104,17 +1169,17 @@ function M._apply()
     if is_host("windows") then
         local log = _get_log()
         if log then log.debug("elfpatch._apply: windows host has no INTERP/RPATH analog; skipping") end
-        return empty
+        return _skipped("a Windows executable has no interpreter or search path to patch")
     end
 
     if _RUNTIME.elfpatch_user_skip then
         local log = _get_log()
         if log then log.debug("elfpatch._apply: user skip") end
-        return empty
+        return _skipped("the recipe asked for none (elfpatch.skip)")
     end
 
     local target = (_RUNTIME and _RUNTIME.install_dir)
-    if not target then return empty end
+    if not target then return _skipped("no install directory") end
 
     -- Helper: scan runtime deps for loader providers.
     local function _loader_candidates()
@@ -1189,7 +1254,7 @@ function M._apply()
 
     if _RUNTIME.elfpatch_user_override then
         local u = _RUNTIME.elfpatch_user_opts or {}
-        if u.enable == false then return empty end
+        if u.enable == false then return _skipped("the recipe asked for none (elfpatch.set{ enable = false })") end
         source = "user_set"
         if u.interpreter and u.interpreter ~= "" then
             effective_loader = u.interpreter
@@ -1198,9 +1263,10 @@ function M._apply()
                 if c.abi == u.interp_from then effective_loader = c.loader; break end
             end
             if not effective_loader then
-                _warn("elfpatch.set: interp_from='" .. u.interp_from
-                    .. "' did not match any runtime-dep loader provider")
-                return empty
+                local why = "elfpatch.set: interp_from='" .. u.interp_from
+                    .. "' did not match any runtime-dep loader provider"
+                _warn(why)
+                return _skipped(why)
             end
         end
         effective_shrink = (u.shrink ~= nil) and u.shrink or false
@@ -1212,7 +1278,7 @@ function M._apply()
         if not r then
             local log = _get_log()
             if log then log.debug("elfpatch._apply: no loader provider in deps; skipping") end
-            return empty
+            return _skipped("no runtime dependency provides a loader")
         end
         if r.predicate_kind == "ambiguous" then
             local lines = {}
@@ -1222,7 +1288,8 @@ function M._apply()
             _warn("elfpatch._apply: multiple loader providers in runtime deps:\n"
                 .. table.concat(lines, "\n")
                 .. "\nUse elfpatch.set({ interp_from = \"<abi>\" }) in install hook to disambiguate.")
-            return empty
+            return _skipped("more than one runtime dependency provides a loader; "
+                .. "the recipe names one with elfpatch.set({ interp_from = ... })")
         end
         source = ("predicate:" .. r.predicate_kind)
         effective_loader = r.loader
@@ -1242,7 +1309,7 @@ function M._apply()
         if not (platform_allows_no_loader or user_explicitly_chose_rpath_only) then
             local log = _get_log()
             if log then log.debug("elfpatch._apply: no loader resolved (source=" .. tostring(source) .. ")") end
-            return empty
+            return _skipped("no loader resolved")
         end
     end
 
@@ -1259,13 +1326,13 @@ function M._apply()
             .. " loader=" .. tostring(effective_loader))
     end
 
-    return M.patch_elf_loader_rpath(target, {
+    return _with_outcome(_patch_loader_rpath(target, {
         loader = effective_loader,
         rpath  = effective_rpath,
         shrink = effective_shrink,
         scan   = effective_scan,
         skip   = effective_skip,
-    })
+    }))
 end
 
 -- Legacy apply path: behaves exactly like the pre-rewrite `apply_auto`
@@ -1274,7 +1341,7 @@ end
 local function _legacy_apply(opts)
     opts = opts or {}
     if not (_RUNTIME and _RUNTIME.elfpatch_legacy_auto) then
-        return { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+        return _skipped("the recipe turned elfpatch.auto off")
     end
 
     local target = opts.target or (_RUNTIME and _RUNTIME.install_dir)
@@ -1294,7 +1361,7 @@ local function _legacy_apply(opts)
         or (_RUNTIME and _RUNTIME.elfpatch_legacy_interpreter)
         or "subos"
 
-    return M.patch_elf_loader_rpath(target, {
+    return _with_outcome(_patch_loader_rpath(target, {
         loader = loader,
         rpath  = rpath,
         shrink = shrink,
@@ -1303,7 +1370,7 @@ local function _legacy_apply(opts)
         include_shared_libs = opts.include_shared_libs,
         recurse = opts.recurse,
         strict  = opts.strict,
-    })
+    }))
 end
 
 -- xlings's apply_elfpatch_auto bridge. Routes between legacy and new
@@ -1314,7 +1381,7 @@ end
 --   4. neither              → new predicate-driven default
 function M.apply_auto(opts)
     if _RUNTIME and _RUNTIME.elfpatch_user_skip then
-        return { scanned = 0, patched = 0, skipped = 0, failed = 0, shrinked = 0, shrink_failed = 0 }
+        return _skipped("the recipe asked for none (elfpatch.skip)")
     end
     if _RUNTIME and _RUNTIME.elfpatch_user_override then
         return M._apply()

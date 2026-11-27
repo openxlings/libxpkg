@@ -1,8 +1,8 @@
 [package]
 namespace   = "mcpplibs"
 name        = "xpkg"
-version     = "0.0.67"
-description = "C++23 reference implementation of the xpkg V2 spec (multi-arch)"
+version     = "0.0.68"
+description = "C++23 reference implementation of the xpkg format"
 license     = "Apache-2.0"
 repo        = "https://github.com/openxlings/libxpkg"
 
@@ -14,3 +14,13 @@ kind = "lib"
 
 [dev-dependencies]
 gtest = "1.15.2"
+
+# The migration tool (tools/xpkg-migrate.cpp): built only when asked for, so a
+# package depending on this library does not build it.
+[targets.xpkg-migrate]
+kind = "bin"
+main = "tools/xpkg-migrate.cpp"
+required_features = ["tools"]
+
+[features]
+tools = []

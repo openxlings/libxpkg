@@ -7,6 +7,46 @@ end
 
 _XVM_OPS = _XVM_OPS or {}
 
+-- Where each shell looks for a command's completion, under the SubOS root.
+local _COMPLETION_DST = {
+    bash = function(name) return "usr/share/bash-completion/completions/" .. name end,
+    zsh  = function(name) return "usr/share/zsh/site-functions/_" .. name end,
+    fish = function(name) return "usr/share/fish/vendor_completions.d/" .. name .. ".fish" end,
+    pwsh = function(name) return "usr/share/powershell/completions/" .. name .. ".ps1" end,
+}
+
+local function _completion(name, entry, completion)
+    if type(completion) ~= "table" then
+        error(string.format("xvm.add(%q): completion is a table of shell = file", name), 3)
+    end
+    local shells = {}
+    for shell in pairs(completion) do table.insert(shells, shell) end
+    table.sort(shells)
+    for _, shell in ipairs(shells) do
+        local src = completion[shell]
+        if not _COMPLETION_DST[shell] then
+            error(string.format("xvm.add(%q): completion for an unknown shell %q (bash, zsh, fish, pwsh)",
+                name, tostring(shell)), 3)
+        end
+        if type(src) ~= "string" or src == "" or src:match("^[/\\]") or src:match("^%a:")
+            or src:match("%.%.") then
+            error(string.format("xvm.add(%q): completion.%s is a file of the payload, relative to its root",
+                name, shell), 3)
+        end
+        table.insert(_XVM_OPS, {
+            op = "add",
+            name = name .. ".completion." .. shell,
+            version = entry.version,
+            bindir = (_RUNTIME and _RUNTIME.install_dir) or "",
+            alias = "", filename = "",
+            type = "files",
+            binding = entry.binding ~= "" and entry.binding or (name .. "@" .. entry.version),
+            src = src,
+            dst = _COMPLETION_DST[shell](name),
+        })
+    end
+end
+
 --- Register one entry with the version manager.
 -- @param name  target name
 -- @param opt   table with:
@@ -22,6 +62,15 @@ _XVM_OPS = _XVM_OPS or {}
 --             one in it breaks, and every reader of `alias` then shows a
 --             command line where a name belongs.
 --   envs      environment variables
+--   completion  { bash = src, zsh = src, fish = src, pwsh = src }: the
+--             program's shell completion, files of the payload (relative to
+--             its root). Each becomes a `files` entry bound to this release
+--             (its `binding`, else name@version), placed where that shell
+--             looks in the SubOS: usr/share/bash-completion/completions/<name>,
+--             usr/share/zsh/site-functions/_<name>,
+--             usr/share/fish/vendor_completions.d/<name>.fish,
+--             usr/share/powershell/completions/<name>.ps1. It follows `use`,
+--             goes with the release and is loaded by xlings' profile.
 --
 -- For type = "files", the entry describes an asset placed into the subos
 -- instead of an artifact to dispatch:
@@ -50,7 +99,9 @@ function M.add(name, opt)
     local log = _get_log()
     if log then log.debug("xvm add %s version=%s", name, entry.version) end
     table.insert(_XVM_OPS, entry)
+    if opt.completion ~= nil then _completion(name, entry, opt.completion) end
 end
+
 
 --- Declare an asset this package places into the subos.
 --

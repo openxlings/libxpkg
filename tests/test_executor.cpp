@@ -2762,6 +2762,63 @@ TEST(ExecutorTest, XvmFiles_DerivesADistinctTargetPerDeclaration) {
     fs::remove_all(dir);
 }
 
+// A program's shell completion (design 2026-11-27 §20.2): files of the
+// payload, placed where each shell looks, bound to the program's release so
+// they follow `use` and go with it.
+TEST(ExecutorTest, XvmAdd_CompletionBecomesFilesBoundToTheRelease) {
+    auto dir = fs::temp_directory_path() / "libxpkg_completion";
+    fs::remove_all(dir);
+    auto ops = ops_from_config(dir,
+        "    xvm.add(\"mcpp\", { bindir = \"bin\", completion = {\n"
+        "        bash = \"share/c/mcpp.bash\", zsh = \"share/c/_mcpp\",\n"
+        "        fish = \"share/c/mcpp.fish\", pwsh = \"share/c/mcpp.ps1\" } })\n"
+        "    xvm.add(\"gcc\", { binding = \"xim-gnu-gcc@1.0.0\", completion = { bash = \"g.bash\" } })");
+    ASSERT_EQ(ops.size(), 7u);
+    EXPECT_EQ(ops[0].name, "mcpp");
+    const std::vector<std::pair<std::string, std::string>> want = {
+        {"share/c/mcpp.bash", "usr/share/bash-completion/completions/mcpp"},
+        {"share/c/mcpp.fish", "usr/share/fish/vendor_completions.d/mcpp.fish"},
+        {"share/c/mcpp.ps1", "usr/share/powershell/completions/mcpp.ps1"},
+        {"share/c/_mcpp", "usr/share/zsh/site-functions/_mcpp"},
+    };
+    for (std::size_t i = 0; i < want.size(); ++i) {
+        const auto& op = ops[1 + i];
+        EXPECT_EQ(op.type, "files");
+        EXPECT_EQ(op.src, want[i].first);
+        EXPECT_EQ(op.dst, want[i].second);
+        EXPECT_EQ(op.binding, "mcpp@" + ops[0].version);
+        EXPECT_EQ(op.version, ops[0].version);
+        EXPECT_EQ(op.bindir, dir.string()) << "src is relative to the payload root";
+        EXPECT_TRUE(op.name.starts_with("mcpp.completion.")) << op.name;
+    }
+    // A program bound to a release: its completion is that release's.
+    EXPECT_EQ(ops[6].binding, "xim-gnu-gcc@1.0.0");
+    EXPECT_EQ(ops[6].dst, "usr/share/bash-completion/completions/gcc");
+    fs::remove_all(dir);
+}
+
+TEST(ExecutorTest, XvmAdd_CompletionForAnUnknownShellOrAnAbsoluteFileFails) {
+    auto dir = fs::temp_directory_path() / "libxpkg_completion_bad";
+    for (const char* body : {
+             "    xvm.add(\"t\", { completion = { tcsh = \"t.csh\" } })",
+             "    xvm.add(\"t\", { completion = { bash = \"/etc/bash_completion.d/t\" } })",
+             "    xvm.add(\"t\", { completion = { bash = \"../t\" } })",
+         }) {
+        fs::remove_all(dir);
+        fs::create_directories(dir);
+        auto pkg = dir / "bad.lua";
+        std::ofstream(pkg) << "package = { spec = \"1\", name = \"bad\", xpm = { linux = { [\"1.0.0\"] = {} } } }\n"
+                              "import(\"xim.libxpkg.xvm\")\nfunction config()\n" << body << "\n    return true\nend\n";
+        auto exec = create_executor(pkg.string());
+        ASSERT_TRUE(exec.has_value());
+        auto ctx = make_context(dir, "linux");
+        auto hook = exec->run_hook(HookType::Config, ctx);
+        EXPECT_FALSE(hook.success) << body;
+        EXPECT_NE(hook.error.find("completion"), std::string::npos) << hook.error;
+    }
+    fs::remove_all(dir);
+}
+
 TEST(ExecutorTest, XvmAdd_OmittingTheNewFieldsLeavesThemEmpty) {
     auto dir = fs::temp_directory_path() / "libxpkg_no_new_fields";
     fs::remove_all(dir);

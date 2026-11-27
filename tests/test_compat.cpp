@@ -65,6 +65,25 @@ TEST(CompatFrozenTest, OsExecOfAFailingCommandReturnsItsStatusAndIsRecorded) {
     EXPECT_EQ(result.call_failures[0].why, "exited with 1");
 }
 
+// #743: an index lib that is not there is a stand-in so the recipe can still
+// be read; a hook that calls it did not do what it says, and the host is told
+// which call, of which lib, and why (design 2026-11-27 §20.1).
+TEST(CompatFrozenTest, ACallIntoAMissingIndexLibIsAFailedCall) {
+    Recipe r(R"LUA(
+    import("xim.pkgindex.probe")
+    local v = probe.f()
+    probe.g.h(1)
+    assert(type(probe.f) == "table")   -- a probe of the function's type still reads as absent
+    )LUA");
+    auto result = r.install();
+    ASSERT_TRUE(result.success) << result.error;
+    ASSERT_EQ(result.call_failures.size(), 2u);
+    EXPECT_EQ(result.call_failures[0].call, "import(\"xim.pkgindex.probe\")");
+    EXPECT_EQ(result.call_failures[0].what, "probe.f");
+    EXPECT_NE(result.call_failures[0].why.find("no index"), std::string::npos) << result.call_failures[0].why;
+    EXPECT_EQ(result.call_failures[1].what, "probe.g.h");
+}
+
 // E16: os.mv of a directory that is not there returns false; the hook reports
 // success, and the host is told which call did not happen.
 TEST(CompatFrozenTest, OsMvOfAMissingDirectoryReturnsFalseAndIsRecorded) {

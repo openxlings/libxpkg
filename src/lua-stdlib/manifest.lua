@@ -92,7 +92,7 @@ return {
             { "error", "declaration", "log.error(fmt, ...)", "a notice to the user, shown after the summary" },
         } },
         { name = "xvm", summary = "what the home registers", entries = {
-            { "add",      "declaration", "xvm.add(name [, opt])", "register a program, library or version" },
+            { "add",      "declaration", "xvm.add(name [, opt])", "register a program, library or version; opt.completion: the program's shell completion files" },
             { "files",    "declaration", "xvm.files(opt)", "place a file of the payload into the SubOS" },
             { "remove",   "declaration", "xvm.remove(name [, version])", "unregister it" },
             { "use",      "declaration", "xvm.use(name, version)", "make a version the active one" },

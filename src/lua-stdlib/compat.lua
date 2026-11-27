@@ -59,9 +59,10 @@ function import(mod_path)
         -- _RUNTIME.pkgindex_dir is set later by inject_context for hook calls.
         local pkgindex_dir = _PKGINDEX_DIR
             or (_RUNTIME and _RUNTIME.pkgindex_dir)
+        local why
         if pkgindex_dir and pkgindex_dir ~= "" then
             local mod_file = pkgindex_dir .. "/libs/" .. pkgindex_mod .. ".lua"
-            local loader = loadfile(mod_file)
+            local loader, err = loadfile(mod_file)
             if loader then
                 local ok, mod = pcall(loader)
                 if ok and mod then
@@ -69,8 +70,35 @@ function import(mod_path)
                     _G[pkgindex_mod] = mod
                     return mod
                 end
+                why = string.format("the index's lib %s could not be loaded: %s", mod_file,
+                    ok and "it returns no module" or tostring(mod))
+            else
+                why = string.format("the index's lib %s could not be read: %s", mod_file, tostring(err))
             end
+        else
+            why = "this recipe is read from no index with libs/"
         end
+        -- A stand-in, so that reading the recipe (a search, an index build)
+        -- still works; but a hook that calls it did not do what it says: each
+        -- call is a failed call of the hook (the host fails the hook with it,
+        -- naming the lib), never a silent success (design 2026-11-27 §20.1).
+        local short = mod_path:match("[^.]+$") or mod_path
+        local function make_lib_proxy(member)
+            return setmetatable({}, {
+                __index = function(_, k) return make_lib_proxy(member .. "." .. tostring(k)) end,
+                __call = function()
+                    _LIBXPKG_CALL_FAILED("import(\"" .. mod_path .. "\")", member, why)
+                    return make_lib_proxy(member)
+                end,
+                __tostring = function() return '' end,
+                __concat = function(a, b) return tostring(a) .. tostring(b) end,
+            })
+        end
+        local stub = setmetatable({}, {
+            __index = function(_, k) return make_lib_proxy(short .. "." .. tostring(k)) end,
+        })
+        _G[short] = stub
+        return stub
     end
 
     -- Stub for unknown imports (platform, base.runtime, etc.)

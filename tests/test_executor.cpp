@@ -3911,6 +3911,41 @@ function installed() return read_for end
     fs::remove_all(temp);
 }
 
+// A recipe in no index with libs of its own (a script, a recipe given by
+// path) imports the libs of the index the host names, at its top level as in
+// its hooks; a recipe's own index comes first.
+TEST(ExecutionBoundaryTest, ARecipeOutsideAnIndexReadsTheHostsIndexLibs) {
+    const auto temp = make_temp_dir("libxpkg-read-index-");
+    for (const auto& dir : {temp / "index" / "libs", temp / "own" / "libs", temp / "own" / "pkgs" / "f"})
+        fs::create_directories(dir);
+    write_text(temp / "index" / "libs" / "probelib.lua", "return { word = function() return 'host' end }\n");
+    write_text(temp / "own" / "libs" / "probelib.lua", "return { word = function() return 'own' end }\n");
+    const auto body = std::string(R"LUA(package = { spec = "2", name = "facts", xpm = { linux = { ["1.0.0"] = {} } } }
+import("xim.pkgindex.probelib")
+local word = probelib.word()
+function installed() return word end
+)LUA");
+    write_text(temp / "loose.lua", body);
+    write_text(temp / "own" / "pkgs" / "f" / "facts.lua", body);
+    const ReadTarget target{"linux", "x86_64", (temp / "index").string()};
+    auto ctx = make_context(temp, "linux");
+
+    auto loose = create_executor(temp / "loose.lua", target);
+    ASSERT_TRUE(loose) << loose.error();
+    EXPECT_EQ(loose->run_hook(HookType::Installed, ctx).version, "host");
+
+    HookWorker worker;
+    auto remote = create_executor(temp / "loose.lua",
+                                  [&](const HookInvocation& request) { return worker.dispatch(request); }, target);
+    ASSERT_TRUE(remote) << remote.error();
+    EXPECT_EQ(remote->run_hook(HookType::Installed, ctx).version, "host");
+
+    auto own = create_executor(temp / "own" / "pkgs" / "f" / "facts.lua", target);
+    ASSERT_TRUE(own) << own.error();
+    EXPECT_EQ(own->run_hook(HookType::Installed, ctx).version, "own");
+    fs::remove_all(temp);
+}
+
 TEST(ExecutionBoundaryTest, MovingADeferredExecutorRetainsTheWorkerAndHookLogContext) {
     const auto temp = make_temp_dir("libxpkg-boundary-log-");
     const auto recipe = temp / "logged.lua";

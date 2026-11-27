@@ -54,6 +54,7 @@ create_executor(const fs::path& pkg_path, ExecutionBoundary boundary, const Read
         ExecutionContext read;
         read.platform = target.platform;
         read.arch = target.arch;
+        read.pkgindex_dir = target.pkgindex_dir;
         auto loaded = boundary({.action = HookAction::Load, .package = pkg_path, .context = std::move(read)});
         if (!loaded) return std::unexpected("hook boundary: " + loaded.error());
         if (!loaded->result.success)
@@ -70,7 +71,8 @@ std::expected<HookResponse, std::string> HookWorker::dispatch(const HookInvocati
     if (invocation.action == HookAction::Load) {
         if (executor_) return std::unexpected("hook worker already has a package; start a new worker");
         auto loaded = create_executor(invocation.package,
-                                      ReadTarget{invocation.context.platform, invocation.context.arch});
+                                      ReadTarget{invocation.context.platform, invocation.context.arch,
+                                                 invocation.context.pkgindex_dir});
         if (!loaded) return std::unexpected(loaded.error());
         package_ = invocation.package;
         executor_.emplace(std::move(*loaded));

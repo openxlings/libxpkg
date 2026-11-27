@@ -122,9 +122,14 @@ struct ExecutionContext {
 // pkginfo.arch()), so a recipe computes the same at both reads; each hook then
 // gets its whole ExecutionContext. A host gives the install's. Empty: the top
 // level is told nothing, and pkginfo raises there as outside any install.
+// `pkgindex_dir` is the index whose libs a recipe that is in no index with
+// libs of its own imports (a script, a recipe given by path) -- the host's
+// answer, as its hooks get it in _RUNTIME.pkgindex_dir; a recipe's own index
+// comes first (a payload's kept recipe is one).
 struct ReadTarget {
     std::string platform;
     std::string arch;
+    std::string pkgindex_dir;
 };
 
 inline constexpr std::size_t kMaxHookOutputBytes = 16 * 1024;
@@ -1748,12 +1753,17 @@ create_executor(const fs::path& pkg_path, const ReadTarget& target = {}) {
     // Derive pkgindex root from pkg_path for top-level import("xim.pkgindex.*").
     // Package files live at <pkgindex>/pkgs/<letter>/<name>.lua — 3 levels up,
     // of the absolute path: a relative one (pkgs/a/x.lua) has no parent there.
+    // A recipe in no index with libs reads the host's (target.pkgindex_dir).
     {
         std::error_code abs_ec;
         auto absolute = fs::absolute(pkg_path, abs_ec);
         auto pkgindex = (abs_ec ? pkg_path : absolute).parent_path().parent_path().parent_path();
         std::error_code ec;
-        if (fs::is_directory(pkgindex / "libs", ec)) {
+        if (!fs::is_directory(pkgindex / "libs", ec)) {
+            pkgindex = target.pkgindex_dir;
+            ec.clear();
+        }
+        if (!pkgindex.empty() && fs::is_directory(pkgindex / "libs", ec)) {
             lua::pushstring(L, pkgindex.string().c_str());
             lua::setglobal(L, "_PKGINDEX_DIR");
         }

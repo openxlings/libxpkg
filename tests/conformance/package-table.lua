@@ -15,8 +15,21 @@ package = {
 import("xim.libxpkg.fs")
 import("xim.libxpkg.path")
 import("xim.libxpkg.pkginfo")
+import("xim.libxpkg.xvm")
 function install()
     fs.write(path.join(pkginfo.install_dir(), "share", "name"), pkginfo.name() .. "@" .. pkginfo.version())
+    fs.write(path.join(pkginfo.install_dir(), "bin", "conf-table"), "#!/bin/sh\necho conf-table\n")
+    fs.chmod(path.join(pkginfo.install_dir(), "bin", "conf-table"), "755")
+    return true
+end
+-- A package that lists programs registers them; a host fails an install
+-- that registers none of them.
+function config()
+    xvm.add("conf-table", { bindir = path.join(pkginfo.install_dir(), "bin") })
+    return true
+end
+function uninstall()
+    xvm.remove("conf-table")
     return true
 end
 ]=],
@@ -27,8 +40,9 @@ end
         platforms = "linux,macosx,windows",
     },
     hooks = {
-        { "install", after = { { "share/name", "file", text = "conf-table@1.0.0" } } },
+        { "install", after = { { "share/name", "file", text = "conf-table@1.0.0" }, { "bin/conf-table", "file" } } },
+        { "config" },
     },
     install = "installed",
-    payload = { { "share/name", "file", text = "conf-table@1.0.0" } },
+    payload = { { "share/name", "file", text = "conf-table@1.0.0" }, { "bin/conf-table", "file" } },
 }

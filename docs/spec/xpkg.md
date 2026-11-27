@@ -71,7 +71,7 @@ it only computes: a recipe of spec `"3"` may call only `pure` names there
 | `categories`, `keywords` | string[] | — | for search |
 | `status` | string | — | `"dev"` (default), `"stable"`, `"deprecated"` |
 | `archs` | string[] | — | §3.3 |
-| `programs` | string[] | — | the executables the package provides |
+| `programs` | string[] | — | the executables the package provides; its `config()` registers them (§7), and a host fails an install that registers none of them |
 | `xvm_enable` | boolean | — | the package registers with xvm |
 | `extensions` | table | — | §3.4 (libxpkg 0.0.66) |
 | `host_facts` | table | — | §3.5 (libxpkg 0.0.67) |

@@ -128,6 +128,24 @@ int main() {
         // the toolchain changes, and a .lua edit would not reach the binary.
         mcpp::rerun_if_changed(m.path);
     }
+
+    // The conformance cases (tests/conformance/*.lua, design 2026-11-27 §9.9):
+    // embedded so a host runs the same cases through its own install without
+    // finding this package's directory.
+    std::vector<fs::path> cases;
+    for (const auto& e : fs::directory_iterator(root / "tests" / "conformance"))
+        if (e.is_regular_file() && e.path().extension() == ".lua") cases.push_back(e.path());
+    std::ranges::sort(cases);
+    std::string table = "inline const std::pair<std::string_view, std::string_view> conformance_cases_lua[] = {\n";
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const auto var = std::format("conformance_case_{}", i);
+        embed(text, var, slurp(cases[i]));
+        table += std::format("    {{\"{}\", {}}},\n", cases[i].stem().string(), var);
+        const auto rel = fs::path("tests") / "conformance" / cases[i].filename();
+        mcpp::rerun_if_changed(rel.generic_string().c_str());
+    }
+    text += table + "};\n";
+    mcpp::rerun_if_changed("tests/conformance");
     text += "} // namespace mcpplibs::xpkg::detail\n";
 
     {

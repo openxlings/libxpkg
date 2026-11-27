@@ -107,6 +107,21 @@ void embed(std::string& out, std::string_view var, const std::string& content) {
     out += std::format("inline const std::string_view {} = {}_storage;\n\n", var, var);
 }
 
+// A text kept byte for byte: chunks of raw literals with nothing added at the
+// seams (`embed` adds a newline at each, inert in Lua, not in a document).
+void embed_exact(std::string& out, std::string_view var, const std::string& content) {
+    out += std::format("inline const std::string {}_storage = []{{ std::string s;\n", var);
+    for (std::size_t pos = 0; pos < content.size();) {
+        auto end = std::min(content.size(), pos + MSVC_LIMIT);
+        // Never inside a UTF-8 sequence: each literal is valid text.
+        while (end < content.size() && end > pos && (static_cast<unsigned char>(content[end]) & 0xC0) == 0x80) --end;
+        out += std::format("    s += R\"__TEXT__({})__TEXT__\";\n", std::string_view{content}.substr(pos, end - pos));
+        pos = end;
+    }
+    out += "    return s; }();\n";
+    out += std::format("inline const std::string_view {} = {}_storage;\n\n", var, var);
+}
+
 } // namespace
 
 int main() {
@@ -146,6 +161,11 @@ int main() {
     }
     text += table + "};\n";
     mcpp::rerun_if_changed("tests/conformance");
+
+    // The specification itself, so a host can hold its copy (xlings'
+    // docs/specs/xpkg.md) to the text of the version it builds with.
+    embed_exact(text, "specification_md", slurp(root / "docs" / "spec" / "xpkg.md"));
+    mcpp::rerun_if_changed("docs/spec/xpkg.md");
     text += "} // namespace mcpplibs::xpkg::detail\n";
 
     {

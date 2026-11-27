@@ -138,3 +138,13 @@ TEST(ConformanceTest, AnExpectationSaysWhatDoesNotHold) {
     ASSERT_EQ(problems.size(), 3u);
     EXPECT_NE(problems[1].find("d: is absent, expected dir"), std::string::npos) << problems[1];
 }
+
+TEST(ConformanceTest, TheSpecificationIsTheFileOfThisVersion) {
+    const auto file = fs::path(__FILE__).parent_path().parent_path() / "docs" / "spec" / "xpkg.md";
+    std::ifstream in(file, std::ios::binary);
+    ASSERT_TRUE(in) << file;
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    EXPECT_EQ(cf::specification(), ss.str());
+    EXPECT_TRUE(cf::specification().starts_with("# The xpkg format"));
+}

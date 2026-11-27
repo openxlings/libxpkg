@@ -78,6 +78,10 @@ fs::path materialize(const Case& c, const fs::path& root);
 // What does not hold in `install_dir`, one line each; empty when all hold.
 std::vector<std::string> unmet(const std::vector<Expectation>& expectations, const fs::path& install_dir);
 
+// The specification's text (docs/spec/xpkg.md) of this version of libxpkg: a
+// host that publishes a copy checks it against this.
+std::string_view specification();
+
 // The loaded package's fields as cases name them: name, spec, type, status,
 // description, archs and programs (comma-joined, in order), and
 // "platforms" (the xpm's platforms, sorted, comma-joined).
@@ -292,6 +296,8 @@ std::vector<std::string> unmet(const std::vector<Expectation>& expectations, con
     }
     return out;
 }
+
+std::string_view specification() { return detail::specification_md; }
 
 std::map<std::string, std::string> fields(const Package& package) {
     std::map<std::string, std::string> out;

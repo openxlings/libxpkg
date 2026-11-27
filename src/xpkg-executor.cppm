@@ -1746,9 +1746,12 @@ create_executor(const fs::path& pkg_path, const ReadTarget& target = {}) {
     }
 
     // Derive pkgindex root from pkg_path for top-level import("xim.pkgindex.*").
-    // Package files live at <pkgindex>/pkgs/<letter>/<name>.lua — 3 levels up.
+    // Package files live at <pkgindex>/pkgs/<letter>/<name>.lua — 3 levels up,
+    // of the absolute path: a relative one (pkgs/a/x.lua) has no parent there.
     {
-        auto pkgindex = pkg_path.parent_path().parent_path().parent_path();
+        std::error_code abs_ec;
+        auto absolute = fs::absolute(pkg_path, abs_ec);
+        auto pkgindex = (abs_ec ? pkg_path : absolute).parent_path().parent_path().parent_path();
         std::error_code ec;
         if (fs::is_directory(pkgindex / "libs", ec)) {
             lua::pushstring(L, pkgindex.string().c_str());

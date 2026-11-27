@@ -80,6 +80,40 @@ end
 }
 
 // The same text with spec "2" is the compatibility layer's.
+// The string library has the three helpers every spec has (pure, plain
+// text): recipes of each spec use them, and a migration keeps them.
+TEST(Spec3EnvTest, TheStringLibraryHasItsThreeHelpers) {
+    Index index;
+    auto recipe = index.recipe(R"LUA(
+function install()
+    assert(("  a b \n"):trim() == "a b")
+    local parts = ("x,y,,z"):split(",", true)
+    assert(#parts == 4 and parts[1] == "x" and parts[3] == "" and parts[4] == "z")
+    assert(("a.b.c"):replace(".", "/") == "a/b/c", "plain text, not a pattern")
+    assert(string.trim == ("").trim)
+    return true
+end
+)LUA");
+    auto result = install(recipe, index.context());
+    EXPECT_TRUE(result.success) << result.error;
+}
+
+// A recipe named by a path relative to the working directory finds its
+// index's libs as one named absolutely does.
+TEST(Spec3EnvTest, ARelativePathFindsTheIndexLibs) {
+    Index index;
+    index.lib("probelib", "local M = {}\nfunction M.word() return 'lib' end\nreturn M\n");
+    index.recipe(R"LUA(
+local probelib = import("xim.pkgindex.probelib")
+function install() return probelib.word() == "lib" end
+)LUA");
+    const auto here = fs::current_path();
+    fs::current_path(index.root);
+    auto result = install(fs::path("pkgs") / "p" / "probe.lua", index.context());
+    fs::current_path(here);
+    EXPECT_TRUE(result.success) << result.error;
+}
+
 TEST(Spec3EnvTest, TheSameTextWithSpec2HasTheCompatibilityLayer) {
     Index index;
     auto recipe = index.recipe(R"LUA(

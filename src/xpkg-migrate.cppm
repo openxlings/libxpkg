@@ -485,7 +485,9 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
         const auto close = open == std::string::npos ? open : closing(code, open);
         if (close == std::string::npos || !top_commas(code, open, close).empty()) { note(at, "os.iorun", "system.run(cmd).out"); continue; }
         edits.push_back({ at, open + 1, "system.run(" });
-        edits.push_back({ close + 1, close + 1, ".out" });
+        // As a statement its output was dropped, and `x.out` alone is no Lua
+        // statement: system.run(x), like os.execute's.
+        if (!is_statement(code, at)) edits.push_back({ close + 1, close + 1, ".out" });
         need.insert("system");
         ++m.rewritten;
     }

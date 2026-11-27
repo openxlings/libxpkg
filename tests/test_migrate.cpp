@@ -85,6 +85,7 @@ function config()
         os.exec("true")
     end
     local out = os.iorun("echo hi")
+    os.iorun("touch stamp")
     os.execute("rm -f stale")
     os.trymv("a", "b")
     cprint(format("%s", raise and "x" or "y"))
@@ -95,6 +96,7 @@ end
     EXPECT_TRUE(has(m.text, "if (pkginfo.platform() == \"linux\") then"));
     EXPECT_TRUE(has(m.text, "system.exec(\"true\")"));
     EXPECT_TRUE(has(m.text, "system.run(\"echo hi\").out"));     // never failed, still does not
+    EXPECT_TRUE(has(m.text, "    system.run(\"touch stamp\")\n")) << m.text;   // a statement: no `.out`
     EXPECT_TRUE(has(m.text, "system.run(\"rm -f stale\")"));     // its status was not read
     EXPECT_TRUE(has(m.text, "pcall(fs.move, \"a\", \"b\")"));
     EXPECT_TRUE(has(m.text, "log.info(string.format(\"%s\""));

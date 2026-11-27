@@ -321,8 +321,9 @@ end
 format = string.format
 raise = function(msg) error(msg or "raise called", 2) end
 
--- string.replace: plain text replacement (not a pattern), as recipes of every
--- spec use it; a pure function, so it is part of both environments.
+-- string.replace: plain text replacement (not a pattern). With string.split
+-- and string.trim above, the three helpers of the string library every spec
+-- has (pure; spec 3 sees `string` whole, docs/spec/xpkg.md §6.2).
 if not string.replace then
     function string.replace(s, old, new, opts)
         -- Plain text, not a pattern; opts is accepted and ignored

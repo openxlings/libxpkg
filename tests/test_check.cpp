@@ -111,6 +111,47 @@ TEST(CheckTest, PackageArchsIsTheUnionOfTheEntries) {
     EXPECT_NE(f->message.find("archs lists riscv64 and no entry does"), std::string::npos) << f->message;
 }
 
+TEST(CheckTest, AnUnstatedEntryOfASingleArchitecturePlatformCountsAsThatOne) {
+    Index index;
+    // Linux names x86_64 only; macOS's unstated entry is aarch64's, Windows' x86_64's.
+    constexpr std::string_view text = R"LUA(package = {
+    spec = "3",
+    name = "probe",
+    description = "a probe",
+    type = "package",
+    archs = { "x86_64", "aarch64" },
+    xpm = {
+        linux = { ["1.0.0"] = { url = "https://example.invalid/l.tar.gz", sha256 = { x86_64 = "00" } } },
+        macosx = { ["1.0.0"] = { url = "https://example.invalid/m.tar.gz", sha256 = "00" } },
+        windows = { ["1.0.0"] = { url = "https://example.invalid/w.zip", sha256 = "00" } },
+    },
+}
+)LUA";
+    auto findings = check_recipe(index.recipe(text));
+    EXPECT_EQ(find(findings, "archs-union"), nullptr) << ::testing::PrintToString(codes(findings));
+    std::string narrow(text);
+    narrow.replace(narrow.find("archs = { \"x86_64\", \"aarch64\" },"),
+                   std::string_view("archs = { \"x86_64\", \"aarch64\" },").size(), "archs = { \"x86_64\" },");
+    findings = check_recipe(index.recipe(narrow));
+    const auto* f = find(findings, "archs-union");
+    ASSERT_NE(f, nullptr) << ::testing::PrintToString(codes(findings));
+    EXPECT_NE(f->message.find("entries list aarch64 and archs does not"), std::string::npos) << f->message;
+}
+
+TEST(CheckTest, AGitRepositoryIsASourceAndNamesNoArchitecture) {
+    Index index;
+    const auto findings = check_recipe(index.recipe(R"LUA(package = {
+    spec = "3",
+    name = "probe",
+    description = "a probe",
+    type = "package",
+    archs = { "x86_64", "aarch64" },
+    xpm = { linux = { ["1.0.0"] = { url = "https://example.invalid/probe.git", sha256 = "00" } } },
+}
+)LUA"));
+    EXPECT_EQ(find(findings, "arch-unstated"), nullptr) << ::testing::PrintToString(codes(findings));
+}
+
 TEST(CheckTest, ACompatibilityNameInTheCodeIsNamedWithWhatReplacesIt) {
     Index index;
     std::string text(kTemplate);

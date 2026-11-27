@@ -175,6 +175,15 @@ int entry_line(std::string_view text, std::string_view platform, std::string_vie
     return at == std::string_view::npos ? 0 : line_of(text, at);
 }
 
+// The one host architecture of a platform that has one (§4.4, design
+// 2026-11-27 §5.3): today macOS arm64 and Windows x86_64. Empty for a
+// platform with several (linux).
+std::string_view single_host_arch(std::string_view platform) {
+    if (platform == "macosx") return "aarch64";
+    if (platform == "windows") return "x86_64";
+    return {};
+}
+
 } // namespace mcpplibs::xpkg::check_detail
 
 namespace mcpplibs::xpkg {
@@ -232,11 +241,17 @@ std::vector<Finding> check_recipe(const fs::path& recipe) {
         for (const auto& version : keys) {
             const auto& entry = versions.at(version);
             if (!entry.ref.empty()) continue;
-            const auto archs = entry_architectures(entry);
+            auto archs = entry_architectures(entry);
+            // A platform with one host architecture (§4.4): an entry with an
+            // artifact that names none ships that one.
+            if (archs.empty() && !declares_no_download_source(pkg.xpm, &entry, platform))
+                if (const auto one = single_host_arch(platform); !one.empty()) archs.insert(std::string(one));
             if (!archs.empty()) anyEnumerates = true;
             listed.insert(archs.begin(), archs.end());
             if (platform != "linux" || pkg.type == PackageType::Subos) continue;
             if (declares_no_download_source(pkg.xpm, &entry, platform)) continue;
+            // A git repository is a source the hooks build, no machine's artifact (§4.4).
+            if (entry.url.ends_with(".git")) continue;
             const auto evidence = classify_arch_evidence(pkg, &entry);
             if (evidence == ArchEvidence::Weak || evidence == ArchEvidence::None) {
                 out.push_back({ .code = "arch-unstated", .severity = spec3 ? "error" : "warning",

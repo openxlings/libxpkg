@@ -14,3 +14,13 @@ kind = "lib"
 
 [dev-dependencies]
 gtest = "1.15.2"
+
+# The migration tool (tools/xpkg-migrate.cpp): built only when asked for, so a
+# package depending on this library does not build it.
+[targets.xpkg-migrate]
+kind = "bin"
+main = "tools/xpkg-migrate.cpp"
+required_features = ["tools"]
+
+[features]
+tools = []

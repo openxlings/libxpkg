@@ -316,15 +316,15 @@ An entry with no hash at all downloads unverified (for old recipes' sake).
 | Hook | Runs | Returns |
 |---|---|---|
 | `installed()` | before an install, to ask what is there | a version string, or nil |
-| `install()` | once the download is in place (§5.2); adjusts the payload | `true`, or `false` / an error to fail |
+| `install()` | once the download is in place (§5.2); adjusts the payload | nothing or `true` succeeds; `false` fails |
 | `config()` | after a successful install, once per scope (a SubOS, the system); registers, sets the environment | the same |
 | `uninstall()` | when the package is removed; withdraws what `config()` did that the host does not withdraw itself | the same |
 
 - spec `"3"` defines these four; `build()` is no hook of spec 3 (the checker
   warns). A missing hook is nothing to do (for `type = "subos"`, the host's
   default).
-- A hook fails by returning `false`, by raising an error, or (spec 3) by an
-  action that is not done (§6.1). A failed step is the package's failure: the
+- A hook fails by returning `false`, by raising an error, or by an action
+  that is not done (§6.1). A failed step is the package's failure: the
   host removes the unfinished payload, registers nothing and the command fails.
 - A command a hook runs writes to the hook's log
   (`<home>/logs/hooks/<ns>-<name>@<ver>.<hook>.log`); `system.exec(cmd, { tty = true })`

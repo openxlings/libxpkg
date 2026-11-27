@@ -128,10 +128,15 @@ struct ExportsRuntime {
     // Dynamic linker (PT_INTERP) path, relative to install_dir.
     // Only libc-class providers (glibc, musl) declare this.
     std::string loader;
-    // Library search dirs (RPATH closure). Empty == fall back to the
-    // {lib64, lib} convention. Only declare if the package's layout
-    // diverges from convention.
+    // Library search dirs (RPATH closure). Undeclared == the {lib64, lib}
+    // convention. Only declare if the package's layout diverges from
+    // convention.
     std::vector<std::string> libdirs;
+    // `libdirs` was written, `{}` included: an empty list is then a package
+    // that exports no library directory -- target content (a sysroot, a
+    // bare-metal C library) that no host and no consumer loads -- not the
+    // convention.
+    bool libdirs_declared { false };
     // ABI tag, used to disambiguate when multiple deps provide loaders
     // (e.g. "linux-x86_64-glibc" vs "linux-x86_64-musl"). The consumer
     // can request a specific abi via `elfpatch.set({interp_from = ...})`.

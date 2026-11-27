@@ -704,7 +704,8 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx, std::vector<std::string>& w
             //   exports = {
             //       runtime = {
             //           loader  = "lib64/ld-linux-x86-64.so.2",  -- libc only
-            //           libdirs = { "lib64", "lib" },            -- non-default only
+            //           libdirs = { "lib64", "lib" },            -- non-default only;
+            //                                                    -- {} exports none
             //           abi     = "linux-x86_64-glibc",          -- multi-libc only
             //       },
             //   }
@@ -724,8 +725,10 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx, std::vector<std::string>& w
                     lua::pop(L, 1);
 
                     lua::getfield(L, rt_idx, "libdirs");
-                    if (lua::type(L, -1) == lua::TTABLE)
+                    if (lua::type(L, -1) == lua::TTABLE) {
                         block.runtime.libdirs = parse_string_array(lua::gettop(L));
+                        block.runtime.libdirs_declared = true;
+                    }
                     lua::pop(L, 1);
 
                     lua::getfield(L, rt_idx, "abi");

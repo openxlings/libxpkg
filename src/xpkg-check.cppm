@@ -46,6 +46,40 @@ std::vector<Finding> check_recipe(const fs::path& recipe);
 // and of the index's own declarations (its index-compat.json) under the key "".
 std::map<std::string, std::vector<Finding>> check_index(const fs::path& index);
 
+// The hook interface as data: the interface manifest (manifest.lua), the one
+// statement of what a hook can call. A host renders its reference from it and
+// a tool reads its old-to-new table; neither keeps a copy of its own.
+struct InterfaceName {
+    std::string name;       // as a recipe writes it: "fs.move"
+    std::string kind;       // "action" | "query" | "declaration" | "pure"
+    std::string signature;  // "fs.move(src, dst [, { replace = true }])"
+    std::string summary;    // what holds after it, or what it answers
+    std::string since;      // the libxpkg version that added it; empty: before 0.0.68
+    std::string platforms;  // what differs by platform; empty: nothing
+};
+
+struct InterfaceModule {
+    std::string name;       // imported as xim.libxpkg.<name>
+    std::string summary;
+    std::vector<InterfaceName> names;
+};
+
+struct InterfaceManifest {
+    std::vector<InterfaceModule> modules;
+    // The part of standard Lua a recipe of spec "3" sees.
+    std::vector<std::string> stdlib_globals;
+    std::vector<std::string> stdlib_libraries;  // whole: string, table, ...
+    std::vector<std::string> stdlib_os;         // os.<name>
+    // The compatibility layer (spec 1 and 2): a name, and what a recipe of
+    // spec "3" writes instead (empty: nothing is needed).
+    std::vector<std::pair<std::string, std::string>> compat;
+    // Names the host calls; no recipe's.
+    std::vector<std::string> host;
+};
+
+// Read once; an empty manifest only if the library's own text does not load.
+const InterfaceManifest& interface_manifest();
+
 } // export namespace mcpplibs::xpkg
 
 namespace mcpplibs::xpkg::check_detail {
@@ -263,6 +297,88 @@ std::vector<Finding> check_recipe(const fs::path& recipe) {
         }
     }
     return out;
+}
+
+const InterfaceManifest& interface_manifest() {
+    static const InterfaceManifest manifest = [] {
+        InterfaceManifest out;
+        lua::State* L = lua::L_newstate();
+        if (!L) return out;
+        lua::L_openlibs(L);
+        const auto str = [L](int at) -> std::string {
+            return lua::type(L, at) == lua::TSTRING ? lua::tostring(L, at) : "";
+        };
+        const auto field = [&](const char* key) {
+            lua::getfield(L, -1, key);
+            auto v = str(-1);
+            lua::pop(L, 1);
+            return v;
+        };
+        // The strings of the list at the top of the stack.
+        const auto strings = [&] {
+            std::vector<std::string> v;
+            const auto n = static_cast<lua::Integer>(lua::rawlen(L, -1));
+            for (lua::Integer i = 1; i <= n; ++i) {
+                lua::rawgeti(L, -1, i);
+                if (auto s = str(-1); !s.empty()) v.push_back(std::move(s));
+                lua::pop(L, 1);
+            }
+            return v;
+        };
+        if (lua::L_loadstring(L, std::string(detail::manifest_lua).c_str()) == lua::OK
+                && lua::pcall(L, 0, 1, 0) == lua::OK) {
+            lua::getfield(L, -1, "modules");
+            const auto modules = static_cast<lua::Integer>(lua::rawlen(L, -1));
+            for (lua::Integer m = 1; m <= modules; ++m) {
+                lua::rawgeti(L, -1, m);
+                InterfaceModule mod { .name = field("name"), .summary = field("summary") };
+                lua::getfield(L, -1, "entries");
+                const auto rows = static_cast<lua::Integer>(lua::rawlen(L, -1));
+                for (lua::Integer r = 1; r <= rows; ++r) {
+                    lua::rawgeti(L, -1, r);
+                    InterfaceName row;
+                    lua::rawgeti(L, -1, 1); row.name = mod.name + "." + str(-1); lua::pop(L, 1);
+                    lua::rawgeti(L, -1, 2); row.kind = str(-1); lua::pop(L, 1);
+                    lua::rawgeti(L, -1, 3); row.signature = str(-1); lua::pop(L, 1);
+                    lua::rawgeti(L, -1, 4); row.summary = str(-1); lua::pop(L, 1);
+                    row.since = field("since");
+                    row.platforms = field("platforms");
+                    mod.names.push_back(std::move(row));
+                    lua::pop(L, 1);
+                }
+                lua::pop(L, 2);
+                out.modules.push_back(std::move(mod));
+            }
+            lua::pop(L, 1);
+
+            lua::getfield(L, -1, "stdlib");
+            lua::getfield(L, -1, "globals");   out.stdlib_globals = strings();   lua::pop(L, 1);
+            lua::getfield(L, -1, "libraries"); out.stdlib_libraries = strings(); lua::pop(L, 1);
+            lua::getfield(L, -1, "os");        out.stdlib_os = strings();        lua::pop(L, 1);
+            lua::pop(L, 1);
+
+            lua::getfield(L, -1, "host");
+            out.host = strings();
+            lua::pop(L, 1);
+
+            lua::getfield(L, -1, "compat");
+            const auto count = static_cast<lua::Integer>(lua::rawlen(L, -1));
+            for (lua::Integer i = 1; i <= count; ++i) {
+                lua::rawgeti(L, -1, i);
+                lua::rawgeti(L, -1, 1);
+                auto name = str(-1);
+                lua::pop(L, 1);
+                lua::rawgeti(L, -1, 2);
+                auto instead = str(-1);
+                lua::pop(L, 2);
+                if (!name.empty()) out.compat.emplace_back(std::move(name), std::move(instead));
+            }
+            lua::pop(L, 1);
+        }
+        lua::close(L);
+        return out;
+    }();
+    return manifest;
 }
 
 std::map<std::string, std::vector<Finding>> check_index(const fs::path& index) {

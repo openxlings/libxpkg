@@ -132,6 +132,19 @@ return {
         } },
     },
 
+    -- The part of standard Lua a recipe of spec "3" sees: these globals, these
+    -- libraries whole, and these functions of os. No io, no os.execute, no
+    -- require, no load: what changes the machine goes through the modules.
+    stdlib = {
+        globals = {
+            "assert", "error", "ipairs", "next", "pairs", "pcall", "print", "rawequal", "rawget",
+            "rawlen", "rawset", "select", "setmetatable", "getmetatable", "tonumber",
+            "tostring", "type", "xpcall", "import",
+        },
+        libraries = { "string", "table", "math", "utf8" },
+        os = { "time", "date", "clock", "getenv" },
+    },
+
     -- The names the host itself calls; not part of a recipe's interface.
     host = { "elfpatch._apply", "elfpatch.apply_auto" },
 

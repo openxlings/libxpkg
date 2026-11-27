@@ -200,3 +200,40 @@ TEST(CheckTest, DISABLED_ARealIndex) {
     }
     for (const auto& [k, n] : counts) std::println("{:28} {:5} findings in {:4} recipes", k, n, recipes[k].size());
 }
+
+// XPKG-API-MANIFEST: the manifest as data is the manifest -- every module and
+// name a recipe of spec "3" can import, the part of standard Lua it sees, and
+// the compatibility layer's table, so a host's reference has nothing of its own.
+TEST(CheckTest, TheInterfaceManifestIsData) {
+    const auto& m = interface_manifest();
+    ASSERT_FALSE(m.modules.empty());
+    std::set<std::string> kinds, names;
+    for (const auto& mod : m.modules) {
+        EXPECT_FALSE(mod.summary.empty()) << mod.name;
+        for (const auto& n : mod.names) {
+            EXPECT_TRUE(n.name.starts_with(mod.name + ".")) << n.name;
+            EXPECT_FALSE(n.signature.empty()) << n.name;
+            EXPECT_FALSE(n.summary.empty()) << n.name;
+            kinds.insert(n.kind);
+            names.insert(n.name);
+        }
+    }
+    EXPECT_EQ(kinds, (std::set<std::string>{"action", "query", "declaration", "pure"}));
+    EXPECT_TRUE(names.contains("fs.move"));
+    EXPECT_TRUE(names.contains("pkginfo.arch"));
+    for (const auto& mod : m.modules)
+        for (const auto& n : mod.names)
+            if (n.name == "fs.chmod") { EXPECT_EQ(n.since, "0.0.68"); EXPECT_FALSE(n.platforms.empty()); }
+            else if (n.name == "pkginfo.name") EXPECT_TRUE(n.since.empty());
+    EXPECT_NE(std::ranges::find(m.stdlib_globals, "pcall"), m.stdlib_globals.end());
+    EXPECT_NE(std::ranges::find(m.stdlib_libraries, "string"), m.stdlib_libraries.end());
+    EXPECT_EQ(std::ranges::find(m.stdlib_libraries, "io"), m.stdlib_libraries.end());
+    EXPECT_NE(std::ranges::find(m.stdlib_os, "getenv"), m.stdlib_os.end());
+    const auto mv = std::ranges::find(m.compat, std::string("os.mv"), &std::pair<std::string, std::string>::first);
+    ASSERT_NE(mv, m.compat.end());
+    EXPECT_EQ(mv->second, "fs.move");
+    const auto sleep = std::ranges::find(m.compat, std::string("os.sleep"), &std::pair<std::string, std::string>::first);
+    ASSERT_NE(sleep, m.compat.end());
+    EXPECT_TRUE(sleep->second.empty());
+    EXPECT_NE(std::ranges::find(m.host, "elfpatch.apply_auto"), m.host.end());
+}

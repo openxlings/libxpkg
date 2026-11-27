@@ -55,22 +55,19 @@ end
 -- registered before the recipe ran (fs.extract); its functions join the
 -- top-level rule then, before the recipe can reach them.
 
-local BASE = {
-    "assert", "error", "ipairs", "next", "pairs", "pcall", "rawequal", "rawget",
-    "rawlen", "rawset", "select", "setmetatable", "getmetatable", "tonumber",
-    "tostring", "type", "xpcall",
-}
 
 local libs = {}   -- index lib name -> its module table, once per state
 
 local function new_env()
     local env = {}
-    for _, name in ipairs(BASE) do env[name] = _G[name] end
+    -- The part of standard Lua the manifest names (its `stdlib`).
+    for _, name in ipairs(manifest.stdlib.globals) do env[name] = _G[name] end
     -- The executor captures print while a hook runs by replacing the global
     -- one; this finds the current one at each call.
     env.print = function(...) return _G.print(...) end
-    env.string, env.table, env.math, env.utf8 = string, table, math, utf8
-    env.os = { time = os.time, date = os.date, clock = os.clock, getenv = os.getenv }
+    for _, name in ipairs(manifest.stdlib.libraries) do env[name] = _G[name] end
+    env.os = {}
+    for _, name in ipairs(manifest.stdlib.os) do env.os[name] = os[name] end
     env._VERSION = _VERSION
     env._G = env
 

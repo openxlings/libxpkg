@@ -85,6 +85,7 @@ function config()
         os.exec("true")
     end
     local out = os.iorun("echo hi")
+    os.execute("rm -f stale")
     os.trymv("a", "b")
     cprint(format("%s", raise and "x" or "y"))
     return true
@@ -93,7 +94,8 @@ end
     EXPECT_TRUE(m.spec3) << (m.left.empty() ? "" : m.left.front().name);
     EXPECT_TRUE(has(m.text, "if (pkginfo.platform() == \"linux\") then"));
     EXPECT_TRUE(has(m.text, "system.exec(\"true\")"));
-    EXPECT_TRUE(has(m.text, "system.exec(\"echo hi\", { capture = true })"));
+    EXPECT_TRUE(has(m.text, "system.run(\"echo hi\").out"));     // never failed, still does not
+    EXPECT_TRUE(has(m.text, "system.run(\"rm -f stale\")"));     // its status was not read
     EXPECT_TRUE(has(m.text, "pcall(fs.move, \"a\", \"b\")"));
     EXPECT_TRUE(has(m.text, "log.info(string.format(\"%s\""));
     for (const auto* mod : {"system", "fs", "log"})
@@ -167,6 +169,6 @@ end
 )LUA"));
     EXPECT_FALSE(m.spec3);
     EXPECT_TRUE(has(m.text, "pcall(os.iorun, \"uname -m\")")) << m.text;
-    EXPECT_TRUE(has(m.text, "out = system.exec(\"uname -m\", { capture = true })")) << m.text;
+    EXPECT_TRUE(has(m.text, "out = system.run(\"uname -m\").out")) << m.text;
     EXPECT_EQ(std::ranges::count_if(m.left, [](const MigrationNote& n) { return n.name == "os.iorun"; }), 2);
 }

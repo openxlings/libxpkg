@@ -428,8 +428,9 @@ its own:
 | `os.dirs`, `fs.files`, `fs.dirs`, `fs.entries` | `fs.list` |
 | running `chmod` | `fs.chmod` |
 | running `tar`, `unzip` | landing (§5.2), `fs.extract` |
-| `os.exec`, `os.execute` | `system.exec`; `system.run` where its result is used |
-| `os.iorun`, `io.popen` | `system.exec(cmd, { capture = true })`, `system.run` |
+| `os.exec` | `system.exec` (both fail the hook when the command fails) |
+| `os.execute` | `system.run` (neither fails on the command's status); `system.exec` when a failure should fail the hook |
+| `os.iorun`, `io.popen` | `system.run(cmd).out` (neither fails: a failed command's output is the answer); `system.exec(cmd, { capture = true })` when a failure should fail the hook |
 | `os.cd`, `os.setenv`, `os.addenv` | `system.exec`'s `cwd` and `env` |
 | `os.host()`, `is_host(x)`, `os.arch()` | `pkginfo.platform()`, `pkginfo.arch()` |
 | the global `path` | `import("xim.libxpkg.path")` |

@@ -161,8 +161,8 @@ constexpr Manual kManual[] = {
     {"utils.filepath_to_absolute", "path.join"},
     {"utils.try_download_and_check", "an entry's url and sha256: the host downloads"},
     {"utils.input_args_process", "a lib of the index"},
-    {"os.iorun", "system.exec(cmd, { capture = true })"},
-    {"os.execute", "system.exec(cmd); system.run(cmd) where its result is used"},
+    {"os.iorun", "system.run(cmd).out; system.exec(cmd, { capture = true }) when its failure should fail the hook"},
+    {"os.execute", "system.run(cmd); system.exec(cmd) when its failure should fail the hook"},
     {"os.trymv", "pcall(fs.move, src, dst)"},
     {"is_host", "pkginfo.platform() == \"<platform>\""},
 };
@@ -456,8 +456,10 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
             ++m.rewritten;
         }
     }
-    // os.trymv(a, b) -> pcall(fs.move, a, b); os.iorun(x) -> system.exec(x, { capture = true });
-    // os.execute(x) as a statement -> system.exec(x); is_host("p") -> pkginfo.platform() == "p".
+    // os.trymv(a, b) -> pcall(fs.move, a, b); os.iorun(x) -> system.run(x).out (both never
+    // fail: os.iorun answers a failed command with its output, as a query does);
+    // os.execute(x) as a statement -> system.run(x) (its status was not read);
+    // is_host("p") -> pkginfo.platform() == "p".
     // The call's own parenthesis, right after the name; npos when the name is
     // used as a value (pcall(os.iorun, cmd), type(os.iorun)).
     const auto call_paren = [&](std::size_t at, std::string_view name) {
@@ -476,9 +478,9 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
         if (in_landing(at)) continue;
         const auto open = call_paren(at, "os.iorun");
         const auto close = open == std::string::npos ? open : closing(code, open);
-        if (close == std::string::npos || !top_commas(code, open, close).empty()) { note(at, "os.iorun", "system.exec(cmd, { capture = true })"); continue; }
-        edits.push_back({ at, open + 1, "system.exec(" });
-        edits.push_back({ close, close, ", { capture = true }" });
+        if (close == std::string::npos || !top_commas(code, open, close).empty()) { note(at, "os.iorun", "system.run(cmd).out"); continue; }
+        edits.push_back({ at, open + 1, "system.run(" });
+        edits.push_back({ close + 1, close + 1, ".out" });
         need.insert("system");
         ++m.rewritten;
     }
@@ -488,7 +490,7 @@ Migration migrate_recipe(std::string_view source, MigrateOptions options) {
             note(at, "os.execute", "system.run(cmd) where its result is used");
             continue;
         }
-        edits.push_back({ at, at + std::string_view("os.execute").size(), "system.exec" });
+        edits.push_back({ at, at + std::string_view("os.execute").size(), "system.run" });
         need.insert("system");
         ++m.rewritten;
     }

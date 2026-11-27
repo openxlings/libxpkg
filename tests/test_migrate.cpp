@@ -119,6 +119,23 @@ end
     EXPECT_EQ(m.left.front().line, 16);
 }
 
+TEST(MigrateTest, ACopyOrMoveIsForAPersonItsDestinationMayBeADirectory) {
+    // os.cp and os.mv put src into dst when dst is a directory and replace what
+    // is there; fs.copy and fs.move take the final path and refuse one that
+    // exists. The text does not say which a call meant.
+    const auto m = migrate_recipe(recipe(R"LUA(
+function config()
+    os.cp(path.join(pkginfo.install_dir(), "a.h"), system.subos_sysrootdir())
+    os.mv("x", "y")
+    return true
+end
+)LUA"));
+    EXPECT_FALSE(m.spec3);
+    EXPECT_TRUE(has(m.text, "os.cp(")) << m.text;
+    EXPECT_TRUE(has(m.text, "os.mv(")) << m.text;
+    EXPECT_EQ(std::ranges::count_if(m.left, [](const MigrationNote& n) { return n.name == "os.cp" || n.name == "os.mv"; }), 2);
+}
+
 TEST(MigrateTest, AnInstallThatLandsItselfAnotherWayIsForAPerson) {
     const auto m = migrate_recipe(recipe(R"LUA(
 function install()

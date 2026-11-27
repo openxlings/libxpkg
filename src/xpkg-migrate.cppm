@@ -124,8 +124,7 @@ constexpr Rename kRenames[] = {
     {"fs.is_directory", "fs.is_dir", "fs"},  {"os.tryrm", "fs.remove", "fs"},
     {"fs.remove_all", "fs.remove", "fs"},    {"os.remove", "fs.remove", "fs"},
     {"os.mkdir", "fs.mkdir", "fs"},          {"fs.mkdir_p", "fs.mkdir", "fs"},
-    {"os.mv", "fs.move", "fs"},              {"os.rename", "fs.move", "fs"},
-    {"os.cp", "fs.copy", "fs"},              {"fs.copy_file", "fs.copy", "fs"},
+    {"fs.copy_file", "fs.copy", "fs"},
     {"io.readfile", "fs.read", "fs"},        {"io.writefile", "fs.write", "fs"},
     {"os.exec", "system.exec", "system"},    {"os.host", "pkginfo.platform", "pkginfo"},
     {"os.arch", "pkginfo.arch", "pkginfo"},  {"fs.basename", "path.filename", "path"},
@@ -164,6 +163,12 @@ constexpr Manual kManual[] = {
     {"os.iorun", "system.run(cmd).out; system.exec(cmd, { capture = true }) when its failure should fail the hook"},
     {"os.execute", "system.run(cmd); system.exec(cmd) when its failure should fail the hook"},
     {"os.trymv", "pcall(fs.move, src, dst)"},
+    // os.mv and os.cp put src INTO dst when dst is a directory, and replace
+    // what is there; fs.move and fs.copy take dst as the final path and
+    // refuse one that exists. Which one a call meant is not in its text.
+    {"os.mv", "fs.move(src, final_path [, { replace = true }]) -- into a directory: path.join(dir, name)"},
+    {"os.cp", "fs.copy(src, final_path [, { replace = true }]) -- into a directory: path.join(dir, name)"},
+    {"os.rename", "fs.move(src, final_path [, { replace = true }])"},
     {"is_host", "pkginfo.platform() == \"<platform>\""},
 };
 

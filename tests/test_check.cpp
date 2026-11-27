@@ -272,7 +272,7 @@ TEST(CheckTest, TheInterfaceManifestIsData) {
     EXPECT_NE(std::ranges::find(m.stdlib_os, "getenv"), m.stdlib_os.end());
     const auto mv = std::ranges::find(m.compat, std::string("os.mv"), &std::pair<std::string, std::string>::first);
     ASSERT_NE(mv, m.compat.end());
-    EXPECT_EQ(mv->second, "fs.move");
+    EXPECT_EQ(mv->second, "fs.move(src, final_path)");
     const auto sleep = std::ranges::find(m.compat, std::string("os.sleep"), &std::pair<std::string, std::string>::first);
     ASSERT_NE(sleep, m.compat.end());
     EXPECT_TRUE(sleep->second.empty());

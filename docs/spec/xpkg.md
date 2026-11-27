@@ -423,7 +423,7 @@ its own:
 | `os.isfile`, `os.isdir`, `fs.is_directory` | `fs.is_file`, `fs.is_dir` |
 | `os.tryrm`, `fs.remove_all`, `os.remove` | `fs.remove` |
 | `os.mkdir`, `fs.mkdir_p` | `fs.mkdir` |
-| `os.mv`, `os.trymv`, `os.rename`, `os.cp`, `fs.copy_file` | `fs.move`, `fs.copy` (the destination is the final path) |
+| `os.mv`, `os.trymv`, `os.rename`, `os.cp`, `fs.copy_file` | `fs.move`, `fs.copy`: the destination is the final path (`path.join(dir, name)` where `os.mv` and `os.cp` went into a directory), and one already there is replaced only with `{ replace = true }` |
 | `io.readfile`, `io.writefile`, `io.open` | `fs.read`, `fs.write` |
 | `os.dirs`, `fs.files`, `fs.dirs`, `fs.entries` | `fs.list` |
 | running `chmod` | `fs.chmod` |

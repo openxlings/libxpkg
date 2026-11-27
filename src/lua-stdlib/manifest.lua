@@ -151,9 +151,9 @@ return {
     -- The compatibility layer: names of spec "1" and "2" only, each with what
     -- a recipe of spec "3" writes instead (nil: nothing is needed).
     compat = {
-        { "os.mv",         "fs.move" },
-        { "os.trymv",      "fs.move" },
-        { "os.cp",         "fs.copy" },
+        { "os.mv",         "fs.move(src, final_path)" },
+        { "os.trymv",      "pcall(fs.move, src, final_path)" },
+        { "os.cp",         "fs.copy(src, final_path)" },
         { "os.mkdir",      "fs.mkdir" },
         { "os.tryrm",      "fs.remove" },
         { "os.isfile",     "fs.is_file" },
@@ -168,7 +168,7 @@ return {
         { "os.host",       "pkginfo.platform" },
         { "os.sleep",      nil },
         { "os.remove",     "fs.remove" },
-        { "os.rename",     "fs.move" },
+        { "os.rename",     "fs.move(src, final_path)" },
         { "os.tmpname",    nil },
         { "io.readfile",   "fs.read" },
         { "io.writefile",  "fs.write" },

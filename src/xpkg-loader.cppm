@@ -767,6 +767,12 @@ PlatformMatrix parse_xpm(lua::State* L, int pkg_idx, std::vector<std::string>& w
                         }
                         res.sha256 = get_str(L, res_idx, "sha256");
                         res.ref    = get_str(L, res_idx, "ref");
+                        // `["1.3.11"] = { ref = "1.3.11" }` names no other
+                        // version: the entry is itself, with what is beside
+                        // the ref (here nothing -- its hooks make the
+                        // payload). Read as an alias it was a ref cycle,
+                        // which clients before spec 3 skipped with a warn.
+                        if (res.ref == version) res.ref.clear();
                         res.revision = get_nonneg_int(L, res_idx, "revision");
                         res.floor = std::min(get_nonneg_int(L, res_idx, "floor"), res.revision);
                         res.min_client = get_str(L, res_idx, "min_client");

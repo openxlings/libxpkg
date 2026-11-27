@@ -77,6 +77,7 @@ graph TD
 - `build_index(repo_dir, ns, BuildOutput)` — 同上；索引自带的 `pkgindex-build.lua` 用 `io.write` / `print` 写出的内容原样、按顺序交给 `BuildOutput`，不再写到进程的 stdout。构建脚本用 `\r[i/n] …\033[K` 画进度，只有调用方知道自己的输出去向（终端、文件还是管道），所以由它决定怎么显示（0.0.59）
 - `load_index_db(path)` / `save_index_db(index, path)` — JSON 格式索引持久化
 - 平台继承：平台段的 `inherits = "<平台>"` 与 V1 写法 `{ ref = "<平台>" }` 都表示继承。加载时沿继承链补齐：本平台缺少的版本取自被继承的平台，`deps`、`exports`、`source` 在本平台未声明时同样继承；遇到环或不存在的平台即停止。平台级的 `ref` 不再生成名为 `ref` 的版本（0.0.64）
+- 版本条目的 `ref` 指向自己（`["1.3.11"] = { ref = "1.3.11" }`）不是别名：条目就是它自己，读作 `ref` 为空、其余字段照旧（没有下载源时是由钩子生成载荷的版本）。此前它是一个 ref 环，spec 3 之前的客户端带一条 warn 跳过下载；两个以上版本之间的环仍是环（0.0.68）
 - 版本条目的 `min_client`：能使用该版本的最旧客户端版本，解析为 `PlatformResource::min_client`。未指定版本时，客户端据此跳过自己不能使用的版本（0.0.64）
 - 版本条目的 `floor`：该版本仍可用的最旧打包修订号（`0 ≤ floor ≤ revision`，缺省 0），解析为 `PlatformResource::floor`，`resolve_resource` 随 `ref` 报告解析到的条目的值；高于 `revision` 时按 `revision` 读。客户端保留记录修订号不低于它的已装载荷，替换低于它的（0.0.65）
 - 包级的 `extensions`：按命名空间区分的扩展数据（`extensions = { luban = { ... } }`），第一层键是读它的程序。加载为 `Package::extensions`：对象的 JSON 文本（键排序；键恰为 1..n 的表与空表是数组），原样交给调用方，libxpkg 不解释。JSON 表达不了的值（函数、userdata、非有限数、数组之外的非字符串键）、嵌套超过 16 层的表丢弃，序列化后超过 4 KiB 时整个丢弃（不截断）；每次丢弃在 `Package::warnings` 里记一行。只改 `extensions` 不改变安装的内容，不 bump `revision`；旧加载器按名字取已知字段，读到它时忽略（0.0.66）

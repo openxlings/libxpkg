@@ -1334,6 +1334,22 @@ load_package(const fs::path& pkg_path, const LoaderContext& context) {
     p.host_facts  = loader_detail::get_host_facts(L, pkg_idx, p.warnings);
 
     lua::close(L);
+    // An executor reads spec from the text, before the recipe runs
+    // (declared_spec): a package table whose spec is not the string its text
+    // declares would be run in an environment its metadata does not name.
+    {
+        std::ifstream in(pkg_path, std::ios::binary);
+        std::ostringstream text;
+        text << in.rdbuf();
+        const auto declared = declared_spec(text.str()).value_or("");
+        if (declared != p.spec) {
+            return std::unexpected(std::format(
+                "{}: package.spec is \"{}\", and its text declares {}: spec is read from the text "
+                "before the recipe runs -- write it as a string in the package table (spec = \"{}\")",
+                pkg_path.string(), p.spec, declared.empty() ? std::string("none") : "\"" + declared + "\"",
+                p.spec));
+        }
+    }
     if (const auto spec = spec_number(p.spec); spec && *spec == 3) {
         if (auto problem = loader_detail::check_spec3_top_level(pkg_path, *recipe_template))
             return std::unexpected("lua error: " + *problem);

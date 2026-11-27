@@ -1696,15 +1696,22 @@ create_executor(const fs::path& pkg_path) {
     if (!fs::exists(pkg_path)) {
         return std::unexpected("package file not found: " + pkg_path.string());
     }
-    // The recipe's spec chooses its environment; it is read first, the way a
-    // host reads it (the loader runs none of the recipe's hooks).
-    auto declared = load_package(pkg_path);
-    if (!declared) return std::unexpected("failed to load package: " + declared.error());
-    const auto spec = spec_number(declared->spec);
+    // The recipe's spec chooses its environment, so it is read from the
+    // recipe's text, not by running it: its top level runs once, in the
+    // environment its spec chooses (a top level with effects -- a file
+    // written, a program started -- must not run first somewhere else).
+    std::string declaredSpec;
+    {
+        std::ifstream in(pkg_path, std::ios::binary);
+        std::ostringstream text;
+        text << in.rdbuf();
+        declaredSpec = declared_spec(text.str()).value_or("");
+    }
+    const auto spec = spec_number(declaredSpec);
     if (spec && *spec > kHighestSpec) {
         return std::unexpected(std::format(
             "{}: spec \"{}\" is newer than this libxpkg reads (the highest is {})",
-            pkg_path.string(), declared->spec, kHighestSpec));
+            pkg_path.string(), declaredSpec, kHighestSpec));
     }
     const bool spec3 = spec && *spec == 3;
 

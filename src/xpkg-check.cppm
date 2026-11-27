@@ -50,59 +50,8 @@ std::map<std::string, std::vector<Finding>> check_index(const fs::path& index);
 
 namespace mcpplibs::xpkg::check_detail {
 
-// The recipe's text with comments and string literals blanked to spaces --
-// newlines kept, so a position still has its line. The names a recipe uses
-// are read from what is left.
-std::string code_only(std::string_view text) {
-    std::string out(text);
-    std::size_t i = 0;
-    auto blank = [&](std::size_t from, std::size_t to) {
-        for (std::size_t k = from; k < to && k < out.size(); ++k)
-            if (out[k] != '\n') out[k] = ' ';
-    };
-    // A long bracket at i: [[ or [=*[; its level, or -1.
-    auto long_open = [&](std::size_t at) -> int {
-        if (at >= text.size() || text[at] != '[') return -1;
-        std::size_t k = at + 1;
-        int level = 0;
-        while (k < text.size() && text[k] == '=') { ++level; ++k; }
-        return (k < text.size() && text[k] == '[') ? level : -1;
-    };
-    auto long_close = [&](std::size_t from, int level) -> std::size_t {
-        const std::string closing = "]" + std::string(static_cast<std::size_t>(level), '=') + "]";
-        const auto end = text.find(closing, from);
-        return end == std::string_view::npos ? text.size() : end + closing.size();
-    };
-    while (i < text.size()) {
-        const char c = text[i];
-        if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') {
-            const int level = long_open(i + 2);
-            std::size_t end;
-            if (level >= 0) end = long_close(i + 2 + static_cast<std::size_t>(level) + 2, level);
-            else {
-                end = text.find('\n', i);
-                if (end == std::string_view::npos) end = text.size();
-            }
-            blank(i, end);
-            i = end;
-        } else if (c == '"' || c == '\'') {
-            std::size_t k = i + 1;
-            while (k < text.size() && text[k] != c && text[k] != '\n') {
-                if (text[k] == '\\') ++k;
-                ++k;
-            }
-            blank(i, k + 1);
-            i = k + 1;
-        } else if (const int level = long_open(i); level >= 0) {
-            const auto end = long_close(i + static_cast<std::size_t>(level) + 2, level);
-            blank(i, end);
-            i = end;
-        } else {
-            ++i;
-        }
-    }
-    return out;
-}
+// The recipe's code: comments and strings blanked (mcpplibs.xpkg's recipe_code).
+std::string code_only(std::string_view text) { return recipe_code(text); }
 
 int line_of(std::string_view text, std::size_t at) {
     return 1 + static_cast<int>(std::count(text.begin(), text.begin() + static_cast<std::ptrdiff_t>(std::min(at, text.size())), '\n'));
@@ -211,7 +160,7 @@ std::vector<Finding> check_recipe(const fs::path& recipe) {
     if (!loaded) {
         out.push_back({ .code = "load", .severity = "error", .message = loaded.error() });
         // What the code uses is still worth saying when the cause is one of them.
-        const bool spec3 = text.find("spec = \"3\"") != std::string::npos;
+        const bool spec3 = declared_spec(text) == "3";
         for (auto& f : compat_uses(code_only(text), spec3, text.find("xim.libxpkg.path") != std::string::npos))
             if (spec3) out.push_back(std::move(f));
         return out;

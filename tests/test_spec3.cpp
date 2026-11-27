@@ -211,6 +211,47 @@ end
     EXPECT_TRUE(fs::is_directory(index.root / "install" / "by-the-lib"));
 }
 
+// A recipe's top level runs once, in the environment its spec chooses: the
+// executor reads spec from the text (declared_spec), not by running it first.
+TEST(Spec3EnvTest, ATopLevelRunsOnceWhenTheExecutorIsMade) {
+    Index index;
+    const auto marks = index.root / "top-level-runs";
+    auto recipe = index.recipe(std::format(R"LUA(
+local f = io.open([[{}]], "a")
+f:write("ran\n")
+f:close()
+function install() return true end
+)LUA", marks.string()), "2");
+    auto exec = create_executor(recipe);
+    ASSERT_TRUE(exec.has_value()) << exec.error();
+    std::ifstream in(marks);
+    std::string line;
+    int runs = 0;
+    while (std::getline(in, line)) ++runs;
+    EXPECT_EQ(runs, 1);
+}
+
+// The spec is read from the recipe's code: a comment or a string that says
+// spec is not the declaration, and a table whose spec is not the string its
+// text declares is a load error -- the executor could not know it.
+TEST(Spec3EnvTest, TheSpecIsTheStringTheTextDeclares) {
+    EXPECT_EQ(declared_spec("package = { spec = \"3\", name = \"x\" }"), "3");
+    EXPECT_EQ(declared_spec("package = {\n  spec='2',\n}"), "2");
+    EXPECT_EQ(declared_spec("-- spec = \"3\" is the current one\npackage = { name = \"x\" }"), std::nullopt);
+    EXPECT_EQ(declared_spec("--[[ spec = \"3\" ]] package = { description = \"spec = '3'\", spec = \"1\" }"), "1");
+    EXPECT_EQ(declared_spec("package = { name = \"x\" }\nif package.spec == \"3\" then end"), std::nullopt);
+    EXPECT_EQ(declared_spec("package = { xspec = \"3\" }"), std::nullopt);
+    EXPECT_EQ(recipe_code("a = \"b\" -- c\nd"), "a =" + std::string(9, ' ') + "\nd");
+
+    Index index;
+    auto file = index.root / "pkgs" / "p" / "probe.lua";
+    std::ofstream(file, std::ios::binary)
+        << "local s = \"3\"\npackage = { spec = s, name = \"probe\", xpm = { linux = { [\"1.0.0\"] = {} } } }\n";
+    auto pkg = load_package(file);
+    ASSERT_FALSE(pkg.has_value());
+    EXPECT_NE(pkg.error().find("package.spec is \"3\", and its text declares none"), std::string::npos) << pkg.error();
+}
+
 TEST(Spec3EnvTest, AHigherSpecIsRefusedByName) {
     Index index;
     auto recipe = index.recipe("function install() return true end\n", "4");

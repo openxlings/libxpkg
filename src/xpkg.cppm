@@ -25,6 +25,18 @@ inline constexpr int kHighestSpec = 3;
 // any spec existed, with the compatibility layer.
 std::optional<int> spec_number(std::string_view spec);
 
+// A recipe's text with comments and string literals blanked to spaces --
+// newlines kept, so a position still has its line: the code, for reading the
+// names a recipe uses without running it.
+std::string recipe_code(std::string_view text);
+
+// The `spec` a recipe's text declares (`spec = "3"`), read without running
+// it: the first `spec` key in its code assigned a string literal; nullopt
+// when there is none. A recipe's top level may have effects, so it runs once,
+// in the environment its spec chooses -- which therefore cannot be learned by
+// running it.
+std::optional<std::string> declared_spec(std::string_view text);
+
 enum class PackageType   { Package, Script, Template, Config, Subos };
 enum class PackageStatus { Dev, Stable, Deprecated };
 
@@ -315,6 +327,80 @@ const ArchIdentity* find_arch_by_elf(std::uint16_t machine, int bits) {
 std::string normalize_arch(std::string_view raw) {
     if (const auto* arch = find_arch(raw)) return std::string(arch->name);
     return lower_(raw);
+}
+
+std::string recipe_code(std::string_view text) {
+    std::string out(text);
+    std::size_t i = 0;
+    auto blank = [&](std::size_t from, std::size_t to) {
+        for (std::size_t k = from; k < to && k < out.size(); ++k)
+            if (out[k] != '\n') out[k] = ' ';
+    };
+    // A long bracket at `at`: [[ or [=*[; its level, or -1.
+    auto long_open = [&](std::size_t at) -> int {
+        if (at >= text.size() || text[at] != '[') return -1;
+        std::size_t k = at + 1;
+        int level = 0;
+        while (k < text.size() && text[k] == '=') { ++level; ++k; }
+        return (k < text.size() && text[k] == '[') ? level : -1;
+    };
+    auto long_close = [&](std::size_t from, int level) -> std::size_t {
+        const std::string closing = "]" + std::string(static_cast<std::size_t>(level), '=') + "]";
+        const auto end = text.find(closing, from);
+        return end == std::string_view::npos ? text.size() : end + closing.size();
+    };
+    while (i < text.size()) {
+        const char c = text[i];
+        if (c == '-' && i + 1 < text.size() && text[i + 1] == '-') {
+            const int level = long_open(i + 2);
+            std::size_t end;
+            if (level >= 0) end = long_close(i + 2 + static_cast<std::size_t>(level) + 2, level);
+            else {
+                end = text.find('\n', i);
+                if (end == std::string_view::npos) end = text.size();
+            }
+            blank(i, end);
+            i = end;
+        } else if (c == '"' || c == '\'') {
+            std::size_t k = i + 1;
+            while (k < text.size() && text[k] != c && text[k] != '\n') {
+                if (text[k] == '\\') ++k;
+                ++k;
+            }
+            blank(i, k + 1);
+            i = k + 1;
+        } else if (const int level = long_open(i); level >= 0) {
+            const auto end = long_close(i + static_cast<std::size_t>(level) + 2, level);
+            blank(i, end);
+            i = end;
+        } else {
+            ++i;
+        }
+    }
+    return out;
+}
+
+std::optional<std::string> declared_spec(std::string_view text) {
+    const auto code = recipe_code(text);
+    const auto word = [](char ch) {
+        return std::isalnum(static_cast<unsigned char>(ch)) || ch == '_';
+    };
+    for (std::size_t at = code.find("spec"); at != std::string::npos; at = code.find("spec", at + 4)) {
+        if ((at > 0 && (word(code[at - 1]) || code[at - 1] == '.')) ||
+            (at + 4 < code.size() && word(code[at + 4])))
+            continue;
+        std::size_t k = at + 4;
+        while (k < code.size() && (code[k] == ' ' || code[k] == '\t')) ++k;
+        if (k >= code.size() || code[k] != '=' || (k + 1 < code.size() && code[k + 1] == '=')) continue;
+        ++k;
+        while (k < text.size() && (text[k] == ' ' || text[k] == '\t')) ++k;
+        if (k >= text.size() || (text[k] != '"' && text[k] != '\'')) continue;
+        const char quote = text[k];
+        const auto end = text.find(quote, k + 1);
+        if (end == std::string_view::npos) return std::nullopt;
+        return std::string(text.substr(k + 1, end - k - 1));
+    }
+    return std::nullopt;
 }
 
 std::optional<int> spec_number(std::string_view spec) {
